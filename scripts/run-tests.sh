@@ -93,6 +93,38 @@ expect_output()
     rm -f "$OUTPUT"
 }
 
+expect_output_count()
+{
+    name="$1"
+    expected="$2"
+    expected_count="$3"
+    shift 3
+    printf "  %-40s " "$name"
+    OUTPUT=$(mktemp)
+    if run_with_timeout "$@" > "$OUTPUT" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    actual_count=$(grep -c "$expected" "$OUTPUT" || true)
+    if [ "$rc" -eq 0 ] && [ "$actual_count" -eq "$expected_count" ]; then
+        printf "${GREEN}PASS${NC}\n"
+        PASS=$((PASS + 1))
+    else
+        if [ "$rc" -eq 124 ]; then
+            printf "${RED}TIMEOUT${NC}\n"
+        elif [ "$rc" -ne 0 ]; then
+            printf "${RED}FAIL${NC} (exit=$rc, match_count=$actual_count/$expected_count)\n"
+        else
+            printf "${RED}FAIL${NC} (match_count=$actual_count/$expected_count)\n"
+        fi
+        echo "    expected pattern: ${expected}"
+        head -20 "$OUTPUT" | sed 's/^/    /'
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$OUTPUT"
+}
+
 echo "=== kbox integration tests ==="
 echo "  binary:  ${KBOX}"
 echo "  rootfs:  ${ROOTFS}"
@@ -276,6 +308,16 @@ for test_prog in dup-test clock-test signal-test path-escape-test errno-test; do
         SKIP=$((SKIP + 1))
     fi
 done
+
+if "$KBOX" image -S "$ROOTFS" -- /bin/sh -c "test -x /opt/tests/clone3-test" 2> /dev/null; then
+    expect_output_count "clone3-test" \
+        "kbox: clone3 denied: namespace flags" 9 \
+        "$KBOX" image --forward-verbose -S "$ROOTFS" --syscall-mode=seccomp \
+        -- "/opt/tests/clone3-test"
+else
+    printf "  %-40s ${YELLOW}SKIP${NC} (not in rootfs)\n" "clone3-test"
+    SKIP=$((SKIP + 1))
+fi
 
 # ---- Networking (requires --net / SLIRP support) ----
 echo ""

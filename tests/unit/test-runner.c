@@ -10,7 +10,7 @@
 
 #include <unistd.h>
 
-#define MAX_TESTS 256
+#define MAX_TESTS 512
 
 struct test_entry {
     const char *name;

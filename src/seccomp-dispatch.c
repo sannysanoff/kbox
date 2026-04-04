@@ -1218,8 +1218,13 @@ static struct kbox_dispatch forward_local_shadow_read_like(
             chunk_len = count - total;
         if (is_pread) {
             long offset = to_c_long_arg(kbox_syscall_request_arg(req, 3));
-            nr = pread(entry->shadow_sp, scratch, chunk_len,
-                       (off_t) (offset + (long) total));
+            long pread_off;
+            if (__builtin_add_overflow(offset, (long) total, &pread_off)) {
+                if (total == 0)
+                    return kbox_dispatch_errno(EOVERFLOW);
+                break;
+            }
+            nr = pread(entry->shadow_sp, scratch, chunk_len, (off_t) pread_off);
         } else {
             nr = read(entry->shadow_sp, scratch, chunk_len);
         }
@@ -1230,8 +1235,13 @@ static struct kbox_dispatch forward_local_shadow_read_like(
         }
         if (nr == 0)
             break;
-        if (guest_mem_write(ctx, pid, remote_buf + total, scratch,
-                            (size_t) nr) < 0) {
+        uint64_t remote;
+        if (__builtin_add_overflow(remote_buf, (uint64_t) total, &remote)) {
+            if (total == 0)
+                return kbox_dispatch_errno(EFAULT);
+            break;
+        }
+        if (guest_mem_write(ctx, pid, remote, scratch, (size_t) nr) < 0) {
             return kbox_dispatch_errno(EFAULT);
         }
         total += (size_t) nr;
@@ -2113,16 +2123,21 @@ static struct kbox_dispatch forward_read_like(
         long ret;
         if (is_pread) {
             long offset = to_c_long_arg(kbox_syscall_request_arg(req, 3));
+            long pread_off;
+            if (__builtin_add_overflow(offset, (long) total, &pread_off)) {
+                if (total == 0)
+                    return kbox_dispatch_errno(EOVERFLOW);
+                break;
+            }
             ret = kbox_lkl_pread64(ctx->sysnrs, lkl_fd, scratch,
-                                   (long) chunk_len, offset + (long) total);
+                                   (long) chunk_len, pread_off);
         } else {
             ret = kbox_lkl_read(ctx->sysnrs, lkl_fd, scratch, (long) chunk_len);
         }
 
         if (ret < 0) {
-            if (total == 0) {
+            if (total == 0)
                 return kbox_dispatch_errno((int) (-ret));
-            }
             break;
         }
 
@@ -2130,7 +2145,12 @@ static struct kbox_dispatch forward_read_like(
         if (n == 0)
             break;
 
-        uint64_t remote = remote_buf + total;
+        uint64_t remote;
+        if (__builtin_add_overflow(remote_buf, (uint64_t) total, &remote)) {
+            if (total == 0)
+                return kbox_dispatch_errno(EFAULT);
+            break;
+        }
         if (ctx->verbose) {
             fprintf(
                 stderr,
@@ -2197,20 +2217,24 @@ static struct kbox_dispatch forward_write(
         if (chunk_len > count - total)
             chunk_len = count - total;
 
-        uint64_t remote = remote_buf + total;
+        uint64_t remote;
+        if (__builtin_add_overflow(remote_buf, (uint64_t) total, &remote)) {
+            if (total == 0)
+                return kbox_dispatch_errno(EFAULT);
+            break;
+        }
         int rrc = guest_mem_read(ctx, pid, remote, scratch, chunk_len);
         if (rrc < 0) {
-            if (total > 0)
-                break;
-            return kbox_dispatch_errno(-rrc);
+            if (total == 0)
+                return kbox_dispatch_errno(-rrc);
+            break;
         }
 
         long ret =
             kbox_lkl_write(ctx->sysnrs, lkl_fd, scratch, (long) chunk_len);
         if (ret < 0) {
-            if (total == 0) {
+            if (total == 0)
                 return kbox_dispatch_errno((int) (-ret));
-            }
             break;
         }
 
@@ -2317,16 +2341,22 @@ static struct kbox_dispatch forward_sendfile(
 
         /* Read from source (LKL fd). */
         long nr;
-        if (has_offset)
+        if (has_offset) {
+            long pread_off;
+            if (__builtin_add_overflow(offset, (long) total, &pread_off)) {
+                if (total == 0)
+                    return kbox_dispatch_errno(EOVERFLOW);
+                break;
+            }
             nr = kbox_lkl_pread64(ctx->sysnrs, in_lkl, scratch, (long) chunk,
-                                  offset + (long) total);
-        else
+                                  pread_off);
+        } else {
             nr = kbox_lkl_read(ctx->sysnrs, in_lkl, scratch, (long) chunk);
+        }
 
         if (nr < 0) {
-            if (total == 0) {
+            if (total == 0)
                 return kbox_dispatch_errno((int) (-nr));
-            }
             break;
         }
         if (nr == 0)
@@ -2334,38 +2364,47 @@ static struct kbox_dispatch forward_sendfile(
 
         size_t n = (size_t) nr;
 
-        /* Write to destination. */
-        if (out_lkl >= 0) {
-            long wr = kbox_lkl_write(ctx->sysnrs, out_lkl, scratch, (long) n);
-            if (wr < 0) {
-                if (total == 0) {
-                    return kbox_dispatch_errno((int) (-wr));
+        /* Write to destination, looping on short writes. */
+        size_t written = 0;
+        while (written < n) {
+            if (out_lkl >= 0) {
+                long wr =
+                    kbox_lkl_write(ctx->sysnrs, out_lkl, scratch + written,
+                                   (long) (n - written));
+                if (wr <= 0) {
+                    if (total + written == 0)
+                        return kbox_dispatch_errno(wr < 0 ? (int) (-wr) : EIO);
+                    total += written;
+                    goto done;
                 }
-                break;
-            }
-        } else {
-            /* Destination is a host FD (e.g. stdout).  The supervisor
-             * shares the FD table with the tracee (from fork), so write()
-             * goes to the same file description.
-             */
-            ssize_t wr = write((int) out_fd, scratch, n);
-            if (wr < 0) {
-                if (total == 0) {
-                    return kbox_dispatch_errno(errno);
+                written += (size_t) wr;
+            } else {
+                ssize_t wr =
+                    write((int) out_fd, scratch + written, n - written);
+                if (wr <= 0) {
+                    if (total + written == 0)
+                        return kbox_dispatch_errno(wr < 0 ? errno : EIO);
+                    total += written;
+                    goto done;
                 }
-                break;
+                written += (size_t) wr;
             }
         }
 
-        total += n;
+        total += written;
         if (n < chunk)
             break;
     }
 
-    /* Update offset in tracee memory if provided. */
+done:
+    /* Update offset in tracee memory if provided.  Best-effort: data has
+     * already been transferred, so return the byte count even if the
+     * offset writeback fails (avoids data duplication on retry).
+     */
     if (has_offset && total > 0) {
-        off_t new_off = offset + (off_t) total;
-        guest_mem_write(ctx, pid, offset_ptr, &new_off, sizeof(new_off));
+        off_t new_off;
+        if (!__builtin_add_overflow(offset, (off_t) total, &new_off))
+            guest_mem_write(ctx, pid, offset_ptr, &new_off, sizeof(new_off));
     }
 
     return kbox_dispatch_value((int64_t) total);

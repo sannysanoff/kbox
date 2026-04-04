@@ -339,14 +339,18 @@ int kbox_vm_read_string(pid_t pid,
 
         local_iov.iov_base = buf + total;
         local_iov.iov_len = chunk;
-        remote_iov.iov_base =
-            (void *) (uintptr_t) (remote_addr + (uint64_t) total);
+        uint64_t remote;
+        if (__builtin_add_overflow(remote_addr, (uint64_t) total, &remote))
+            return -EFAULT;
+        remote_iov.iov_base = (void *) (uintptr_t) remote;
         remote_iov.iov_len = chunk;
 
         n = syscall(SYS_process_vm_readv, pid, &local_iov, 1, &remote_iov, 1,
                     0);
-        if (n <= 0)
-            return errno ? -errno : -EIO;
+        if (n < 0)
+            return -errno;
+        if (n == 0)
+            return -EFAULT;
 
         for (i = 0; i < (size_t) n; i++) {
             if (buf[total + i] == '\0')

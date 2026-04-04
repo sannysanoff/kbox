@@ -475,20 +475,30 @@ struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
         if (chunk_len > count - total)
             chunk_len = count - total;
 
-        uint64_t remote = remote_buf + total;
+        uint64_t remote;
+        if (__builtin_add_overflow(remote_buf, (uint64_t) total, &remote)) {
+            if (total == 0)
+                return kbox_dispatch_errno(EFAULT);
+            break;
+        }
         int rrc = guest_mem_read(ctx, pid, remote, scratch, chunk_len);
         if (rrc < 0) {
-            if (total > 0)
-                break;
-            return kbox_dispatch_errno(-rrc);
+            if (total == 0)
+                return kbox_dispatch_errno(-rrc);
+            break;
         }
 
+        long pwrite_off;
+        if (__builtin_add_overflow(offset, (long) total, &pwrite_off)) {
+            if (total == 0)
+                return kbox_dispatch_errno(EOVERFLOW);
+            break;
+        }
         long ret = kbox_lkl_pwrite64(ctx->sysnrs, lkl_fd, scratch,
-                                     (long) chunk_len, offset + (long) total);
+                                     (long) chunk_len, pwrite_off);
         if (ret < 0) {
-            if (total == 0) {
+            if (total == 0)
                 return kbox_dispatch_errno((int) (-ret));
-            }
             break;
         }
 
@@ -577,9 +587,14 @@ static struct kbox_dispatch dispatch_iov_transfer(
             if (chunk > len - seg_total)
                 chunk = len - seg_total;
 
+            uint64_t remote;
+            if (__builtin_add_overflow(base, seg_total, &remote)) {
+                err = EFAULT;
+                goto done;
+            }
+
             if (is_write) {
-                rrc =
-                    guest_mem_read(ctx, pid, base + seg_total, scratch, chunk);
+                rrc = guest_mem_read(ctx, pid, remote, scratch, chunk);
                 if (rrc < 0) {
                     err = -rrc;
                     goto done;
@@ -605,8 +620,7 @@ static struct kbox_dispatch dispatch_iov_transfer(
                     (void) written;
                 }
             } else {
-                int wrc =
-                    guest_mem_write(ctx, pid, base + seg_total, scratch, n);
+                int wrc = guest_mem_write(ctx, pid, remote, scratch, n);
                 if (wrc < 0)
                     return kbox_dispatch_errno(-wrc);
             }

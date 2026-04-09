@@ -76,20 +76,26 @@ events. Pin `--syscall-mode=seccomp` if you need the dashboard.
 
 ## What makes kbox unique
 
-| Property | kbox | `chroot` | `proot` | UML | gVisor | container |
-|----------|:----:|:--------:|:-------:|:---:|:------:|:---------:|
-| Rootless / unprivileged                 | yes | no  | yes | yes | yes | varies |
-| Real Linux kernel handling syscalls     | yes | yes | no  | yes | no  | yes    |
-| LKL kernel runs in the supervisor proc  | yes | -   | no  | no  | no  | no     |
-| No `ptrace` overhead                    | yes | -   | no  | no  | yes | yes    |
-| Near-native syscall speed               | yes | yes | no  | no  | no  | yes    |
-| Reads guest kernel `/proc` from outside | yes | no  | no  | no  | no  | no     |
-| Per-syscall audit trail with latency    | yes | no  | strace | no  | yes | no |
-| Patched-syscall fast path (rewrite)     | yes | no  | no  | no  | no  | no     |
+| Property | kbox | `chroot` | `proot` | UML | gVisor | containers |
+|----------|:----:|:--------:|:-------:|:---:|:------:|:----------:|
+| Rootless, no daemon                    | yes | no | yes | yes | yes | depends |
+| Real Linux kernel for syscalls         | yes | yes | no  | yes | no  | yes |
+| In-process kernel                      | yes | n/a | no  | no  | no  | no |
+| No `ptrace` dispatch                   | yes | n/a | no  | no  | yes | yes |
+| Near-native latency                    | yes | yes | no  | no  | no  | yes |
+| Host-side guest `/proc` inspection     | yes | no | no  | no  | no  | no |
+| Built-in latency tracing               | yes | no | via `strace` | no | partial | no |
+| Web observatory                        | yes | no | no | no | no | no |
+| Rewrite mode                           | yes | no | no | no | no | no |
 
-The combination is the point. Many tools give you one or two of these;
-kbox is the only one that gives you a real Linux kernel, in-process,
-rootless, observable, and fast.
+The point is the combination. Most tools cover one or two of these
+properties; kbox combines a real Linux kernel, in-process execution,
+rootless operation, observability, and low overhead in one design.
+It implements the in-process kernel with LKL.
+It also exposes a browser observatory for telemetry and inspection.
+
+The rewrite mode is kbox-specific and applies to eligible direct
+binaries, where patched syscall sites provide the fastest dispatch path.
 
 ## Why kbox
 

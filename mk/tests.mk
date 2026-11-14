@@ -76,6 +76,7 @@ check: check-unit check-integration check-stress
 check-unit: $(TEST_TARGET)
 	@echo "  RUN     check-unit"
 	$(Q)./$(TEST_TARGET)
+	$(Q)python3 $(TEST_DIR)/test-docker-engine.py
 
 # Unit tests are built WITHOUT linking LKL.
 # We define LKL stubs for functions referenced by test support code.

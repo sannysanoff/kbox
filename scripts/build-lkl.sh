@@ -1,6 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# Build liblkl.a from source (lkl/linux) and populate lkl-<ARCH>/.
+# Build liblkl.a from source (sannysanoff/linux, a fork of lkl/linux) and
+# populate lkl-<ARCH>/.
 #
 # Usage: ./scripts/build-lkl.sh [ARCH]
 #   ARCH defaults to the host architecture (x86_64 or aarch64).
@@ -17,7 +18,10 @@ detect_arch "${1:-}"
 
 LKL_DIR="${LKL_DIR:-lkl-${ARCH}}"
 LKL_SRC="${LKL_SRC:-build/lkl-src}"
-LKL_UPSTREAM="https://github.com/lkl/linux"
+# Fork of lkl/linux that carries the LKL commit kbox is built and tested
+# against (branch "kbox"). Use LKL_REF=kbox to pin to that branch; the
+# default keeps the fork's default branch.
+LKL_UPSTREAM="${LKL_UPSTREAM:-https://github.com/sannysanoff/linux}"
 
 is_commit_sha()
 {
@@ -85,29 +89,63 @@ fi
 # ---- Configure -----------------------------------------------------------
 
 if [ ! -f "${LKL_SRC}/.config" ]; then
+    echo "  CONF    tools/lkl"
+    make -C "${LKL_SRC}/tools/lkl" conf
+
     echo "  CONFIG  ARCH=lkl defconfig"
     make -C "${LKL_SRC}" ARCH=lkl defconfig
+    if [ -f "${LKL_SRC}/tools/lkl/kernel.config" ]; then
+        cat "${LKL_SRC}/tools/lkl/kernel.config" >> "${LKL_SRC}/.config"
+    fi
 
-    # Enable features required by kbox (mirrors build-lkl.yml).
+    # Enable features required by kbox (mirrors build-lkl.yml) plus
+    # container namespaces, veth/bridge/NAT networking, loop, tmpfs, overlayfs.
     for opt in \
         CONFIG_DEVTMPFS \
         CONFIG_DEVTMPFS_MOUNT \
         CONFIG_DEVPTS_FS \
-        CONFIG_DEBUG_INFO \
-        CONFIG_GDB_SCRIPTS \
+        CONFIG_NAMESPACES \
+        CONFIG_NET_NS \
+        CONFIG_UTS_NS \
+        CONFIG_IPC_NS \
+        CONFIG_PID_NS \
+        CONFIG_NET_CORE \
+        CONFIG_NETDEVICES \
+        CONFIG_INET \
+        CONFIG_IP_ADVANCED_ROUTER \
+        CONFIG_IP_MULTIPLE_TABLES \
+        CONFIG_VETH \
+        CONFIG_LLC \
+        CONFIG_STP \
+        CONFIG_BRIDGE \
+        CONFIG_NETFILTER \
+        CONFIG_NETFILTER_XTABLES \
+        CONFIG_NF_CONNTRACK \
+        CONFIG_NF_NAT \
+        CONFIG_IP_NF_IPTABLES \
+        CONFIG_IP_NF_FILTER \
+        CONFIG_IP_NF_NAT \
+        CONFIG_IP_NF_TARGET_MASQUERADE \
+        CONFIG_NETFILTER_XT_TARGET_MASQUERADE \
+        CONFIG_BLK_DEV_LOOP \
+        CONFIG_TMPFS \
+        CONFIG_OVERLAY_FS \
         CONFIG_SCHED_DEBUG \
         CONFIG_PROC_SYSCTL \
         CONFIG_PRINTK \
-        CONFIG_TRACEPOINTS \
-        CONFIG_FTRACE \
         CONFIG_DEBUG_FS; do
         "${LKL_SRC}/scripts/config" --file "${LKL_SRC}/.config" --enable "${opt}"
     done
 
-    "${LKL_SRC}/scripts/config" --file "${LKL_SRC}/.config" \
-        --set-val CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT y
-
     for opt in \
+        CONFIG_DEBUG_INFO \
+        CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
+        CONFIG_GDB_SCRIPTS \
+        CONFIG_TRACEPOINTS \
+        CONFIG_FTRACE \
+        CONFIG_BTRFS_FS \
+        CONFIG_XFS_FS \
+        CONFIG_F2FS_FS \
         CONFIG_MODULES \
         CONFIG_SOUND \
         CONFIG_USB_SUPPORT \
@@ -118,6 +156,7 @@ if [ ! -f "${LKL_SRC}/.config" ]; then
     done
 
     make -C "${LKL_SRC}" ARCH=lkl olddefconfig
+    make -C "${LKL_SRC}" ARCH=lkl syncconfig
 fi
 
 # ---- Build ---------------------------------------------------------------
@@ -138,7 +177,8 @@ test -f "${LKL_SRC}/tools/lkl/liblkl.a" \
 echo "  VERIFY  symbols"
 for sym in lkl_init lkl_start_kernel lkl_cleanup lkl_syscall \
     lkl_strerror lkl_disk_add lkl_mount_dev \
-    lkl_host_ops lkl_dev_blk_ops; do
+    lkl_host_ops lkl_dev_blk_ops \
+    veth_newlink br_add_if net_ns_init sys_unshare; do
     if ! nm "${LKL_SRC}/tools/lkl/liblkl.a" 2> /dev/null \
         | awk -v s="$sym" '$3==s && $2~/^[TtDdBbRr]$/{found=1} END{exit !found}'; then
         die "MISSING symbol: ${sym}"

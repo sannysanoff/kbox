@@ -52,7 +52,7 @@ static int socketpair_create(int fds[2])
 
 /* Send a single file descriptor over a UNIX socket using SCM_RIGHTS.
  */
-static int send_fd(int sock, int fd)
+int kbox_supervisor_send_fd(int sock, int fd)
 {
     char buf = 0;
     struct iovec iov = {
@@ -101,7 +101,7 @@ static int send_fd(int sock, int fd)
 /* Receive a single file descriptor from a UNIX socket via SCM_RIGHTS.
  * Returns the received FD on success, -1 on error.
  */
-static int recv_fd(int sock)
+int kbox_supervisor_recv_fd(int sock)
 {
     char buf;
     struct iovec iov = {
@@ -184,6 +184,8 @@ static void build_response(struct kbox_seccomp_notif_resp *resp,
          */
         resp->error = d->error ? -d->error : 0;
         break;
+    case KBOX_DISPATCH_DEFERRED:
+        break;
     }
 }
 
@@ -217,17 +219,30 @@ static int check_child(pid_t pid, int *exit_code)
     return 0;
 }
 
+static int check_ctx_child(struct kbox_supervisor_ctx *ctx, int *exit_code)
+{
+    if (ctx->exit_notify_fd >= 0 && ctx->exit_status_ptr) {
+        int st = __atomic_load_n(ctx->exit_status_ptr, __ATOMIC_ACQUIRE);
+        if (st >= 0) {
+            *exit_code = st;
+            return 1;
+        }
+        return 0;
+    }
+    return check_child(ctx->child_pid, exit_code);
+}
+
 /* Supervisor loop. */
 
 /* Sit in a poll loop on two FDs:
  *   - listener_fd: seccomp notifications from the child.
- *   - sigchld_fd:  signalfd for SIGCHLD (instant child-exit wakeup).
+ *   - wait_fd:     signalfd for SIGCHLD, or caller-provided exit_notify_fd.
  *
- * On SIGCHLD or POLLHUP, recheck child via non-blocking waitpid.
+ * On SIGCHLD/exit_notify_fd or POLLHUP, recheck child exit status.
  * On POLLIN for the listener, receive notification, dispatch, respond.
  *
- * SIGCHLD must already be blocked by the caller before fork() so the
- * signal cannot be lost between fork and signalfd creation.
+ * When exit_notify_fd < 0, SIGCHLD must already be blocked by the caller
+ * before fork() so the signal cannot be lost between fork and signalfd.
  *
  * Returns the child exit code, or -1 on fatal error.
  */
@@ -240,32 +255,35 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
     struct pollfd pfds[2];
     int exit_code = -1;
     int ret;
-    int sigchld_fd;
+    int sigchld_fd = -1;
+    int wait_fd;
     int poll_timeout;
 
-    /* Create a signalfd for SIGCHLD so poll() wakes immediately when the child
-     * exits. SIGCHLD must already be blocked by the caller (before fork) to
-     * avoid losing the signal in the race between fork and this point.
-     */
-    {
+    if (ctx->exit_notify_fd >= 0) {
+        wait_fd = ctx->exit_notify_fd;
+    } else {
         sigset_t mask;
         sigemptyset(&mask);
         sigaddset(&mask, SIGCHLD);
         sigchld_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+        if (sigchld_fd < 0) {
+            fprintf(stderr, "signalfd: %s\n", strerror(errno));
+            return -1;
+        }
+        wait_fd = sigchld_fd;
     }
-    if (sigchld_fd < 0) {
-        fprintf(stderr, "signalfd: %s\n", strerror(errno));
-        return -1;
-    }
-
-    poll_timeout = -1;
-#ifdef KBOX_HAS_WEB
-    if (ctx->web)
-        poll_timeout = 100;
-#endif
 
     for (;;) {
-        /* Poll for seccomp notifications and SIGCHLD simultaneously.
+        if (ctx->pending_accept_count > 0)
+            kbox_dispatch_poll_pending(ctx);
+
+        poll_timeout = ctx->pending_accept_count > 0 ? 5 : -1;
+#ifdef KBOX_HAS_WEB
+        if (ctx->web && (poll_timeout < 0 || poll_timeout > 100))
+            poll_timeout = 100;
+#endif
+
+        /* Poll for seccomp notifications and child exit simultaneously.
          * In the normal non-web steady state we block here instead of
          * doing a non-blocking waitpid() on every iteration; that extra
          * wait syscall shows up directly in the seccomp fast path on
@@ -274,7 +292,7 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
         pfds[0].fd = ctx->listener_fd;
         pfds[0].events = POLLIN;
         pfds[0].revents = 0;
-        pfds[1].fd = sigchld_fd;
+        pfds[1].fd = wait_fd;
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
 
@@ -297,12 +315,18 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
             continue;
         }
 
-        /* SIGCHLD received: drain the signalfd and check child. */
+        /* Child exit wakeup: drain wait_fd and check child status. */
         if (pfds[1].revents & POLLIN) {
-            struct signalfd_siginfo si;
-            while (read(sigchld_fd, &si, sizeof(si)) > 0)
-                ;
-            ret = check_child(ctx->child_pid, &exit_code);
+            if (sigchld_fd >= 0) {
+                struct signalfd_siginfo si;
+                while (read(sigchld_fd, &si, sizeof(si)) > 0)
+                    ;
+            } else {
+                uint64_t val;
+                while (read(wait_fd, &val, sizeof(val)) > 0)
+                    ;
+            }
+            ret = check_ctx_child(ctx, &exit_code);
             if (ret < 0) {
                 fprintf(stderr, "waitpid: %s\n", strerror(errno));
                 goto out;
@@ -313,7 +337,7 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
 
         /* POLLHUP / POLLERR on listener => recheck child. */
         if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            ret = check_child(ctx->child_pid, &exit_code);
+            ret = check_ctx_child(ctx, &exit_code);
             if (ret < 0) {
                 fprintf(stderr, "waitpid: %s\n", strerror(errno));
                 goto out;
@@ -337,7 +361,7 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
                     kbox_web_counters(ctx->web)->recv_enoent++;
 #endif
                 if (e == ENOENT) {
-                    ret = check_child(ctx->child_pid, &exit_code);
+                    ret = check_ctx_child(ctx, &exit_code);
                     if (ret < 0) {
                         fprintf(stderr, "waitpid: %s\n", strerror(errno));
                         goto out;
@@ -401,6 +425,9 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
 
         d = kbox_dispatch_request(ctx, &req);
 
+        if (d.kind == KBOX_DISPATCH_DEFERRED)
+            continue;
+
         /* Build and send response. */
         build_response(&resp, notif.id, &d);
         ret = kbox_notify_send(ctx->listener_fd, &resp);
@@ -438,7 +465,7 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
                 if (e == ENOENT && ctx->web)
                     kbox_web_counters(ctx->web)->send_enoent++;
 #endif
-                ret = check_child(ctx->child_pid, &exit_code);
+                ret = check_ctx_child(ctx, &exit_code);
                 if (ret < 0) {
                     fprintf(stderr, "waitpid: %s\n", strerror(errno));
                     goto out;
@@ -453,22 +480,49 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
     }
 
 out:
-    close(sigchld_fd);
+    if (sigchld_fd >= 0)
+        close(sigchld_fd);
     return exit_code;
+}
+
+int kbox_supervise_ctx(struct kbox_supervisor_ctx *ctx)
+{
+    return supervise_loop(ctx);
+}
+
+int kbox_supervisor_prepare_child_security(void)
+{
+    struct rlimit rl = {65536, 65536};
+    struct rlimit rtlim = {0, 0};
+
+    setrlimit(RLIMIT_NOFILE, &rl);
+    setrlimit(RLIMIT_RTPRIO, &rtlim);
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        fprintf(stderr, "prctl(PR_SET_NO_NEW_PRIVS): %s\n", strerror(errno));
+        return -1;
+    }
+
+    prctl(47 /* PR_CAP_AMBIENT */, 4 /* PR_CAP_AMBIENT_CLEAR_ALL */, 0, 0, 0);
+    for (int cap = 0; cap <= 63; cap++)
+        prctl(24 /* PR_CAPBSET_DROP */, cap, 0, 0, 0);
+    return 0;
 }
 
 /* Public entry point. */
 
-int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
-                        const char *command,
-                        const char *const *args,
-                        int nargs,
-                        const char *host_root,
-                        int exec_memfd,
-                        int verbose,
-                        int root_identity,
-                        int normalize,
-                        struct kbox_web_ctx *web)
+int kbox_run_supervisor_volumes(const struct kbox_sysnrs *sysnrs,
+                                const char *command,
+                                const char *const *args,
+                                int nargs,
+                                const char *host_root,
+                                int exec_memfd,
+                                int verbose,
+                                int root_identity,
+                                int normalize,
+                                struct kbox_web_ctx *web,
+                                const struct kbox_host_bind *host_binds,
+                                size_t host_bind_count)
 {
     int sp[2]; /* socketpair */
     pid_t pid;
@@ -519,44 +573,8 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
         /* Child process. */
         close(sp[0]);
 
-        /* Raise RLIMIT_NOFILE so the host kernel allows FD numbers
-         * above the default limit (typically 1024).  The guest shell
-         * (busybox ash) saves/restores FDs via fcntl(F_DUPFD, minfd)
-         * where minfd can be above 4096 when virtual FDs are in use.
-         * Without this, the host kernel returns EINVAL.
-         */
-        {
-            struct rlimit rl;
-            rl.rlim_cur = 65536;
-            rl.rlim_max = 65536;
-            setrlimit(RLIMIT_NOFILE, &rl);
-        }
-
-        /* Prevent RT scheduling starvation: cap RLIMIT_RTPRIO to 0
-         * so sched_setscheduler(SCHED_FIFO/RR) fails with EPERM.
-         * This makes sched_* CONTINUE entries safe.
-         */
-        {
-            struct rlimit rtlim = {0, 0};
-            setrlimit(RLIMIT_RTPRIO, &rtlim);
-        }
-
-        /* 3a. No new privileges: required for seccomp. */
-        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-            fprintf(stderr, "prctl(PR_SET_NO_NEW_PRIVS): %s\n",
-                    strerror(errno));
+        if (kbox_supervisor_prepare_child_security() < 0)
             _exit(127);
-        }
-
-        /* Drop all ambient capabilities and clear the bounding set.
-         * This limits what the child can do even if it somehow
-         * gains privileges.  Errors are ignored: a given cap number
-         * may not exist on this kernel.
-         */
-        prctl(47 /* PR_CAP_AMBIENT */, 4 /* PR_CAP_AMBIENT_CLEAR_ALL */, 0, 0,
-              0);
-        for (int cap = 0; cap <= 63; cap++)
-            prctl(24 /* PR_CAPBSET_DROP */, cap, 0, 0, 0);
 
         /* 3b. Install BPF filter, get listener FD. */
         listener_fd = kbox_install_seccomp_listener(host_nrs);
@@ -567,7 +585,7 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
 
         /* 3c. Send listener FD to parent via SCM_RIGHTS.
          * sendmsg is in the BPF allow list so this bypasses seccomp. */
-        if (send_fd(sp[1], listener_fd) < 0)
+        if (kbox_supervisor_send_fd(sp[1], listener_fd) < 0)
             _exit(127);
 
         /* 3d. Close socket and listener; parent owns them now. */
@@ -617,7 +635,7 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
     close(sp[1]);
 
     /* 4a. Receive listener FD from child. */
-    listener_fd = recv_fd(sp[0]);
+    listener_fd = kbox_supervisor_recv_fd(sp[0]);
     close(sp[0]);
 
     if (listener_fd < 0) {
@@ -661,9 +679,14 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
     ctx.guest_mem_ops = &kbox_process_vm_guest_mem_ops;
     ctx.fd_inject_ops = NULL;
     ctx.web = web;
+    ctx.host_binds = host_binds;
+    ctx.host_bind_count = host_bind_count;
+    ctx.exit_notify_fd = -1;
+    ctx.exit_status_ptr = NULL;
 
     /* 4c. Enter supervisor loop. */
     exit_code = supervise_loop(&ctx);
+    kbox_dispatch_cleanup_proc_fds(&ctx);
 
     /* Restore the caller's signal mask now that the signalfd is closed. */
     if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0)
@@ -692,4 +715,20 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
         return -1;
     }
     return 0;
+}
+
+int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
+                        const char *command,
+                        const char *const *args,
+                        int nargs,
+                        const char *host_root,
+                        int exec_memfd,
+                        int verbose,
+                        int root_identity,
+                        int normalize,
+                        struct kbox_web_ctx *web)
+{
+    return kbox_run_supervisor_volumes(sysnrs, command, args, nargs, host_root,
+                                       exec_memfd, verbose, root_identity,
+                                       normalize, web, NULL, 0);
 }

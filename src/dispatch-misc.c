@@ -8,11 +8,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -135,13 +138,17 @@ struct kbox_dispatch forward_readlinkat(const struct kbox_syscall_request *req,
     /* Host dirfd: call host readlinkat with a supervisor-owned copy. */
     if (should_continue_for_dirfd(lkl_dirfd)) {
         long raw_dirfd = to_dirfd_arg(kbox_syscall_request_arg(req, 0));
-        int sv_dirfd = dup_tracee_fd(pid, (int) raw_dirfd);
-        if (sv_dirfd < 0)
-            return kbox_dispatch_errno(-sv_dirfd);
+        int sv_dirfd = AT_FDCWD;
+        int close_sv = 0;
+        int drc = open_host_dirfd_for_dispatch(pid, raw_dirfd, lkl_dirfd,
+                                               &sv_dirfd, &close_sv);
+        if (drc < 0)
+            return kbox_dispatch_errno(-drc);
         char linkbuf[KBOX_MAX_PATH];
         ssize_t n = readlinkat(sv_dirfd, translated, linkbuf, bufsiz);
         int saved = errno;
-        close(sv_dirfd);
+        if (close_sv)
+            close(sv_dirfd);
         if (n < 0)
             return kbox_dispatch_errno(saved);
         int wrc = guest_mem_write(ctx, pid, remote_buf, linkbuf, (size_t) n);
@@ -164,10 +171,42 @@ struct kbox_dispatch forward_readlinkat(const struct kbox_syscall_request *req,
     return kbox_dispatch_value((int64_t) n);
 }
 
+static struct kbox_dispatch inject_host_fd_pair(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    int host_fds[2],
+    uint64_t remote_fds,
+    uint32_t cloexec_flag)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+    int tracee_fd0 = request_addfd(ctx, req, host_fds[0], cloexec_flag);
+    if (tracee_fd0 < 0) {
+        close(host_fds[0]);
+        close(host_fds[1]);
+        return kbox_dispatch_errno(-tracee_fd0);
+    }
+
+    int tracee_fd1 = request_addfd(ctx, req, host_fds[1], cloexec_flag);
+    close(host_fds[0]);
+    close(host_fds[1]);
+    if (tracee_fd1 < 0)
+        return kbox_dispatch_errno(-tracee_fd1);
+
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd0);
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd1);
+
+    int guest_fds[2] = {tracee_fd0, tracee_fd1};
+    int wrc =
+        guest_mem_write(ctx, pid, remote_fds, guest_fds, sizeof(guest_fds));
+    if (wrc < 0)
+        return kbox_dispatch_errno(-wrc);
+
+    return kbox_dispatch_value(0);
+}
+
 struct kbox_dispatch forward_pipe2(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx)
 {
-    pid_t pid = kbox_syscall_request_pid(req);
     uint64_t remote_pipefd = kbox_syscall_request_arg(req, 0);
     long flags = to_c_long_arg(kbox_syscall_request_arg(req, 1));
 
@@ -185,38 +224,46 @@ struct kbox_dispatch forward_pipe2(const struct kbox_syscall_request *req,
     if (pipe2(host_pipefd, (int) flags) < 0)
         return kbox_dispatch_errno(errno);
 
-    uint32_t cloexec_flag = (flags & O_CLOEXEC) ? O_CLOEXEC : 0;
+    return inject_host_fd_pair(req, ctx, host_pipefd, remote_pipefd,
+                               (flags & O_CLOEXEC) ? O_CLOEXEC : 0);
+}
 
-    int tracee_fd0 = request_addfd(ctx, req, host_pipefd[0], cloexec_flag);
-    if (tracee_fd0 < 0) {
-        close(host_pipefd[0]);
-        close(host_pipefd[1]);
-        return kbox_dispatch_errno(-tracee_fd0);
-    }
+struct kbox_dispatch forward_socketpair(const struct kbox_syscall_request *req,
+                                        struct kbox_supervisor_ctx *ctx)
+{
+    long domain = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    long type_raw = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+    long protocol = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    uint64_t remote_sv = kbox_syscall_request_arg(req, 3);
 
-    int tracee_fd1 = request_addfd(ctx, req, host_pipefd[1], cloexec_flag);
-    if (tracee_fd1 < 0) {
-        close(host_pipefd[0]);
-        close(host_pipefd[1]);
-        return kbox_dispatch_errno(-tracee_fd1);
-    }
+    if (remote_sv == 0)
+        return kbox_dispatch_errno(EFAULT);
+    if (domain != AF_UNIX)
+        return kbox_dispatch_errno(EAFNOSUPPORT);
 
-    /* Supervisor copies no longer needed; tracee owns its own copies. */
-    close(host_pipefd[0]);
-    close(host_pipefd[1]);
+    int host_sv[2];
+    if (socketpair((int) domain, (int) type_raw, (int) protocol, host_sv) < 0)
+        return kbox_dispatch_errno(errno);
 
-    /* Track both pipe FDs as host-passthrough so I/O handlers CONTINUE them
-     * instead of returning EBADF.
-     */
-    track_host_passthrough_fd(ctx->fd_table, tracee_fd0);
-    track_host_passthrough_fd(ctx->fd_table, tracee_fd1);
+    return inject_host_fd_pair(req, ctx, host_sv, remote_sv,
+                               (type_raw & SOCK_CLOEXEC) ? O_CLOEXEC : 0);
+}
 
-    int guest_fds[2] = {tracee_fd0, tracee_fd1};
-    int wrc =
-        guest_mem_write(ctx, pid, remote_pipefd, guest_fds, sizeof(guest_fds));
-    if (wrc < 0)
-        return kbox_dispatch_errno(-wrc);
+struct kbox_dispatch forward_xattr_nodata(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    (void) req;
+    (void) ctx;
+    return kbox_dispatch_errno(ENODATA);
+}
 
+struct kbox_dispatch forward_xattr_empty_list(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    (void) req;
+    (void) ctx;
     return kbox_dispatch_value(0);
 }
 
@@ -233,6 +280,15 @@ struct kbox_dispatch forward_uname(const struct kbox_syscall_request *req,
     memset(&uts, 0, sizeof(uts));
     snprintf(uts.sysname, sizeof(uts.sysname), "Linux");
     snprintf(uts.nodename, sizeof(uts.nodename), "kbox");
+    if (ctx->exit_notify_fd >= 0 && ctx->sysnrs && ctx->sysnrs->uname > 0) {
+        struct utsname lkl_uts;
+        memset(&lkl_uts, 0, sizeof(lkl_uts));
+        if (lkl_syscall6(ctx->sysnrs->uname, (long) &lkl_uts, 0, 0, 0, 0, 0) ==
+                0 &&
+            lkl_uts.nodename[0] && strcmp(lkl_uts.nodename, "(none)") != 0)
+            snprintf(uts.nodename, sizeof(uts.nodename), "%s",
+                     lkl_uts.nodename);
+    }
     snprintf(uts.release, sizeof(uts.release), "6.8.0-kbox");
     snprintf(uts.version, sizeof(uts.version), "#1 SMP");
 #if defined(__x86_64__)
@@ -341,6 +397,9 @@ struct kbox_dispatch forward_syslog(const struct kbox_syscall_request *req,
      */
     static uint8_t scratch[1024 * 1024];
     static long cached_ring_sz;
+    static pthread_mutex_t syslog_lock = PTHREAD_MUTEX_INITIALIZER;
+
+    pthread_mutex_lock(&syslog_lock);
     if (!cached_ring_sz) {
         long sz = lkl_syscall6(ctx->sysnrs->syslog, SYSLOG_ACTION_SIZE_BUFFER,
                                0, 0, 0, 0, 0);
@@ -353,11 +412,14 @@ struct kbox_dispatch forward_syslog(const struct kbox_syscall_request *req,
 
     long ret =
         lkl_syscall6(ctx->sysnrs->syslog, type, (long) scratch, len, 0, 0, 0);
-    if (ret < 0)
+    if (ret < 0) {
+        pthread_mutex_unlock(&syslog_lock);
         return kbox_dispatch_errno((int) (-ret));
+    }
 
     size_t n = (size_t) ret;
     int wrc = guest_mem_write(ctx, pid, remote_buf, scratch, n);
+    pthread_mutex_unlock(&syslog_lock);
 
     if (wrc < 0)
         return kbox_dispatch_errno(-wrc);
@@ -435,6 +497,113 @@ struct kbox_dispatch forward_prctl(const struct kbox_syscall_request *req,
     return kbox_dispatch_value(0);
 }
 
+#define KBOX_CAP_VERSION_1 0x19980330U
+#define KBOX_CAP_VERSION_2 0x20071026U
+#define KBOX_CAP_VERSION_3 0x20080522U
+
+struct kbox_cap_header {
+    uint32_t version;
+    int32_t pid;
+};
+
+struct kbox_cap_data {
+    uint32_t effective;
+    uint32_t permitted;
+    uint32_t inheritable;
+};
+
+static int cap_u32s_for_version(uint32_t version)
+{
+    if (version == KBOX_CAP_VERSION_1)
+        return 1;
+    if (version == KBOX_CAP_VERSION_2 || version == KBOX_CAP_VERSION_3)
+        return 2;
+    return 0;
+}
+
+/* Read and validate a Linux capability header from the tracee.
+ * On unsupported version, kernel capget/capset rewrites hdr->version to v3 and
+ * returns EINVAL (or 0 for capget with datap == NULL). Returns u32s (>0) when
+ * valid, 0 if capget(hdrp, NULL) succeeded after version rewrite, or -errno.
+ */
+static int cap_validate_header(struct kbox_supervisor_ctx *ctx,
+                               pid_t pid,
+                               uint64_t remote_hdr,
+                               int allow_null_data,
+                               uint64_t remote_data)
+{
+    if (remote_hdr == 0)
+        return -EFAULT;
+
+    struct kbox_cap_header hdr;
+    int rrc = guest_mem_read(ctx, pid, remote_hdr, &hdr, sizeof(hdr));
+    if (rrc < 0)
+        return rrc;
+
+    int u32s = cap_u32s_for_version(hdr.version);
+    if (u32s == 0) {
+        hdr.version = KBOX_CAP_VERSION_3;
+        int wrc = guest_mem_write(ctx, pid, remote_hdr, &hdr, sizeof(hdr));
+        if (wrc < 0)
+            return wrc;
+        if (allow_null_data && remote_data == 0)
+            return 0;
+        return -EINVAL;
+    }
+
+    return u32s;
+}
+
+struct kbox_dispatch forward_capget(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+    uint64_t remote_hdr = kbox_syscall_request_arg(req, 0);
+    uint64_t remote_data = kbox_syscall_request_arg(req, 1);
+
+    int u32s = cap_validate_header(ctx, pid, remote_hdr, 1, remote_data);
+    if (u32s < 0)
+        return kbox_dispatch_errno(-u32s);
+    if (u32s == 0 || remote_data == 0)
+        return kbox_dispatch_value(0);
+
+    /* Supervisor runs with NO_NEW_PRIVS and ambient/bounding caps cleared;
+     * report an empty capability mask consistently for any virtual PID.
+     */
+    struct kbox_cap_data data[2] = {0};
+    int wrc = guest_mem_write(ctx, pid, remote_data, data,
+                              (size_t) u32s * sizeof(data[0]));
+    if (wrc < 0)
+        return kbox_dispatch_errno(-wrc);
+    return kbox_dispatch_value(0);
+}
+
+struct kbox_dispatch forward_capset(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+    uint64_t remote_hdr = kbox_syscall_request_arg(req, 0);
+    uint64_t remote_data = kbox_syscall_request_arg(req, 1);
+
+    int u32s = cap_validate_header(ctx, pid, remote_hdr, 0, remote_data);
+    if (u32s < 0)
+        return kbox_dispatch_errno(-u32s);
+    if (remote_data == 0)
+        return kbox_dispatch_errno(EFAULT);
+
+    struct kbox_cap_data data[2] = {0};
+    int rrc = guest_mem_read(ctx, pid, remote_data, data,
+                             (size_t) u32s * sizeof(data[0]));
+    if (rrc < 0)
+        return kbox_dispatch_errno(-rrc);
+
+    for (int i = 0; i < u32s; i++) {
+        if (data[i].effective || data[i].permitted || data[i].inheritable)
+            return kbox_dispatch_errno(EPERM);
+    }
+    return kbox_dispatch_value(0);
+}
+
 struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
                                       struct kbox_supervisor_ctx *ctx)
 {
@@ -443,7 +612,7 @@ struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -525,7 +694,7 @@ struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
  * single-threaded (documented invariant), so a static buffer is safe.
  */
 #define IOV_MAX_COUNT 1024
-static uint8_t iov_scratch[IOV_MAX_COUNT * IOV_ENTRY_SIZE];
+static __thread uint8_t iov_scratch[IOV_MAX_COUNT * IOV_ENTRY_SIZE];
 
 /* Shared iov scatter/gather dispatcher for writev and readv.
  *
@@ -540,11 +709,14 @@ static struct kbox_dispatch dispatch_iov_transfer(
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
+    if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
+        return kbox_dispatch_continue();
 
     if (is_write)
         invalidate_stat_cache_fd(ctx, lkl_fd);
@@ -662,7 +834,7 @@ struct kbox_dispatch forward_ftruncate(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -686,7 +858,7 @@ struct kbox_dispatch forward_fallocate(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -713,14 +885,54 @@ struct kbox_dispatch forward_flock(const struct kbox_syscall_request *req,
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
 
     long operation = to_c_long_arg(kbox_syscall_request_arg(req, 1));
     long ret = kbox_lkl_flock(ctx->sysnrs, lkl_fd, operation);
+    if (ret == -ENOSYS) {
+        if ((operation & (LOCK_SH | LOCK_EX | LOCK_UN)) == 0)
+            return kbox_dispatch_errno(EINVAL);
+        return kbox_dispatch_value(0);
+    }
     return kbox_dispatch_from_lkl(ret);
+}
+
+struct kbox_dispatch forward_fchmod(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx)
+{
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
+
+    long mode = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+    long ret = kbox_lkl_fchmod(ctx->sysnrs, lkl_fd, mode);
+    if (ret >= 0) {
+        invalidate_path_shadow_cache(ctx);
+        invalidate_stat_cache_fd(ctx, lkl_fd);
+    }
+    return kbox_dispatch_from_lkl(ret);
+}
+
+struct kbox_dispatch forward_fadvise64(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx)
+{
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
+    return kbox_dispatch_value(0);
 }
 
 struct kbox_dispatch forward_fsync(const struct kbox_syscall_request *req,
@@ -731,7 +943,7 @@ struct kbox_dispatch forward_fsync(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -754,7 +966,7 @@ struct kbox_dispatch forward_fdatasync(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -799,12 +1011,18 @@ struct kbox_dispatch forward_symlinkat(const struct kbox_syscall_request *req,
     /* Host dirfd: call host symlinkat with a supervisor-owned copy. */
     if (should_continue_for_dirfd(newdirfd)) {
         long raw = to_dirfd_arg(kbox_syscall_request_arg(req, 1));
-        int sv_dirfd = dup_tracee_fd(pid, (int) raw);
-        if (sv_dirfd < 0)
-            return kbox_dispatch_errno(-sv_dirfd);
+        if (host_bind_is_readonly(ctx, pid, raw, newdirfd))
+            return kbox_dispatch_errno(EROFS);
+        int sv_dirfd = AT_FDCWD;
+        int close_sv = 0;
+        int drc = open_host_dirfd_for_dispatch(pid, raw, newdirfd, &sv_dirfd,
+                                               &close_sv);
+        if (drc < 0)
+            return kbox_dispatch_errno(-drc);
         int host_rc = symlinkat(targetbuf, sv_dirfd, linktrans);
         int saved = errno;
-        close(sv_dirfd);
+        if (close_sv)
+            close(sv_dirfd);
         if (host_rc < 0)
             return kbox_dispatch_errno(saved);
         invalidate_path_shadow_cache(ctx);
@@ -842,32 +1060,34 @@ struct kbox_dispatch forward_linkat(const struct kbox_syscall_request *req,
     /* Host dirfd on either side: call host linkat with supervisor copies. */
     if (should_continue_for_dirfd(olddirfd) ||
         should_continue_for_dirfd(newdirfd)) {
+        if (!should_continue_for_dirfd(olddirfd) ||
+            !should_continue_for_dirfd(newdirfd))
+            return kbox_dispatch_errno(EXDEV);
+        long raw_old = to_dirfd_arg(kbox_syscall_request_arg(req, 0));
+        long raw_new = to_dirfd_arg(kbox_syscall_request_arg(req, 2));
+        if (host_bind_is_readonly(ctx, pid, raw_old, olddirfd) ||
+            host_bind_is_readonly(ctx, pid, raw_new, newdirfd))
+            return kbox_dispatch_errno(EROFS);
         int sv_old = AT_FDCWD;
         int sv_new = AT_FDCWD;
-        if (should_continue_for_dirfd(olddirfd)) {
-            long raw = to_dirfd_arg(kbox_syscall_request_arg(req, 0));
-            sv_old = dup_tracee_fd(pid, (int) raw);
-            if (sv_old < 0)
-                return kbox_dispatch_errno(-sv_old);
-        } else {
-            sv_old = (int) olddirfd;
-        }
-        if (should_continue_for_dirfd(newdirfd)) {
-            long raw = to_dirfd_arg(kbox_syscall_request_arg(req, 2));
-            sv_new = dup_tracee_fd(pid, (int) raw);
-            if (sv_new < 0) {
-                if (should_continue_for_dirfd(olddirfd))
-                    close(sv_old);
-                return kbox_dispatch_errno(-sv_new);
-            }
-        } else {
-            sv_new = (int) newdirfd;
+        int close_old = 0;
+        int close_new = 0;
+        int drc = open_host_dirfd_for_dispatch(pid, raw_old, olddirfd, &sv_old,
+                                               &close_old);
+        if (drc < 0)
+            return kbox_dispatch_errno(-drc);
+        drc = open_host_dirfd_for_dispatch(pid, raw_new, newdirfd, &sv_new,
+                                           &close_new);
+        if (drc < 0) {
+            if (close_old)
+                close(sv_old);
+            return kbox_dispatch_errno(-drc);
         }
         int host_rc = linkat(sv_old, oldtrans, sv_new, newtrans, (int) flags);
         int saved = errno;
-        if (should_continue_for_dirfd(olddirfd))
+        if (close_old)
             close(sv_old);
-        if (should_continue_for_dirfd(newdirfd))
+        if (close_new)
             close(sv_new);
         if (host_rc < 0)
             return kbox_dispatch_errno(saved);
@@ -933,13 +1153,27 @@ struct kbox_dispatch forward_utimensat(const struct kbox_syscall_request *req,
      * with a supervisor-owned copy of the tracee's dirfd.
      */
     if (need_host_emulation) {
-        int sv_dirfd = dup_tracee_fd(pid, (int) dirfd_raw);
-        if (sv_dirfd < 0)
-            return kbox_dispatch_errno(-sv_dirfd);
-        int host_rc = utimensat(sv_dirfd, translated_path,
+        if (host_bind_is_readonly(ctx, pid, dirfd_raw, lkl_dirfd))
+            return kbox_dispatch_errno(EROFS);
+        int sv_dirfd = AT_FDCWD;
+        int close_sv = 0;
+        int drc = open_host_dirfd_for_dispatch(pid, dirfd_raw, lkl_dirfd,
+                                               &sv_dirfd, &close_sv);
+        if (drc < 0)
+            return kbox_dispatch_errno(-drc);
+        int host_rc;
+        if (translated_path) {
+            host_rc = utimensat(sv_dirfd, translated_path,
                                 (const struct timespec *) times, (int) flags);
+        } else if (flags == 0) {
+            host_rc = futimens(sv_dirfd, (const struct timespec *) times);
+        } else {
+            errno = EINVAL;
+            host_rc = -1;
+        }
         int saved = errno;
-        close(sv_dirfd);
+        if (close_sv)
+            close(sv_dirfd);
         if (host_rc < 0)
             return kbox_dispatch_errno(saved);
         invalidate_path_shadow_cache(ctx);
@@ -995,7 +1229,7 @@ struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
         return kbox_dispatch_continue();
     }
     if (lkl_fd < 0) {
-        if (!fd_should_deny_io(fd, lkl_fd)) {
+        if (!fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)) {
             if (cmd == TIOCSPGRP || cmd == TIOCGPGRP || cmd == TIOCSCTTY)
                 return kbox_dispatch_errno(ENOTTY);
             return kbox_dispatch_continue();

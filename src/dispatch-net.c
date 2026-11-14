@@ -4,8 +4,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "dispatch-internal.h"
@@ -31,6 +34,69 @@
  * doesn't support inbound connections. Server sockets must be used without
  * --net or via a future deferred-bridge approach.
  */
+static int attach_shadow_socket(const struct kbox_syscall_request *req,
+                                struct kbox_supervisor_ctx *ctx,
+                                long lkl_fd,
+                                int base_type,
+                                int sock_flags,
+                                int64_t *out_fd)
+{
+    int sp[2];
+    if (socketpair(AF_UNIX, base_type | SOCK_CLOEXEC, 0, sp) < 0)
+        return -errno;
+
+    fcntl(sp[0], F_SETFL, O_NONBLOCK);
+    if (sock_flags & SOCK_NONBLOCK)
+        fcntl(sp[1], F_SETFL, O_NONBLOCK);
+
+    long vfd = kbox_fd_table_insert(ctx->fd_table, lkl_fd, 0);
+    if (vfd < 0) {
+        close(sp[0]);
+        close(sp[1]);
+        return -EMFILE;
+    }
+
+    if (kbox_net_register_socket((int) lkl_fd, sp[0], base_type) < 0) {
+        close(sp[0]);
+        close(sp[1]);
+        if (sock_flags & SOCK_CLOEXEC)
+            kbox_fd_table_set_cloexec(ctx->fd_table, vfd, 1);
+        *out_fd = (int64_t) vfd;
+        return 0;
+    }
+
+    uint32_t addfd_flags = (sock_flags & SOCK_CLOEXEC) ? O_CLOEXEC : 0;
+    int host_fd = request_addfd(ctx, req, sp[1], addfd_flags);
+    if (host_fd < 0) {
+        kbox_net_deregister_socket((int) lkl_fd);
+        close(sp[1]);
+        kbox_fd_table_remove(ctx->fd_table, vfd);
+        return host_fd;
+    }
+    kbox_fd_table_set_host_fd(ctx->fd_table, vfd, host_fd);
+
+    /* The ADDFD-injected host_fd may land on a low FD number that already
+     * has a SHADOW_ONLY entry (from pipe tracking or inherited FD scan).
+     * Overwrite it so resolve_lkl_socket finds the LKL socket via the
+     * direct lookup path instead of returning the stale SHADOW_ONLY.
+     */
+    if (host_fd != vfd) {
+        struct kbox_fd_entry *low = fd_table_entry(ctx->fd_table, host_fd);
+        if (low && low->lkl_fd == KBOX_LKL_FD_SHADOW_ONLY)
+            kbox_fd_table_remove(ctx->fd_table, host_fd);
+    }
+
+    struct kbox_fd_entry *e = fd_table_entry(ctx->fd_table, vfd);
+    if (e) {
+        e->shadow_sp = sp[1];
+        if (sock_flags & SOCK_CLOEXEC)
+            e->cloexec = 1;
+    }
+
+    *out_fd = (int64_t) host_fd;
+    return 0;
+}
+
 struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx)
 {
@@ -47,7 +113,7 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
     long lkl_fd = ret;
 
     /* Virtual FD path when shadow bridge is not applicable:
-     * - SLIRP not active (no --net)
+     * - SLIRP/net loop not active
      * - Non-INET domain (AF_UNIX, AF_NETLINK, etc.)
      * - Non-stream/datagram type (SOCK_RAW, etc.): socketpair(AF_UNIX) only
      *   supports SOCK_STREAM and SOCK_DGRAM
@@ -60,69 +126,19 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
             lkl_close_and_invalidate(ctx, lkl_fd);
             return kbox_dispatch_errno(EMFILE);
         }
+        if (type_raw & SOCK_CLOEXEC)
+            kbox_fd_table_set_cloexec(ctx->fd_table, vfd, 1);
         return kbox_dispatch_value((int64_t) vfd);
     }
 
-    /* Shadow socket bridge for INET with SLIRP. */
-    int sp[2];
-    if (socketpair(AF_UNIX, base_type | SOCK_CLOEXEC, 0, sp) < 0) {
+    int64_t out_fd = -1;
+    int rc = attach_shadow_socket(req, ctx, lkl_fd, base_type, (int) type_raw,
+                                  &out_fd);
+    if (rc < 0) {
         lkl_close_and_invalidate(ctx, lkl_fd);
-        return kbox_dispatch_errno(errno);
+        return kbox_dispatch_errno(-rc);
     }
-    fcntl(sp[0], F_SETFL, O_NONBLOCK);
-    if (type_raw & SOCK_NONBLOCK)
-        fcntl(sp[1], F_SETFL, O_NONBLOCK);
-
-    long vfd = kbox_fd_table_insert(ctx->fd_table, lkl_fd, 0);
-    if (vfd < 0) {
-        close(sp[0]);
-        close(sp[1]);
-        lkl_close_and_invalidate(ctx, lkl_fd);
-        return kbox_dispatch_errno(EMFILE);
-    }
-
-    if (kbox_net_register_socket((int) lkl_fd, sp[0], base_type) < 0) {
-        close(sp[0]);
-        close(sp[1]);
-        /* Fall back to virtual FD. */
-        return kbox_dispatch_value((int64_t) vfd);
-    }
-
-    uint32_t addfd_flags = 0;
-    if (type_raw & SOCK_CLOEXEC)
-        addfd_flags = O_CLOEXEC;
-    int host_fd = request_addfd(ctx, req, sp[1], addfd_flags);
-    if (host_fd < 0) {
-        /* Deregister closes sp[0] and marks inactive. */
-        kbox_net_deregister_socket((int) lkl_fd);
-        close(sp[1]);
-        kbox_fd_table_remove(ctx->fd_table, vfd);
-        lkl_close_and_invalidate(ctx, lkl_fd);
-        return kbox_dispatch_errno(-host_fd);
-    }
-    kbox_fd_table_set_host_fd(ctx->fd_table, vfd, host_fd);
-
-    /* The ADDFD-injected host_fd may land on a low FD number that already
-     * has a SHADOW_ONLY entry (from pipe tracking or inherited FD scan).
-     * Overwrite it so resolve_lkl_socket finds the LKL socket via the
-     * direct lookup path instead of returning the stale SHADOW_ONLY.
-     */
-    if (host_fd != vfd) {
-        struct kbox_fd_entry *low = fd_table_entry(ctx->fd_table, host_fd);
-        if (low && low->lkl_fd == KBOX_LKL_FD_SHADOW_ONLY)
-            kbox_fd_table_remove(ctx->fd_table, host_fd);
-    }
-
-    {
-        struct kbox_fd_entry *e = fd_table_entry(ctx->fd_table, vfd);
-        if (e) {
-            e->shadow_sp = sp[1];
-            if (type_raw & SOCK_CLOEXEC)
-                e->cloexec = 1;
-        }
-    }
-
-    return kbox_dispatch_value((int64_t) host_fd);
+    return kbox_dispatch_value(out_fd);
 }
 
 static long resolve_lkl_socket(struct kbox_supervisor_ctx *ctx, long fd);
@@ -161,22 +177,314 @@ struct kbox_dispatch forward_bind(const struct kbox_syscall_request *req,
     return kbox_dispatch_from_lkl(ret);
 }
 
-/* Resolve LKL FD from a tracee FD.  The tracee may hold either a virtual FD
- * (>= KBOX_FD_BASE) or a host FD from a shadow-socket bridge via ADDFD.
- * Try both paths.
- */
-static long resolve_lkl_socket(struct kbox_supervisor_ctx *ctx, long fd)
+/* Resolve LKL FD and optional FD-table entry from a tracee FD. */
+static long resolve_lkl_socket_entry(struct kbox_supervisor_ctx *ctx,
+                                     long fd,
+                                     struct kbox_fd_entry **entry_out)
 {
+    if (entry_out)
+        *entry_out = NULL;
+
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
-    if (lkl_fd >= 0 || lkl_fd == KBOX_LKL_FD_SHADOW_ONLY)
+    if (lkl_fd >= 0) {
+        if (entry_out)
+            *entry_out = fd_table_entry(ctx->fd_table, fd);
+        return lkl_fd;
+    }
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY)
         return lkl_fd;
 
-    /* Shadow socket: tracee uses the host_fd directly. */
     long vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
-    if (vfd >= 0)
-        return kbox_fd_table_get_lkl(ctx->fd_table, vfd);
+    if (vfd >= 0) {
+        struct kbox_fd_entry *e = fd_table_entry(ctx->fd_table, vfd);
+        if (entry_out)
+            *entry_out = e;
+        return e ? e->lkl_fd : -1;
+    }
 
     return -1;
+}
+
+static long resolve_lkl_socket(struct kbox_supervisor_ctx *ctx, long fd)
+{
+    return resolve_lkl_socket_entry(ctx, fd, NULL);
+}
+
+struct kbox_dispatch forward_listen(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx)
+{
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    long backlog = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+    struct kbox_fd_entry *entry = NULL;
+    long lkl_fd = resolve_lkl_socket_entry(ctx, fd, &entry);
+
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
+
+    long ret = kbox_lkl_listen(ctx->sysnrs, lkl_fd, backlog);
+    if (ret == 0 && entry && entry->shadow_sp >= 0 && kbox_net_is_active())
+        kbox_net_set_listening((int) lkl_fd);
+    return kbox_dispatch_from_lkl(ret);
+}
+
+static struct kbox_dispatch complete_accept_result(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    struct kbox_fd_entry *entry,
+    long listen_lkl_fd,
+    uint64_t addr_ptr,
+    uint64_t len_ptr,
+    unsigned int in_len,
+    unsigned int out_len,
+    const uint8_t *addr,
+    long client_lkl,
+    int flags)
+{
+    /* Drain any listening readiness token from the host socketpair and re-arm
+     * notification in case additional backlog connections remain.
+     */
+    if (entry && entry->shadow_sp >= 0 && kbox_net_is_active()) {
+        char drain[16];
+        while (recv(entry->shadow_sp, drain, sizeof(drain), MSG_DONTWAIT) > 0)
+            ;
+        kbox_net_clear_listening_notify((int) listen_lkl_fd);
+    }
+
+    if (client_lkl < 0)
+        return kbox_dispatch_from_lkl(client_lkl);
+
+    pid_t pid = kbox_syscall_request_pid(req);
+    if (addr_ptr != 0) {
+        unsigned int write_len = out_len < in_len ? out_len : in_len;
+        if (write_len > 0) {
+            int wrc = guest_mem_write(ctx, pid, addr_ptr, addr, write_len);
+            if (wrc < 0) {
+                lkl_close_and_invalidate(ctx, client_lkl);
+                return kbox_dispatch_errno(-wrc);
+            }
+        }
+        int wrc = guest_mem_write(ctx, pid, len_ptr, &out_len, sizeof(out_len));
+        if (wrc < 0) {
+            lkl_close_and_invalidate(ctx, client_lkl);
+            return kbox_dispatch_errno(-wrc);
+        }
+    }
+
+    if (!entry || entry->shadow_sp < 0 || !kbox_net_is_active()) {
+        long vfd = kbox_fd_table_insert(ctx->fd_table, client_lkl, 0);
+        if (vfd < 0) {
+            lkl_close_and_invalidate(ctx, client_lkl);
+            return kbox_dispatch_errno(EMFILE);
+        }
+        if (flags & SOCK_CLOEXEC)
+            kbox_fd_table_set_cloexec(ctx->fd_table, vfd, 1);
+        return kbox_dispatch_value((int64_t) vfd);
+    }
+
+    int64_t out_fd = -1;
+    int rc = attach_shadow_socket(req, ctx, client_lkl, SOCK_STREAM, flags,
+                                  &out_fd);
+    if (rc < 0) {
+        lkl_close_and_invalidate(ctx, client_lkl);
+        return kbox_dispatch_errno(-rc);
+    }
+    return kbox_dispatch_value(out_fd);
+}
+
+static struct kbox_dispatch defer_pending_accept(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    long listen_fd,
+    int flags,
+    uint64_t addr_ptr,
+    uint64_t len_ptr,
+    unsigned int in_len)
+{
+    for (size_t i = 0; i < KBOX_PENDING_ACCEPTS_MAX; i++) {
+        if (!ctx->pending_accepts[i].active) {
+            ctx->pending_accepts[i].active = 1;
+            ctx->pending_accepts[i].req = *req;
+            ctx->pending_accepts[i].listen_fd = listen_fd;
+            ctx->pending_accepts[i].flags = flags;
+            ctx->pending_accepts[i].addr_ptr = addr_ptr;
+            ctx->pending_accepts[i].len_ptr = len_ptr;
+            ctx->pending_accepts[i].in_len = in_len;
+            ctx->pending_accept_count++;
+            return (struct kbox_dispatch){.kind = KBOX_DISPATCH_DEFERRED};
+        }
+    }
+    return kbox_dispatch_errno(EAGAIN);
+}
+
+static long try_accept4_nonblock(const struct kbox_sysnrs *sysnrs,
+                                 long lkl_fd,
+                                 int *was_nonblock_out,
+                                 void *addr,
+                                 unsigned int *out_len,
+                                 int flags)
+{
+    long lfl = kbox_lkl_fcntl(sysnrs, lkl_fd, F_GETFL, 0);
+    int nonblock = (lfl >= 0 && (lfl & O_NONBLOCK)) ? 1 : 0;
+
+    if (was_nonblock_out)
+        *was_nonblock_out = nonblock;
+
+    if (!nonblock && lfl >= 0)
+        kbox_lkl_fcntl(sysnrs, lkl_fd, F_SETFL, lfl | O_NONBLOCK);
+    long client_lkl = kbox_lkl_accept4(sysnrs, lkl_fd, addr, out_len, flags);
+    if (!nonblock && lfl >= 0)
+        kbox_lkl_fcntl(sysnrs, lkl_fd, F_SETFL, lfl);
+    return client_lkl;
+}
+
+void kbox_dispatch_poll_pending(struct kbox_supervisor_ctx *ctx)
+{
+    if (!ctx || ctx->pending_accept_count == 0 || ctx->listener_fd < 0)
+        return;
+
+    for (size_t i = 0; i < KBOX_PENDING_ACCEPTS_MAX; i++) {
+        struct kbox_pending_accept *pa = &ctx->pending_accepts[i];
+        if (!pa->active)
+            continue;
+
+        uint64_t id = kbox_syscall_request_cookie(&pa->req);
+        if (ioctl(ctx->listener_fd, KBOX_SECCOMP_IOCTL_NOTIF_ID_VALID, &id) <
+            0) {
+            pa->active = 0;
+            ctx->pending_accept_count--;
+            continue;
+        }
+
+        struct kbox_syscall_request saved_req = pa->req;
+        kbox_dispatch_prepare_request_ctx(ctx, &saved_req);
+
+        struct kbox_fd_entry *entry = NULL;
+        long lkl_fd = resolve_lkl_socket_entry(ctx, pa->listen_fd, &entry);
+        if (lkl_fd < 0) {
+            struct kbox_dispatch d = kbox_dispatch_errno(EBADF);
+            pa->active = 0;
+            ctx->pending_accept_count--;
+            kbox_notify_respond(ctx->listener_fd, id, &d);
+            continue;
+        }
+
+        uint8_t addr[4096];
+        unsigned int out_len = pa->addr_ptr != 0 ? pa->in_len : 0;
+        long client_lkl = try_accept4_nonblock(
+            ctx->sysnrs, lkl_fd, NULL, pa->addr_ptr ? addr : NULL,
+            pa->addr_ptr ? &out_len : NULL, pa->flags);
+        if (client_lkl == -EAGAIN || client_lkl == -EWOULDBLOCK)
+            continue;
+
+        uint64_t addr_ptr = pa->addr_ptr;
+        uint64_t len_ptr = pa->len_ptr;
+        unsigned int in_len = pa->in_len;
+        int flags = pa->flags;
+
+        pa->active = 0;
+        ctx->pending_accept_count--;
+
+        struct kbox_dispatch d = complete_accept_result(
+            &saved_req, ctx, entry, lkl_fd, addr_ptr, len_ptr, in_len, out_len,
+            addr, client_lkl, flags);
+        kbox_notify_respond(ctx->listener_fd, id, &d);
+    }
+}
+
+static struct kbox_dispatch dispatch_accept_common(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    int flags)
+{
+    if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC))
+        return kbox_dispatch_errno(EINVAL);
+
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    struct kbox_fd_entry *entry = NULL;
+    long lkl_fd = resolve_lkl_socket_entry(ctx, fd, &entry);
+
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
+
+    pid_t pid = kbox_syscall_request_pid(req);
+    uint64_t addr_ptr = kbox_syscall_request_arg(req, 1);
+    uint64_t len_ptr = kbox_syscall_request_arg(req, 2);
+    unsigned int in_len = 0;
+
+    if (addr_ptr != 0) {
+        if (len_ptr == 0)
+            return kbox_dispatch_errno(EFAULT);
+        int rrc = guest_mem_read(ctx, pid, len_ptr, &in_len, sizeof(in_len));
+        if (rrc < 0)
+            return kbox_dispatch_errno(-rrc);
+        if ((int) in_len < 0)
+            return kbox_dispatch_errno(EINVAL);
+        if (in_len > 4096)
+            in_len = 4096;
+    }
+
+    uint8_t addr[4096];
+    unsigned int out_len = 0;
+    int nonblock = 0;
+    long client_lkl = -EAGAIN;
+
+    for (;;) {
+        out_len = addr_ptr != 0 ? in_len : 0;
+        if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP &&
+            ctx->listener_fd >= 0) {
+            client_lkl = try_accept4_nonblock(
+                ctx->sysnrs, lkl_fd, &nonblock, addr_ptr ? addr : NULL,
+                addr_ptr ? &out_len : NULL, flags);
+        } else {
+            long lfl = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, F_GETFL, 0);
+            nonblock = (lfl >= 0 && (lfl & O_NONBLOCK)) ? 1 : 0;
+            client_lkl = kbox_lkl_accept4(ctx->sysnrs, lkl_fd,
+                                          addr_ptr ? addr : NULL,
+                                          addr_ptr ? &out_len : NULL, flags);
+        }
+        if (client_lkl != -EAGAIN && client_lkl != -EWOULDBLOCK)
+            break;
+        if (nonblock)
+            break;
+        if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP &&
+            ctx->listener_fd >= 0) {
+            return defer_pending_accept(req, ctx, fd, flags, addr_ptr, len_ptr,
+                                        in_len);
+        }
+        struct pollfd lpfd = {
+            .fd = (int) lkl_fd,
+            .events = POLLIN,
+            .revents = 0,
+        };
+        struct timespec ts = {0, 50 * 1000 * 1000};
+        long pr = kbox_lkl_ppoll(ctx->sysnrs, &lpfd, 1, &ts, NULL, 0);
+        if (pr < 0 && pr != -EINTR) {
+            client_lkl = pr;
+            break;
+        }
+    }
+
+    return complete_accept_result(req, ctx, entry, lkl_fd, addr_ptr, len_ptr,
+                                  in_len, out_len, addr, client_lkl, flags);
+}
+
+struct kbox_dispatch forward_accept(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx)
+{
+    return dispatch_accept_common(req, ctx, 0);
+}
+
+struct kbox_dispatch forward_accept4(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx)
+{
+    int flags = (int) to_c_long_arg(kbox_syscall_request_arg(req, 3));
+    return dispatch_accept_common(req, ctx, flags);
 }
 
 struct kbox_dispatch forward_connect(const struct kbox_syscall_request *req,

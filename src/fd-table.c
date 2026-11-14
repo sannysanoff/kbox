@@ -39,6 +39,7 @@ static inline void clear_fd_entry(struct kbox_fd_entry *e)
 {
     e->lkl_fd = -1;
     e->host_fd = -1;
+    e->host_sv_fd = -1;
     e->shadow_sp = -1;
     e->shadow_writeback = 0;
     e->mirror_tty = 0;
@@ -56,6 +57,7 @@ static inline void init_live_entry(struct kbox_fd_entry *e,
 {
     e->lkl_fd = lkl_fd;
     e->host_fd = -1;
+    e->host_sv_fd = -1;
     e->shadow_sp = -1;
     e->shadow_writeback = 0;
     e->mirror_tty = mirror_tty;
@@ -254,6 +256,12 @@ int kbox_fd_table_insert_at(struct kbox_fd_table *t,
     if (e->lkl_fd != -1) {
         lkl_ref_dec(t, e->lkl_fd);
         rev_host_clear(t, e->host_fd, fd);
+#ifndef KBOX_UNIT_TEST
+        if (e->host_sv_fd >= 0) {
+            close(e->host_sv_fd);
+            e->host_sv_fd = -1;
+        }
+#endif
     }
 
     init_live_entry(e, lkl_fd, mirror_tty);
@@ -299,6 +307,8 @@ long kbox_fd_table_remove(struct kbox_fd_table *t, long fd)
      */
     if (e->host_fd >= 0 && e->shadow_sp < 0)
         close((int) e->host_fd);
+    if (e->host_sv_fd >= 0)
+        close(e->host_sv_fd);
     if (e->shadow_sp >= 0)
         close(e->shadow_sp);
 #endif
@@ -444,6 +454,26 @@ long kbox_fd_table_get_host_fd(const struct kbox_fd_table *t, long fd)
     if (!e || e->lkl_fd == -1)
         return -1;
     return e->host_fd;
+}
+
+void kbox_fd_table_set_host_sv_fd(struct kbox_fd_table *t, long fd, int sv_fd)
+{
+    struct kbox_fd_entry *e = fd_lookup(t, fd);
+    if (!e || e->lkl_fd == -1)
+        return;
+#ifndef KBOX_UNIT_TEST
+    if (e->host_sv_fd >= 0 && e->host_sv_fd != sv_fd)
+        close(e->host_sv_fd);
+#endif
+    e->host_sv_fd = sv_fd;
+}
+
+int kbox_fd_table_get_host_sv_fd(const struct kbox_fd_table *t, long fd)
+{
+    const struct kbox_fd_entry *e = fd_lookup(t, fd);
+    if (!e || e->lkl_fd == -1)
+        return -1;
+    return e->host_sv_fd;
 }
 
 long kbox_fd_table_find_by_host_fd(const struct kbox_fd_table *t, long host_fd)

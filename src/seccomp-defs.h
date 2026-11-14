@@ -98,6 +98,8 @@ struct kbox_seccomp_notif_addfd {
 #define KBOX_SECCOMP_IOCTL_NOTIF_SEND \
     _KBOX_IOWR('!', 1, sizeof(struct kbox_seccomp_notif_resp))
 
+#define KBOX_SECCOMP_IOCTL_NOTIF_ID_VALID _KBOX_IOW('!', 2, sizeof(uint64_t))
+
 #define KBOX_SECCOMP_IOCTL_NOTIF_ADDFD \
     _KBOX_IOW('!', 3, sizeof(struct kbox_seccomp_notif_addfd))
 

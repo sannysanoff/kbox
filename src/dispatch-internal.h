@@ -27,10 +27,10 @@
 #define KBOX_FD_HOST_SAME_FD_SHADOW (-2)
 #define KBOX_FD_LOCAL_ONLY_SHADOW (-3)
 
-/* Shared scratch buffer for I/O dispatch. The dispatcher is single-threaded and
- * non-reentrant: only one syscall is dispatched at a time.
+/* Per-thread scratch buffer for I/O dispatch. Each seccomp supervisor thread
+ * is non-reentrant: only one syscall is dispatched per thread at a time.
  */
-extern uint8_t dispatch_scratch[KBOX_IO_CHUNK_LEN];
+extern __thread uint8_t dispatch_scratch[KBOX_IO_CHUNK_LEN];
 
 /* Argument extraction helpers. */
 
@@ -68,6 +68,17 @@ static inline int fd_should_deny_io(long fd, long lkl_fd)
 {
     (void) fd;
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY || lkl_fd >= 0)
+        return 0;
+    return 1;
+}
+
+static inline int fd_should_deny_io_ctx(const struct kbox_fd_table *t,
+                                        long fd,
+                                        long lkl_fd)
+{
+    if (!fd_should_deny_io(fd, lkl_fd))
+        return 0;
+    if (t && kbox_fd_table_find_by_host_fd(t, fd) >= 0)
         return 0;
     return 1;
 }
@@ -266,6 +277,15 @@ int translate_request_at_path(const struct kbox_syscall_request *req,
                               size_t size,
                               long *lkl_dirfd);
 int should_continue_for_dirfd(long lkl_dirfd);
+int open_host_dirfd_for_dispatch(pid_t pid,
+                                 long raw_dirfd,
+                                 long lkl_dirfd,
+                                 int *sv_dirfd_out,
+                                 int *close_out);
+int host_bind_is_readonly(const struct kbox_supervisor_ctx *ctx,
+                          pid_t pid,
+                          long raw_dirfd,
+                          long lkl_dirfd);
 int guest_addr_is_writable(pid_t pid, uint64_t addr);
 int guest_range_has_shared_file_write_mapping(pid_t pid,
                                               uint64_t addr,
@@ -333,6 +353,12 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_bind(const struct kbox_syscall_request *req,
                                   struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_listen(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_accept(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_accept4(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_connect(const struct kbox_syscall_request *req,
                                      struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_sendto(const struct kbox_syscall_request *req,
@@ -431,8 +457,20 @@ struct kbox_dispatch forward_syslog(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_prctl(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_capget(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_capset(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_pipe2(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_socketpair(const struct kbox_syscall_request *req,
+                                        struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_xattr_nodata(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_xattr_empty_list(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
@@ -447,6 +485,10 @@ struct kbox_dispatch forward_fallocate(const struct kbox_syscall_request *req,
                                        struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_flock(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_fchmod(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_fadvise64(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_fsync(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_fdatasync(const struct kbox_syscall_request *req,

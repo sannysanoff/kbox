@@ -40,71 +40,73 @@
 /* Read chunk size: 128 KB, matches KBOX_IO_CHUNK_LEN. */
 #define SHADOW_CHUNK_LEN (128 * 1024)
 
-int kbox_shadow_create(const struct kbox_sysnrs *s, long lkl_fd)
+static int write_all_memfd(int memfd, const char *buf, size_t len)
 {
-    /* Use kbox_lkl_stat (generic-arch layout) instead of struct stat
-     * (x86_64 layout).  LKL always fills the buffer in generic-arch
-     * format regardless of the host architecture.
-     */
-    struct kbox_lkl_stat kst;
-    long ret;
+    size_t written = 0;
+    while (written < len) {
+        ssize_t w = write(memfd, buf + written, len - written);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return -errno;
+        }
+        written += (size_t) w;
+    }
+    return 0;
+}
 
-    memset(&kst, 0, sizeof(kst));
-    ret = kbox_lkl_fstat(s, lkl_fd, &kst);
-    if (ret < 0)
-        return (int) ret;
+static int shadow_create_common(const struct kbox_sysnrs *s,
+                                long fd,
+                                int is_host,
+                                off_t file_size)
+{
+    static __thread char buf[SHADOW_CHUNK_LEN];
+    int memfd;
+    off_t off = 0;
+    off_t remaining = file_size;
 
-    if (!S_ISREG(kst.st_mode))
-        return -ENODEV;
-
-    if (kst.st_size > KBOX_SHADOW_MAX_SIZE)
+    if (file_size > KBOX_SHADOW_MAX_SIZE)
         return -EFBIG;
 
-    int memfd = memfd_create("kbox-shadow", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    memfd = memfd_create("kbox-shadow", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (memfd < 0)
         return -errno;
 
-    if (ftruncate(memfd, (off_t) kst.st_size) < 0) {
+    if (ftruncate(memfd, file_size) < 0) {
         int e = errno;
         close(memfd);
         return -e;
     }
 
-    if (kst.st_size == 0)
-        return memfd;
-
-    /* Read from LKL in chunks via pread64 (position-independent)
-     * and write to the memfd.
-     */
-    long off = 0;
-    long remaining = (long) kst.st_size;
-    /* Static buffer: supervisor is single-threaded, no re-entrancy. */
-    static char buf[SHADOW_CHUNK_LEN];
-
     while (remaining > 0) {
-        long chunk = remaining;
+        long chunk = (long) remaining;
+        long ret;
         if (chunk > SHADOW_CHUNK_LEN)
             chunk = SHADOW_CHUNK_LEN;
 
-        ret = kbox_lkl_pread64(s, lkl_fd, buf, chunk, off);
+        if (is_host) {
+            ssize_t r;
+            do {
+                r = pread((int) fd, buf, (size_t) chunk, off);
+            } while (r < 0 && errno == EINTR);
+            ret = r < 0 ? -errno : (long) r;
+        } else {
+            ret = kbox_lkl_pread64(s, fd, buf, chunk, (long) off);
+        }
+
         if (ret < 0) {
             close(memfd);
             return (int) ret;
         }
         if (ret == 0) {
             close(memfd);
-            return -EIO; /* EOF before expected size: truncated file */
+            return -EIO;
         }
 
-        long written = 0;
-        while (written < ret) {
-            ssize_t w = write(memfd, buf + written, (size_t) (ret - written));
-            if (w < 0) {
-                int e = errno;
-                close(memfd);
-                return -e;
-            }
-            written += w;
+        int wrc = write_all_memfd(memfd, buf, (size_t) ret);
+        if (wrc < 0) {
+            close(memfd);
+            return wrc;
         }
 
         off += ret;
@@ -118,6 +120,34 @@ int kbox_shadow_create(const struct kbox_sysnrs *s, long lkl_fd)
     }
 
     return memfd;
+}
+
+int kbox_shadow_create(const struct kbox_sysnrs *s, long lkl_fd)
+{
+    struct kbox_lkl_stat kst;
+    long ret;
+
+    memset(&kst, 0, sizeof(kst));
+    ret = kbox_lkl_fstat(s, lkl_fd, &kst);
+    if (ret < 0)
+        return (int) ret;
+
+    if (!S_ISREG(kst.st_mode))
+        return -ENODEV;
+
+    return shadow_create_common(s, lkl_fd, 0, (off_t) kst.st_size);
+}
+
+int kbox_shadow_create_from_host_fd(int host_fd)
+{
+    struct stat st;
+
+    if (fstat(host_fd, &st) < 0)
+        return -errno;
+    if (!S_ISREG(st.st_mode))
+        return -ENODEV;
+
+    return shadow_create_common(NULL, (long) host_fd, 1, st.st_size);
 }
 
 int kbox_shadow_seal(int memfd)

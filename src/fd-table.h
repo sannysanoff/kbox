@@ -47,6 +47,7 @@ struct kbox_sysnrs; /* forward declaration */
 struct kbox_fd_entry {
     long lkl_fd;   /* LKL-internal FD, -1 if slot is free */
     long host_fd;  /* host memfd shadow / tracee FD number, -1 if none */
+    int host_sv_fd; /* supervisor-side FD sharing host-passthrough struct file */
     int shadow_sp; /* supervisor's dup of shadow socket sp[1], -1 if none.
                     * Kept alive so dup/dup2/dup3 can inject new copies into
                     * the tracee via ADDFD.
@@ -95,6 +96,8 @@ void kbox_fd_table_close_cloexec(struct kbox_fd_table *t,
 void kbox_fd_table_set_host_fd(struct kbox_fd_table *t, long fd, long host_fd);
 long kbox_fd_table_get_host_fd(const struct kbox_fd_table *t, long fd);
 long kbox_fd_table_find_by_host_fd(const struct kbox_fd_table *t, long host_fd);
+void kbox_fd_table_set_host_sv_fd(struct kbox_fd_table *t, long fd, int sv_fd);
+int kbox_fd_table_get_host_sv_fd(const struct kbox_fd_table *t, long fd);
 /* Return the number of virtual FDs currently referencing @lkl_fd. */
 unsigned kbox_fd_table_lkl_ref_count(const struct kbox_fd_table *t,
                                      long lkl_fd);

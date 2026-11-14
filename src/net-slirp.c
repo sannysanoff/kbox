@@ -54,10 +54,10 @@
 #define MAX_PKT_SIZE 65535
 
 /* Maximum number of shadow sockets tracked by the event loop */
-#define MAX_SHADOW_SOCKETS 64
+#define MAX_SHADOW_SOCKETS 512
 
 /* Maximum pollfd entries: SLIRP FDs + shadow sockets + wakeup pipe */
-#define MAX_POLLFDS 256
+#define MAX_POLLFDS 1024
 
 /* RX pipe: length-prefixed framing. */
 
@@ -193,6 +193,8 @@ struct shadow_socket {
     int lkl_fd;        /* LKL-side socket FD */
     int supervisor_fd; /* supervisor end of the socketpair */
     int sock_type;     /* SOCK_STREAM or SOCK_DGRAM */
+    int listening;     /* 1 after listen() on this socket */
+    int listen_notified;
     size_t to_lkl_off;
     size_t to_lkl_len;
     uint8_t to_lkl_buf[65536];
@@ -414,6 +416,7 @@ static const SlirpCb slirp_callbacks = {
 
 struct poll_ctx {
     struct pollfd pfds[MAX_POLLFDS];
+    int shadow_slots[MAX_SHADOW_SOCKETS];
     int count;
     int slirp_base; /* index where SLIRP entries start */
 };
@@ -476,6 +479,7 @@ static int get_revents_cb(int idx, void *opaque)
 #define LKL_IFF_UP 0x1
 #define LKL_IFF_RUNNING 0x40
 #define LKL_SIOCADDRT 0x890B
+#define LKL_SIOCDELRT 0x890C
 
 static int shadow_flush_to_lkl(struct shadow_socket *sock)
 {
@@ -490,7 +494,8 @@ static int shadow_flush_to_lkl(struct shadow_socket *sock)
                 sock->to_lkl_off = 0;
             continue;
         }
-        if (r == -EAGAIN || r == -EWOULDBLOCK)
+        if (r == -EAGAIN || r == -EWOULDBLOCK || r == -EINPROGRESS ||
+            r == -EALREADY)
             return 0;
         return -1;
     }
@@ -537,17 +542,42 @@ static int shadow_nonfatal_recv_error(const struct shadow_socket *sock, long r)
 
 static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
 {
-    int si = 0;
+    int shadow_cnt = ctx->count - shadow_base;
 
     pthread_mutex_lock(&shadow_lock);
-    for (int i = 0; i < MAX_SHADOW_SOCKETS && si < ctx->count - shadow_base;
-         i++) {
-        if (!shadow_sockets[i].active)
+    for (int si = 0; si < shadow_cnt; si++) {
+        int slot = ctx->shadow_slots[si];
+        if (slot < 0 || slot >= MAX_SHADOW_SOCKETS || !shadow_sockets[slot].active)
             continue;
 
-        struct shadow_socket *sock = &shadow_sockets[i];
+        struct shadow_socket *sock = &shadow_sockets[slot];
         int pidx = shadow_base + si;
-        si++;
+
+        if (sock->listening) {
+            if (ctx->pfds[pidx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                sock->active = 0;
+                close(sock->supervisor_fd);
+                sock->supervisor_fd = -1;
+                continue;
+            }
+            if (!sock->listen_notified && net_sysnrs) {
+                struct pollfd lpfd = {
+                    .fd = sock->lkl_fd,
+                    .events = POLLIN,
+                    .revents = 0,
+                };
+                struct timespec zero_ts = {0, 0};
+                long pr = kbox_lkl_ppoll(net_sysnrs, &lpfd, 1, &zero_ts, NULL,
+                                         0);
+                if (pr > 0 && (lpfd.revents & (POLLIN | POLLERR | POLLHUP))) {
+                    char wake = 'A';
+                    ssize_t wn = write(sock->supervisor_fd, &wake, 1);
+                    if (wn == 1)
+                        sock->listen_notified = 1;
+                }
+            }
+            continue;
+        }
 
         /* Retry any buffered stream data before reading more. */
         if (shadow_flush_to_lkl(sock) < 0 ||
@@ -728,6 +758,9 @@ static int net_poll(struct lkl_netdev *nd)
         return 0; /* no RX, no TX while gated */
     }
 
+    if (!__atomic_load_n(&slirp_running, __ATOMIC_RELAXED))
+        return LKL_DEV_NET_POLL_HUP;
+
     int flags = LKL_DEV_NET_POLL_TX;
     unsigned head = __atomic_load_n(&rx_head, __ATOMIC_ACQUIRE);
     unsigned tail = __atomic_load_n(&rx_tail, __ATOMIC_RELAXED);
@@ -742,9 +775,13 @@ static int net_poll(struct lkl_netdev *nd)
             uint64_t val;
             ssize_t n = read(rx_eventfd, &val, sizeof(val));
             (void) n;
+            if (!__atomic_load_n(&slirp_running, __ATOMIC_RELAXED))
+                return LKL_DEV_NET_POLL_HUP;
             flags |= LKL_DEV_NET_POLL_RX;
         }
     }
+    if (!__atomic_load_n(&slirp_running, __ATOMIC_RELAXED))
+        return LKL_DEV_NET_POLL_HUP;
     return flags;
 }
 
@@ -754,10 +791,15 @@ static int net_poll(struct lkl_netdev *nd)
 static void net_poll_hup(struct lkl_netdev *nd)
 {
     (void) nd;
-    /* Write a zero-length frame to unblock the RX read. */
+    /* Write a zero-length frame to unblock the RX read, and wake eventfd. */
     uint16_t zero = 0;
     ssize_t n = write(rx_pipe[1], &zero, sizeof(zero));
     (void) n;
+    if (rx_eventfd >= 0) {
+        uint64_t one = 1;
+        n = write(rx_eventfd, &one, sizeof(one));
+        (void) n;
+    }
 }
 
 static void net_free(struct lkl_netdev *nd)
@@ -832,8 +874,13 @@ static void *slirp_event_loop(void *arg)
                 continue;
             if (ctx.count >= MAX_POLLFDS)
                 break;
+            int si = ctx.count - shadow_base;
+            if (si >= MAX_SHADOW_SOCKETS)
+                break;
+            ctx.shadow_slots[si] = i;
             ctx.pfds[ctx.count].fd = shadow_sockets[i].supervisor_fd;
-            ctx.pfds[ctx.count].events = POLLIN;
+            ctx.pfds[ctx.count].events =
+                shadow_sockets[i].listening ? 0 : POLLIN;
             ctx.pfds[ctx.count].revents = 0;
             ctx.count++;
         }
@@ -1013,6 +1060,159 @@ err_rx_pipe:
  * Configure the interface synchronously, then open the gate to let the poll
  * thread start normal operation.
  */
+#define LKL_NR_IOCTL 29
+
+static int configure_ipv4_iface(long sock,
+                                const char *ifname,
+                                const char *ip_str,
+                                const char *mask_str)
+{
+    _Static_assert(sizeof(struct ifreq) == 40,
+                   "struct ifreq must be 40 bytes (64-bit Linux ABI)");
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
+
+    /* 1. Bring interface UP. */
+    ifr.ifr_flags = LKL_IFF_UP | LKL_IFF_RUNNING;
+    long ret = lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCSIFFLAGS, (long) &ifr,
+                            0, 0, 0);
+    if (ret < 0) {
+        fprintf(stderr, "kbox: net: %s SIOCSIFFLAGS: %ld\n", ifname, ret);
+        return -1;
+    }
+
+    /* 2. Set IP address via SIOCSIFADDR. */
+    memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
+    struct sockaddr_in *addr = (struct sockaddr_in *) &ifr.ifr_addr;
+    addr->sin_family = AF_INET;
+    inet_pton(AF_INET, ip_str, &addr->sin_addr);
+    ret =
+        lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCSIFADDR, (long) &ifr, 0, 0, 0);
+    if (ret < 0) {
+        fprintf(stderr, "kbox: net: %s SIOCSIFADDR: %ld\n", ifname, ret);
+        return -1;
+    }
+
+    /* 3. Set netmask via SIOCSIFNETMASK. */
+    memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
+    addr->sin_family = AF_INET;
+    inet_pton(AF_INET, mask_str, &addr->sin_addr);
+    ret = lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCSIFNETMASK, (long) &ifr, 0,
+                       0, 0);
+    if (ret < 0) {
+        fprintf(stderr, "kbox: net: %s SIOCSIFNETMASK: %ld\n", ifname, ret);
+        return -1;
+    }
+    return 0;
+}
+
+static int host_route_ioctl(const struct kbox_sysnrs *sysnrs,
+                            unsigned long cmd,
+                            const char *ifname,
+                            const char *ip_str)
+{
+    long sock = kbox_lkl_socket(sysnrs, 2 /* AF_INET */, 2 /* SOCK_DGRAM */, 0);
+    if (sock < 0)
+        return (int) sock;
+
+    char devname[16];
+    snprintf(devname, sizeof(devname), "%s", ifname);
+
+    struct rtentry rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.rt_dst.sa_family = AF_INET;
+    if (inet_pton(AF_INET, ip_str, &rt.rt_dst.sa_data[2]) != 1) {
+        kbox_lkl_close(sysnrs, sock);
+        return -EINVAL;
+    }
+    rt.rt_genmask.sa_family = AF_INET;
+    inet_pton(AF_INET, "255.255.255.255", &rt.rt_genmask.sa_data[2]);
+    rt.rt_flags = 0x0005; /* RTF_UP | RTF_HOST */
+    rt.rt_dev = devname;
+
+    long ret = lkl_syscall6(LKL_NR_IOCTL, sock, (long) cmd, (long) &rt, 0, 0, 0);
+    kbox_lkl_close(sysnrs, sock);
+    return (int) ret;
+}
+
+int kbox_net_add_host_route(const struct kbox_sysnrs *sysnrs,
+                            const char *ifname,
+                            const char *ip_str)
+{
+    int ret = host_route_ioctl(sysnrs, LKL_SIOCADDRT, ifname, ip_str);
+    return (ret < 0 && ret != -EEXIST) ? -1 : 0;
+}
+
+int kbox_net_del_host_route(const struct kbox_sysnrs *sysnrs,
+                            const char *ifname,
+                            const char *ip_str)
+{
+    int ret = host_route_ioctl(sysnrs, LKL_SIOCDELRT, ifname, ip_str);
+    return (ret < 0 && ret != -ESRCH) ? -1 : 0;
+}
+
+int kbox_net_configure_ipv4(const struct kbox_sysnrs *sysnrs,
+                            const char *ifname,
+                            const char *ip_str,
+                            const char *mask_str,
+                            const char *gw_str)
+{
+    long sock = kbox_lkl_socket(sysnrs, 2 /* AF_INET */, 2 /* SOCK_DGRAM */, 0);
+    if (sock < 0) {
+        fprintf(stderr, "kbox: net: ipv4 ioctl socket failed: %ld\n", sock);
+        return -1;
+    }
+
+    if (configure_ipv4_iface(sock, ifname, ip_str, mask_str) < 0)
+        return -1;
+
+    if (gw_str && gw_str[0]) {
+        _Static_assert(sizeof(struct rtentry) == 120,
+                       "struct rtentry must be 120 bytes (kernel ABI)");
+        char devname[16];
+        snprintf(devname, sizeof(devname), "%s", ifname);
+
+        if (strcmp(mask_str, "255.255.255.255") == 0) {
+            struct rtentry host_rt;
+            memset(&host_rt, 0, sizeof(host_rt));
+            host_rt.rt_dst.sa_family = AF_INET;
+            inet_pton(AF_INET, gw_str, &host_rt.rt_dst.sa_data[2]);
+            host_rt.rt_genmask.sa_family = AF_INET;
+            inet_pton(AF_INET, "255.255.255.255",
+                      &host_rt.rt_genmask.sa_data[2]);
+            host_rt.rt_flags = 0x0005; /* RTF_UP | RTF_HOST */
+            host_rt.rt_dev = devname;
+
+            long hret = lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCADDRT,
+                                     (long) &host_rt, 0, 0, 0);
+            if (hret < 0 && hret != -EEXIST) {
+                fprintf(stderr, "kbox: net: %s host route %s SIOCADDRT: %ld\n",
+                        ifname, gw_str, hret);
+                return -1;
+            }
+        }
+
+        struct rtentry rt;
+        memset(&rt, 0, sizeof(rt));
+        rt.rt_dst.sa_family = AF_INET;
+        rt.rt_genmask.sa_family = AF_INET;
+        rt.rt_gateway.sa_family = AF_INET;
+        inet_pton(AF_INET, gw_str, &rt.rt_gateway.sa_data[2]);
+        rt.rt_flags = 0x0003; /* RTF_UP | RTF_GATEWAY */
+        rt.rt_dev = devname;
+
+        long ret = lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCADDRT, (long) &rt,
+                                0, 0, 0);
+        if (ret < 0) {
+            fprintf(stderr, "kbox: net: %s SIOCADDRT: %ld\n", ifname, ret);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 int kbox_net_configure(const struct kbox_sysnrs *sysnrs)
 {
     net_sysnrs = sysnrs;
@@ -1026,19 +1226,6 @@ int kbox_net_configure(const struct kbox_sysnrs *sysnrs)
         kbox_lkl_close(sysnrs, fd);
     }
 
-    /* Configure the interface using ioctl-based API via raw lkl_syscall. The
-     * ioctl path (SIOCSIFADDR) creates connected routes synchronously via
-     * fib_add_ifaddr, unlike the netlink RTM_NEWADDR path which may defer route
-     * creation in LKL.
-     *
-     * Sequence: UP -> SIOCSIFADDR -> SIOCSIFNETMASK -> SIOCADDRT (gateway)
-     * All done with the poll thread gated to avoid BKL contention.
-     *
-     * NR 29 is __lkl__NR_ioctl from asm-generic/unistd.h. LKL always uses the
-     * asm-generic ABI regardless of host architecture (x86_64 host ioctl is NR
-     * 16, but lkl_syscall uses the LKL-internal table).
-     */
-#define LKL_NR_IOCTL 29
     long sock = kbox_lkl_socket(sysnrs, 2 /* AF_INET */, 2 /* SOCK_DGRAM */, 0);
     if (sock < 0) {
         fprintf(stderr, "kbox: net: helper socket failed: %ld\n", sock);
@@ -1046,43 +1233,13 @@ int kbox_net_configure(const struct kbox_sysnrs *sysnrs)
         return -1;
     }
 
-    _Static_assert(sizeof(struct ifreq) == 40,
-                   "struct ifreq must be 40 bytes (64-bit Linux ABI)");
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "eth%d", lkl_netdev_id);
+    /* Bring up loopback (127.0.0.1/8) for local connections. */
+    (void) configure_ipv4_iface(sock, "lo", "127.0.0.1", "255.0.0.0");
 
-    /* 1. Bring interface UP. */
-    ifr.ifr_flags = LKL_IFF_UP | LKL_IFF_RUNNING;
-    long ret = lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCSIFFLAGS, (long) &ifr,
-                            0, 0, 0);
-    if (ret < 0) {
-        fprintf(stderr, "kbox: net: SIOCSIFFLAGS: %ld\n", ret);
-        __atomic_store_n(&net_ready, 1, __ATOMIC_RELEASE);
-        return -1;
-    }
-
-    /* 2. Set IP address via SIOCSIFADDR. */
-    memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
-    struct sockaddr_in *addr = (struct sockaddr_in *) &ifr.ifr_addr;
-    addr->sin_family = AF_INET;
-    inet_pton(AF_INET, GUEST_IP_STR, &addr->sin_addr);
-    ret =
-        lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCSIFADDR, (long) &ifr, 0, 0, 0);
-    if (ret < 0) {
-        fprintf(stderr, "kbox: net: SIOCSIFADDR: %ld\n", ret);
-        __atomic_store_n(&net_ready, 1, __ATOMIC_RELEASE);
-        return -1;
-    }
-
-    /* 3. Set netmask via SIOCSIFNETMASK. */
-    memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
-    addr->sin_family = AF_INET;
-    inet_pton(AF_INET, "255.255.255.0", &addr->sin_addr);
-    ret = lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCSIFNETMASK, (long) &ifr, 0,
-                       0, 0);
-    if (ret < 0) {
-        fprintf(stderr, "kbox: net: SIOCSIFNETMASK: %ld\n", ret);
+    char eth_name[16];
+    snprintf(eth_name, sizeof(eth_name), "eth%d", lkl_netdev_id);
+    if (configure_ipv4_iface(sock, eth_name, GUEST_IP_STR, "255.255.255.0") <
+        0) {
         __atomic_store_n(&net_ready, 1, __ATOMIC_RELEASE);
         return -1;
     }
@@ -1106,7 +1263,8 @@ int kbox_net_configure(const struct kbox_sysnrs *sysnrs)
     inet_pton(AF_INET, GATEWAY_IP_STR, &rt.rt_gateway.sa_data[2]);
     rt.rt_flags = 0x0003; /* RTF_UP | RTF_GATEWAY */
 
-    ret = lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCADDRT, (long) &rt, 0, 0, 0);
+    long ret =
+        lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCADDRT, (long) &rt, 0, 0, 0);
     if (ret < 0) {
         fprintf(stderr, "kbox: net: SIOCADDRT: %ld\n", ret);
         __atomic_store_n(&net_ready, 1, __ATOMIC_RELEASE);
@@ -1194,6 +1352,8 @@ int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type)
             shadow_sockets[i].lkl_fd = lkl_fd;
             shadow_sockets[i].supervisor_fd = supervisor_fd;
             shadow_sockets[i].sock_type = sock_type;
+            shadow_sockets[i].listening = 0;
+            shadow_sockets[i].listen_notified = 0;
             shadow_sockets[i].to_lkl_off = 0;
             shadow_sockets[i].to_lkl_len = 0;
             shadow_sockets[i].to_supervisor_off = 0;
@@ -1241,6 +1401,39 @@ void kbox_net_deregister_socket(int lkl_fd)
     (void) n;
 }
 
+void kbox_net_set_listening(int lkl_fd)
+{
+    pthread_mutex_lock(&shadow_lock);
+    for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
+        if (shadow_sockets[i].active && shadow_sockets[i].lkl_fd == lkl_fd) {
+            shadow_sockets[i].listening = 1;
+            shadow_sockets[i].listen_notified = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&shadow_lock);
+
+    char c = 'L';
+    ssize_t n = write(wakeup_pipe[1], &c, 1);
+    (void) n;
+}
+
+void kbox_net_clear_listening_notify(int lkl_fd)
+{
+    pthread_mutex_lock(&shadow_lock);
+    for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
+        if (shadow_sockets[i].active && shadow_sockets[i].lkl_fd == lkl_fd) {
+            shadow_sockets[i].listen_notified = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&shadow_lock);
+
+    char c = 'A';
+    ssize_t n = write(wakeup_pipe[1], &c, 1);
+    (void) n;
+}
+
 #else /* !KBOX_HAS_SLIRP */
 
 #include <stdio.h>
@@ -1274,6 +1467,16 @@ int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type)
 }
 
 void kbox_net_deregister_socket(int lkl_fd)
+{
+    (void) lkl_fd;
+}
+
+void kbox_net_set_listening(int lkl_fd)
+{
+    (void) lkl_fd;
+}
+
+void kbox_net_clear_listening_notify(int lkl_fd)
 {
     (void) lkl_fd;
 }

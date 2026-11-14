@@ -118,6 +118,7 @@
     X(rt_sigprocmask)          \
     X(rt_sigreturn)            \
     X(rt_sigpending)           \
+    X(rt_sigsuspend)           \
     X(rt_sigaltstack)          \
     X(kill)                    \
     X(tgkill)                  \
@@ -170,7 +171,24 @@
     X(statfs)                  \
     X(fstatfs)                 \
     X(sysinfo)                 \
-    X(readlink)
+    X(readlink)                \
+    X(capget)                  \
+    X(capset)                  \
+    X(getcpu)                  \
+    X(fchmod)                  \
+    X(fadvise64)               \
+    X(socketpair)              \
+    X(timer_create)            \
+    X(timer_gettime)           \
+    X(timer_getoverrun)        \
+    X(timer_settime)           \
+    X(timer_delete)            \
+    X(getxattr)                \
+    X(lgetxattr)               \
+    X(fgetxattr)               \
+    X(listxattr)               \
+    X(llistxattr)              \
+    X(flistxattr)
 
 struct kbox_sysnrs {
     long chdir, fchdir, getcwd;
@@ -185,8 +203,9 @@ struct kbox_sysnrs {
     bool mkdirat_style;
     long mount, umount2;
     long openat, openat2, fcntl, socket, connect;
-    long bind, sendto, recvfrom, sendmsg, recvmsg;
+    long bind, listen, accept, accept4, sendto, recvfrom, sendmsg, recvmsg;
     long getsockopt, setsockopt, getsockname, getpeername, shutdown;
+    long ppoll, unshare, setns, sethostname, new_thread_group_leader;
     long dup, dup3, close;
     long read, write, pread64, pwrite64, lseek;
     long readv, writev;
@@ -194,10 +213,11 @@ struct kbox_sysnrs {
     long fstat, newfstatat, faccessat2, statx;
     long getdents, getdents64;
     long mkdirat, unlinkat, renameat2;
-    long fchmodat, fchownat;
+    long fchmodat, fchmod, fchownat;
     long symlinkat, linkat, utimensat;
     long mmap, munmap;
     long ftruncate, fallocate, flock;
+    long statfs, fstatfs;
     long fsync, fdatasync, sync;
     long pipe2;
     long sendfile, copy_file_range;

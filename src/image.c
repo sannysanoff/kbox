@@ -16,6 +16,7 @@
 #include <sys/prctl.h>
 #include <sys/random.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "fd-table.h"
@@ -818,6 +819,8 @@ int kbox_run_image(const struct kbox_image_args *args)
     long ret;
     struct kbox_bind_spec bind_specs[KBOX_MAX_BIND_MOUNTS];
     int bind_count = 0;
+    struct kbox_host_bind host_binds[KBOX_MAX_HOST_VOLUMES];
+    size_t host_bind_count = 0;
     int i;
     uid_t override_uid = (uid_t) -1;
     gid_t override_gid = (gid_t) -1;
@@ -859,6 +862,21 @@ int kbox_run_image(const struct kbox_image_args *args)
         if (kbox_parse_bind_spec(args->bind_mounts[i], &bind_specs[i]) < 0)
             return -1;
         bind_count++;
+    }
+
+    /* Parse host volume bind specs. */
+    for (i = 0; i < args->host_volume_count; i++) {
+        if (host_bind_count >= KBOX_MAX_HOST_VOLUMES) {
+            fprintf(stderr, "too many host volumes\n");
+            return -1;
+        }
+        if (kbox_parse_host_volume(args->host_volumes[i],
+                                   &host_binds[host_bind_count]) < 0) {
+            fprintf(stderr, "invalid host volume spec: %s\n",
+                    args->host_volumes[i]);
+            return -1;
+        }
+        host_bind_count++;
     }
 
     /* Open image file. */
@@ -930,6 +948,10 @@ int kbox_run_image(const struct kbox_image_args *args)
         if (kbox_apply_bind_mounts(sysnrs, bind_specs, bind_count) < 0)
             goto err_post_boot;
     }
+
+    /* Create LKL mountpoint stubs for host volume bind mounts. */
+    if (host_bind_count > 0)
+        kbox_ensure_lkl_bind_stubs(sysnrs, host_binds, host_bind_count);
 
     /* Working directory. */
     ret = kbox_lkl_chdir(sysnrs, work_dir);
@@ -1008,15 +1030,42 @@ int kbox_run_image(const struct kbox_image_args *args)
 
         memset(&launch, 0, sizeof(launch));
 
-        lkl_fd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, command, O_RDONLY, 0);
-        if (lkl_fd < 0) {
-            fprintf(stderr, "cannot open %s in image: %s\n", command,
-                    kbox_err_text(lkl_fd));
-            goto err_net;
+        exec_memfd = -1;
+        if (host_bind_count > 0) {
+            struct kbox_supervisor_ctx tmp_ctx;
+            char host_cmd[KBOX_MAX_PATH];
+            int ro = 0;
+            memset(&tmp_ctx, 0, sizeof(tmp_ctx));
+            tmp_ctx.sysnrs = sysnrs;
+            tmp_ctx.host_binds = host_binds;
+            tmp_ctx.host_bind_count = host_bind_count;
+            snprintf(tmp_ctx.host_cwd, sizeof(tmp_ctx.host_cwd), "%s",
+                     work_dir);
+            if (kbox_resolve_host_bind_at(&tmp_ctx, -100, command, host_cmd,
+                                          sizeof(host_cmd), &ro) > 0) {
+                int hfd = open(host_cmd, O_RDONLY | O_CLOEXEC);
+                if (hfd < 0) {
+                    fprintf(stderr, "cannot open %s (%s): %s\n", command,
+                            host_cmd, strerror(errno));
+                    goto err_net;
+                }
+                exec_memfd = kbox_shadow_create_from_host_fd(hfd);
+                close(hfd);
+            }
         }
 
-        exec_memfd = kbox_shadow_create(sysnrs, lkl_fd);
-        kbox_lkl_close(sysnrs, lkl_fd);
+        if (exec_memfd < 0) {
+            lkl_fd =
+                kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, command, O_RDONLY, 0);
+            if (lkl_fd < 0) {
+                fprintf(stderr, "cannot open %s in image: %s\n", command,
+                        kbox_err_text(lkl_fd));
+                goto err_net;
+            }
+
+            exec_memfd = kbox_shadow_create(sysnrs, lkl_fd);
+            kbox_lkl_close(sysnrs, lkl_fd);
+        }
 
         if (exec_memfd < 0) {
             fprintf(stderr, "cannot create memfd for %s: %s\n", command,
@@ -1524,28 +1573,28 @@ int kbox_run_image(const struct kbox_image_args *args)
                                                args->verbose);
 
         /* Fork, seccomp, exec, supervise. */
-        rc = kbox_run_supervisor(
+        rc = kbox_run_supervisor_volumes(
             sysnrs, command, args->extra_args, args->extra_argc, NULL,
             exec_memfd, args->verbose, args->root_id || args->system_root,
-            args->normalize, web_ctx);
+            args->normalize, web_ctx, host_binds, host_bind_count);
         if (interp_memfd >= 0)
             close(interp_memfd);
         close(exec_memfd);
 
     err_net:
+        if (args->net)
+            kbox_net_cleanup();
         kbox_halt_kernel();
 #ifdef KBOX_HAS_WEB
         if (web_ctx)
             kbox_web_shutdown(web_ctx);
 #endif
-        if (args->net)
-            kbox_net_cleanup();
         return rc;
     }
 
 err_post_boot:
-    kbox_halt_kernel();
     if (args->net)
         kbox_net_cleanup();
+    kbox_halt_kernel();
     return -1;
 }

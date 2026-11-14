@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -240,6 +241,21 @@ long kbox_lkl_fchmodat(const struct kbox_sysnrs *s,
                        long flags)
 {
     return lkl_syscall6(s->fchmodat, dirfd, (long) path, mode, flags, 0, 0);
+}
+
+long kbox_lkl_fchmod(const struct kbox_sysnrs *s, long fd, long mode)
+{
+    return lkl_syscall6(s->fchmod, fd, mode, 0, 0, 0, 0);
+}
+
+long kbox_lkl_statfs(const struct kbox_sysnrs *s, const char *path, void *buf)
+{
+    return lkl_syscall6(s->statfs, (long) path, (long) buf, 0, 0, 0, 0);
+}
+
+long kbox_lkl_fstatfs(const struct kbox_sysnrs *s, long fd, void *buf)
+{
+    return lkl_syscall6(s->fstatfs, fd, (long) buf, 0, 0, 0, 0);
 }
 
 long kbox_lkl_fchownat(const struct kbox_sysnrs *s,
@@ -527,4 +543,62 @@ long kbox_lkl_recvfrom(const struct kbox_sysnrs *s,
 {
     return lkl_syscall6(s->recvfrom, fd, (long) buf, len, flags, (long) addr,
                         (long) addrlen);
+}
+
+long kbox_lkl_listen(const struct kbox_sysnrs *s, long fd, long backlog)
+{
+    return lkl_syscall6(s->listen, fd, backlog, 0, 0, 0, 0);
+}
+
+long kbox_lkl_accept(const struct kbox_sysnrs *s,
+                     long fd,
+                     void *addr,
+                     void *addrlen)
+{
+    return lkl_syscall6(s->accept, fd, (long) addr, (long) addrlen, 0, 0, 0);
+}
+
+long kbox_lkl_accept4(const struct kbox_sysnrs *s,
+                      long fd,
+                      void *addr,
+                      void *addrlen,
+                      long flags)
+{
+    return lkl_syscall6(s->accept4, fd, (long) addr, (long) addrlen, flags, 0,
+                        0);
+}
+
+long kbox_lkl_ppoll(const struct kbox_sysnrs *s,
+                    void *fds,
+                    unsigned long nfds,
+                    const void *tmo_p,
+                    const void *sigmask,
+                    unsigned long sigsetsize)
+{
+    return lkl_syscall6(s->ppoll, (long) fds, (long) nfds, (long) tmo_p,
+                        (long) sigmask, (long) sigsetsize, 0);
+}
+
+long kbox_lkl_unshare(const struct kbox_sysnrs *s, long flags)
+{
+    return lkl_syscall6(s->unshare, flags, 0, 0, 0, 0, 0);
+}
+
+long kbox_lkl_setns(const struct kbox_sysnrs *s, long fd, long nstype)
+{
+    return lkl_syscall6(s->setns, fd, nstype, 0, 0, 0, 0);
+}
+
+long kbox_lkl_sethostname(const struct kbox_sysnrs *s,
+                          const char *name,
+                          long len)
+{
+    return lkl_syscall6(s->sethostname, (long) name, len, 0, 0, 0, 0);
+}
+
+long kbox_lkl_new_thread_group_leader(const struct kbox_sysnrs *s)
+{
+    if (s->new_thread_group_leader < 0)
+        return -ENOSYS;
+    return lkl_syscall6(s->new_thread_group_leader, 0, 0, 0, 0, 0, 0);
 }

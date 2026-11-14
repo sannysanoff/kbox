@@ -88,6 +88,32 @@ static void test_at_fdcwd(void)
     ASSERT_EQ(AT_FDCWD_LINUX, -100L);
 }
 
+static void test_host_cap_syscalls(void)
+{
+    ASSERT_EQ(HOST_NRS_X86_64.capget, 125);
+    ASSERT_EQ(HOST_NRS_X86_64.capset, 126);
+    ASSERT_EQ(HOST_NRS_GENERIC.capget, 90);
+    ASSERT_EQ(HOST_NRS_GENERIC.capset, 91);
+}
+
+static void test_host_statfs_fchmod_fadvise_syscalls(void)
+{
+    ASSERT_EQ(HOST_NRS_X86_64.statfs, 137);
+    ASSERT_EQ(HOST_NRS_GENERIC.statfs, 43);
+    ASSERT_EQ(HOST_NRS_X86_64.fchmod, 91);
+    ASSERT_EQ(HOST_NRS_GENERIC.fchmod, 52);
+    ASSERT_EQ(HOST_NRS_X86_64.fadvise64, 221);
+    ASSERT_EQ(HOST_NRS_GENERIC.fadvise64, 223);
+    ASSERT_EQ(HOST_NRS_X86_64.rt_sigsuspend, 130);
+    ASSERT_EQ(HOST_NRS_GENERIC.rt_sigsuspend, 133);
+    ASSERT_EQ(HOST_NRS_X86_64.socketpair, 53);
+    ASSERT_EQ(HOST_NRS_GENERIC.socketpair, 199);
+    ASSERT_EQ(HOST_NRS_X86_64.timer_create, 222);
+    ASSERT_EQ(HOST_NRS_GENERIC.timer_create, 107);
+    ASSERT_EQ(HOST_NRS_X86_64.lgetxattr, 192);
+    ASSERT_EQ(HOST_NRS_GENERIC.lgetxattr, 9);
+}
+
 void test_syscall_nr_init(void)
 {
     TEST_REGISTER(test_x86_64_openat);
@@ -106,4 +132,6 @@ void test_syscall_nr_init(void)
     TEST_REGISTER(test_host_aarch64_gettimeofday);
     TEST_REGISTER(test_host_aarch64_no_open);
     TEST_REGISTER(test_at_fdcwd);
+    TEST_REGISTER(test_host_cap_syscalls);
+    TEST_REGISTER(test_host_statfs_fchmod_fadvise_syscalls);
 }

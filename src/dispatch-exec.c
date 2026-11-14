@@ -108,7 +108,7 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
         return kbox_dispatch_errno(EBADF);
     if (lkl_fd >= 0) {
         long host = kbox_fd_table_get_host_fd(ctx->fd_table, fd);
-        if (host == -1) {
+        if (host == -1 || host == KBOX_FD_LOCAL_ONLY_SHADOW) {
             /* Only create lazy shadows for read-only/private mappings.
              * Writable MAP_SHARED mappings on LKL files cannot be supported
              * via memfd (writes would go to the copy, not LKL).
@@ -118,13 +118,23 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
             if ((mmap_flags & MAP_SHARED) && (mmap_prot & PROT_WRITE))
                 return kbox_dispatch_errno(ENODEV);
 
-            int memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
-            if (memfd < 0)
-                return kbox_dispatch_errno(ENODEV);
-            kbox_shadow_seal(memfd);
+            struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
+            int memfd = -1;
+            int own_memfd = 0;
+            if (host == KBOX_FD_LOCAL_ONLY_SHADOW && entry &&
+                entry->shadow_sp >= 0) {
+                memfd = entry->shadow_sp;
+            } else {
+                memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
+                if (memfd < 0)
+                    return kbox_dispatch_errno(ENODEV);
+                kbox_shadow_seal(memfd);
+                own_memfd = 1;
+            }
             int injected = request_addfd_at(ctx, req, memfd, (int) fd, 0);
             if (injected < 0) {
-                close(memfd);
+                if (own_memfd)
+                    close(memfd);
                 return kbox_dispatch_errno(ENODEV);
             }
             /* Mark that a shadow was injected so repeated mmaps do not
@@ -136,11 +146,8 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
              */
             kbox_fd_table_set_host_fd(ctx->fd_table, fd,
                                       KBOX_FD_HOST_SAME_FD_SHADOW);
-            {
-                struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
-                if (entry)
-                    entry->shadow_sp = memfd;
-            }
+            if (entry && own_memfd)
+                entry->shadow_sp = memfd;
         }
     }
 
@@ -775,6 +782,160 @@ fail_early:
  * the kernel has not yet copied the pathname (getname happens after the seccomp
  * check), so the overwrite is race-free.
  */
+static int read_tracee_sp(pid_t pid, uint64_t *sp_out)
+{
+    char pbuf[64];
+    char sbuf[512];
+    int fd;
+    ssize_t n;
+
+    snprintf(pbuf, sizeof(pbuf), "/proc/%d/syscall", (int) pid);
+    fd = open(pbuf, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -errno;
+    n = read(fd, sbuf, sizeof(sbuf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -ENOENT;
+    sbuf[n] = '\0';
+
+    /* Format: "<nr> <arg0> <arg1> <arg2> <arg3> <arg4> <arg5> <sp> <ip>" */
+    char *p = sbuf;
+    for (int col = 0; col < 7; col++) {
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            return -ENOENT;
+    }
+    errno = 0;
+    uint64_t sp = (uint64_t) strtoull(p, NULL, 16);
+    if (errno || sp < 4096)
+        return -EINVAL;
+    *sp_out = sp;
+    return 0;
+}
+
+static int write_guest_mem_any(const struct kbox_supervisor_ctx *ctx,
+                               pid_t pid,
+                               uint64_t addr,
+                               const void *buf,
+                               size_t len)
+{
+    int rc = guest_mem_write(ctx, pid, addr, buf, len);
+    if (rc < 0)
+        rc = guest_mem_write_force(ctx, pid, addr, buf, len);
+    return rc;
+}
+
+#define MAX_EXEC_RELOC 32
+
+struct exec_str_reloc {
+    uint64_t old_ptr;
+    size_t offset;
+    size_t len_with_nul;
+    char str[KBOX_MAX_PATH];
+};
+
+struct exec_slot_update {
+    uint64_t slot_addr;
+    size_t reloc_idx;
+};
+
+static int relocate_overlapping_exec_vecs(const struct kbox_supervisor_ctx *ctx,
+                                          pid_t pid,
+                                          uint64_t path_addr,
+                                          size_t new_bytes,
+                                          uint64_t argv_addr,
+                                          uint64_t envp_addr)
+{
+    struct exec_str_reloc relocs[MAX_EXEC_RELOC];
+    struct exec_slot_update slots[MAX_EXEC_RELOC * 2];
+    size_t reloc_cnt = 0;
+    size_t slot_cnt = 0;
+    size_t total_bytes = 0;
+    uint64_t win_end = path_addr + (uint64_t) new_bytes;
+    uint64_t vecs[2] = {argv_addr, envp_addr};
+
+    for (int vi = 0; vi < 2; vi++) {
+        uint64_t base = vecs[vi];
+        if (!base)
+            continue;
+        for (size_t idx = 0; idx < 1024; idx++) {
+            uint64_t ptr = 0;
+            uint64_t slot_addr = base + (uint64_t) idx * sizeof(uint64_t);
+            if (guest_mem_read(ctx, pid, slot_addr, &ptr, sizeof(ptr)) < 0 ||
+                ptr == 0)
+                break;
+
+            if (ptr >= win_end)
+                continue;
+            if (ptr < path_addr && path_addr - ptr >= KBOX_MAX_PATH)
+                continue;
+
+            size_t found = (size_t) -1;
+            for (size_t r = 0; r < reloc_cnt; r++) {
+                if (relocs[r].old_ptr == ptr) {
+                    found = r;
+                    break;
+                }
+            }
+            if (found == (size_t) -1) {
+                char tmp[KBOX_MAX_PATH];
+                if (guest_mem_read_string(ctx, pid, ptr, tmp, sizeof(tmp)) < 0)
+                    continue;
+                size_t slen = strlen(tmp) + 1;
+                if (ptr < path_addr && ptr + (uint64_t) slen <= path_addr)
+                    continue;
+                if (reloc_cnt >= MAX_EXEC_RELOC)
+                    return -E2BIG;
+                found = reloc_cnt++;
+                relocs[found].old_ptr = ptr;
+                relocs[found].offset = total_bytes;
+                relocs[found].len_with_nul = slen;
+                memcpy(relocs[found].str, tmp, slen);
+                total_bytes += slen;
+            }
+            if (slot_cnt >= MAX_EXEC_RELOC * 2)
+                return -E2BIG;
+            slots[slot_cnt].slot_addr = slot_addr;
+            slots[slot_cnt].reloc_idx = found;
+            slot_cnt++;
+        }
+    }
+
+    if (reloc_cnt == 0)
+        return 0;
+
+    uint64_t sp = 0;
+    int rc = read_tracee_sp(pid, &sp);
+    if (rc < 0)
+        return rc;
+
+    char *packed = malloc(total_bytes);
+    if (!packed)
+        return -ENOMEM;
+    for (size_t r = 0; r < reloc_cnt; r++)
+        memcpy(packed + relocs[r].offset, relocs[r].str, relocs[r].len_with_nul);
+
+    /* Place packed strings safely below tracee stack pointer (past redzone). */
+    uint64_t scratch = (sp - 512 - (uint64_t) total_bytes) & ~(uint64_t) 15;
+    rc = write_guest_mem_any(ctx, pid, scratch, packed, total_bytes);
+    free(packed);
+    if (rc < 0)
+        return rc;
+
+    for (size_t s = 0; s < slot_cnt; s++) {
+        uint64_t new_ptr = scratch + (uint64_t) relocs[slots[s].reloc_idx].offset;
+        rc = write_guest_mem_any(ctx, pid, slots[s].slot_addr, &new_ptr,
+                                 sizeof(new_ptr));
+        if (rc < 0)
+            return rc;
+    }
+    return 0;
+}
+
 struct kbox_dispatch forward_execve(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx,
                                     int is_execveat)
@@ -800,29 +961,47 @@ struct kbox_dispatch forward_execve(const struct kbox_syscall_request *req,
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
 
-    /* Translate path for LKL. */
+    /* Resolve host bind mount or translate path for LKL. */
     char translated[KBOX_MAX_PATH];
-    rc = kbox_translate_path_for_lkl(pid, pathbuf, ctx->host_root, translated,
-                                     sizeof(translated));
-    if (rc < 0)
-        return kbox_dispatch_errno(-rc);
+    int bind_ro = 0;
+    long raw_dirfd =
+        is_execveat ? to_dirfd_arg(kbox_syscall_request_arg(req, 0))
+                    : AT_FDCWD_LINUX;
+    int brc = kbox_resolve_host_bind_at(ctx, raw_dirfd, pathbuf, translated,
+                                        sizeof(translated), &bind_ro);
+    if (brc < 0)
+        return kbox_dispatch_errno(-brc);
 
-    /* Virtual paths (/proc, /sys, /dev) are not executable binaries.
-     * Return ENOENT/EACCES rather than CONTINUE to avoid a TOCTOU window
-     * where a sibling thread could swap the path after validation.
-     */
-    if (kbox_is_lkl_virtual_path(translated))
-        return kbox_dispatch_errno(EACCES);
+    int exec_memfd;
+    if (brc > 0) {
+        int hfd = open(translated, O_RDONLY | O_CLOEXEC);
+        if (hfd < 0)
+            return kbox_dispatch_errno(errno);
+        exec_memfd = kbox_shadow_create_from_host_fd(hfd);
+        close(hfd);
+    } else {
+        rc = kbox_translate_path_for_lkl(pid, pathbuf, ctx->host_root,
+                                         translated, sizeof(translated));
+        if (rc < 0)
+            return kbox_dispatch_errno(-rc);
 
-    /* Open the binary from LKL. */
-    long lkl_fd =
-        kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX, translated, O_RDONLY, 0);
-    if (lkl_fd < 0)
-        return kbox_dispatch_errno((int) (-lkl_fd));
+        /* Virtual paths (/proc, /sys, /dev) are not executable binaries.
+         * Return ENOENT/EACCES rather than CONTINUE to avoid a TOCTOU window
+         * where a sibling thread could swap the path after validation.
+         */
+        if (kbox_is_lkl_virtual_path(translated))
+            return kbox_dispatch_errno(EACCES);
 
-    /* Create a memfd with the binary contents. */
-    int exec_memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
-    lkl_close_and_invalidate(ctx, lkl_fd);
+        /* Open the binary from LKL. */
+        long lkl_fd = kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX, translated,
+                                      O_RDONLY, 0);
+        if (lkl_fd < 0)
+            return kbox_dispatch_errno((int) (-lkl_fd));
+
+        /* Create a memfd with the binary contents. */
+        exec_memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
+        lkl_close_and_invalidate(ctx, lkl_fd);
+    }
 
     if (exec_memfd < 0)
         return kbox_dispatch_errno(-exec_memfd);
@@ -834,6 +1013,20 @@ struct kbox_dispatch forward_execve(const struct kbox_syscall_request *req,
      */
     if (request_uses_trap_signals(req))
         return trap_userspace_exec(req, ctx, exec_memfd, pathbuf, is_execveat);
+
+    /* Check for ELF header; non-ELF executables (e.g. #! scripts) cannot be
+     * executed safely via /proc/self/fd/N because binfmt_script would invoke
+     * the host interpreter and close O_CLOEXEC FDs. Returning ENOEXEC lets the
+     * guest shell run the script inside the LKL/bind namespace.
+     */
+    {
+        unsigned char elf_magic[4];
+        if (pread(exec_memfd, elf_magic, 4, 0) != 4 ||
+            memcmp(elf_magic, "\x7f" "ELF", 4) != 0) {
+            close(exec_memfd);
+            return kbox_dispatch_errno(ENOEXEC);
+        }
+    }
 
     /* Check for PT_INTERP (dynamic binary). */
     {
@@ -940,76 +1133,35 @@ struct kbox_dispatch forward_execve(const struct kbox_syscall_request *req,
         return kbox_dispatch_errno(-tracee_exec_fd);
 
     /* Overwrite the pathname in the tracee's memory with /proc/self/fd/<N>.
-     * The kernel has not yet copied the pathname (getname happens after the
-     * seccomp check), so when we CONTINUE, it reads our rewritten path.
-     *
-     * argv[0] aliasing: some shells pass the same pointer for pathname and
-     * argv[0]. If we overwrite the pathname, we corrupt argv[0]. Detect this
-     * and fix it by writing the original path right after the new path in the
-     * same buffer, then updating the argv[0] pointer in the argv array.
-     *
-     * Try process_vm_writev first (fast path). If that fails (e.g. pathname
-     * is in .rodata), fall back to /proc/pid/mem which can write through page
-     * protections.
+     * Relocate any overlapping argv[]/envp[] strings (including aliased
+     * argv[0] and short pathnames packed adjacent to argv[1..]) below the
+     * tracee stack pointer before overwriting path_addr.
      */
     char new_path[64];
     int new_path_len = snprintf(new_path, sizeof(new_path), "/proc/self/fd/%d",
                                 tracee_exec_fd);
-
-    /* Check if argv[0] is aliased with the pathname. argv pointer is args[1]
-     * for execve, args[2] for execveat.
-     */
-    uint64_t argv_addr = is_execveat ? kbox_syscall_request_arg(req, 2)
-                                     : kbox_syscall_request_arg(req, 1);
-    uint64_t argv0_ptr = 0;
-    int argv0_aliased = 0;
-
-    if (argv_addr != 0) {
-        rc = guest_mem_read(ctx, pid, argv_addr, &argv0_ptr, sizeof(argv0_ptr));
-        if (rc == 0 && argv0_ptr == path_addr)
-            argv0_aliased = 1;
-    }
-
-    /* Build the write buffer: new_path + NUL + original_path + NUL. Original
-     * path goes right after the new path so we can point argv[0] at it.
-     */
-    size_t orig_len = strlen(pathbuf);
     size_t total_write = (size_t) (new_path_len + 1);
 
-    if (argv0_aliased)
-        total_write += orig_len + 1;
+    uint64_t argv_addr = is_execveat ? kbox_syscall_request_arg(req, 2)
+                                     : kbox_syscall_request_arg(req, 1);
+    uint64_t envp_addr = is_execveat ? kbox_syscall_request_arg(req, 3)
+                                     : kbox_syscall_request_arg(req, 2);
 
-    char write_buf[KBOX_MAX_PATH + 64];
-    if (total_write > sizeof(write_buf))
-        return kbox_dispatch_errno(ENAMETOOLONG);
-
-    memcpy(write_buf, new_path, (size_t) (new_path_len + 1));
-    if (argv0_aliased)
-        memcpy(write_buf + new_path_len + 1, pathbuf, orig_len + 1);
-
-    rc = guest_mem_write(ctx, pid, path_addr, write_buf, total_write);
-    if (rc < 0) {
-        rc = guest_mem_write_force(ctx, pid, path_addr, write_buf, total_write);
-        if (rc < 0) {
-            if (ctx->verbose)
-                fprintf(stderr,
-                        "kbox: exec %s: cannot rewrite "
-                        "pathname: %s\n",
-                        pathbuf, strerror(-rc));
-            return kbox_dispatch_errno(ENOEXEC);
-        }
+    rc = relocate_overlapping_exec_vecs(ctx, pid, path_addr, total_write,
+                                        argv_addr, envp_addr);
+    if (rc < 0 && ctx->verbose) {
+        fprintf(stderr, "kbox: exec %s: vector relocation skipped (%s)\n",
+                pathbuf, strerror(-rc));
     }
 
-    /* If argv[0] was aliased, update the argv[0] pointer to point at original
-     * path copy (right after the new path).
-     */
-    if (argv0_aliased) {
-        uint64_t new_argv0 = path_addr + (uint64_t) (new_path_len + 1);
-        rc =
-            guest_mem_write(ctx, pid, argv_addr, &new_argv0, sizeof(new_argv0));
-        if (rc < 0)
-            guest_mem_write_force(ctx, pid, argv_addr, &new_argv0,
-                                  sizeof(new_argv0));
+    rc = write_guest_mem_any(ctx, pid, path_addr, new_path, total_write);
+    if (rc < 0) {
+        if (ctx->verbose)
+            fprintf(stderr,
+                    "kbox: exec %s: cannot rewrite "
+                    "pathname: %s\n",
+                    pathbuf, strerror(-rc));
+        return kbox_dispatch_errno(ENOEXEC);
     }
 
     if (ctx->verbose)

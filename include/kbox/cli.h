@@ -9,6 +9,7 @@
 /* CLI argument structures and parsing. */
 
 #define KBOX_MAX_BIND_MOUNTS 32
+#define KBOX_MAX_HOST_VOLUMES 32
 #define KBOX_MAX_MOUNT_OPTS 16
 
 enum kbox_syscall_mode {
@@ -31,6 +32,8 @@ struct kbox_image_args {
     int mount_opt_count;
     const char *bind_mounts[KBOX_MAX_BIND_MOUNTS];
     int bind_mount_count;
+    const char *host_volumes[KBOX_MAX_HOST_VOLUMES];
+    int host_volume_count;
     bool root_id;                          /* -0: force uid=0 gid=0 */
     const char *change_id;                 /* --change-id UID:GID */
     bool normalize;                        /* -n: normalize permissions */

@@ -123,6 +123,9 @@ long kbox_lkl_fchmodat(const struct kbox_sysnrs *s,
                        const char *path,
                        long mode,
                        long flags);
+long kbox_lkl_fchmod(const struct kbox_sysnrs *s, long fd, long mode);
+long kbox_lkl_statfs(const struct kbox_sysnrs *s, const char *path, void *buf);
+long kbox_lkl_fstatfs(const struct kbox_sysnrs *s, long fd, void *buf);
 long kbox_lkl_fchownat(const struct kbox_sysnrs *s,
                        long dirfd,
                        const char *path,
@@ -282,6 +285,28 @@ long kbox_lkl_recvfrom(const struct kbox_sysnrs *s,
                        long flags,
                        void *addr,
                        void *addrlen);
+long kbox_lkl_listen(const struct kbox_sysnrs *s, long fd, long backlog);
+long kbox_lkl_accept(const struct kbox_sysnrs *s,
+                     long fd,
+                     void *addr,
+                     void *addrlen);
+long kbox_lkl_accept4(const struct kbox_sysnrs *s,
+                      long fd,
+                      void *addr,
+                      void *addrlen,
+                      long flags);
+long kbox_lkl_ppoll(const struct kbox_sysnrs *s,
+                    void *fds,
+                    unsigned long nfds,
+                    const void *tmo_p,
+                    const void *sigmask,
+                    unsigned long sigsetsize);
+long kbox_lkl_unshare(const struct kbox_sysnrs *s, long flags);
+long kbox_lkl_setns(const struct kbox_sysnrs *s, long fd, long nstype);
+long kbox_lkl_sethostname(const struct kbox_sysnrs *s,
+                          const char *name,
+                          long len);
+long kbox_lkl_new_thread_group_leader(const struct kbox_sysnrs *s);
 
 /* Forward declarations for netdev ops. */
 struct iovec;

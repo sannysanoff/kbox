@@ -35,6 +35,7 @@ static const struct option longopts[] = {
     {"cmdline", required_argument, NULL, 'k'},
     {"mount-opts", required_argument, NULL, 'm'},
     {"bind-mount", required_argument, NULL, 'b'},
+    {"volume", required_argument, NULL, 'V'},
     {"root-id", no_argument, NULL, '0'},
     {"change-id", required_argument, NULL, OPT_CHANGE_ID},
     {"normalize", no_argument, NULL, 'n'},
@@ -50,7 +51,7 @@ static const struct option longopts[] = {
     {NULL, 0, NULL, 0},
 };
 
-static const char shortopts[] = "r:R:S:t:p:w:c:k:m:b:0nh";
+static const char shortopts[] = "r:R:S:t:p:w:c:k:m:b:V:0nh";
 
 void kbox_usage(const char *argv0)
 {
@@ -72,6 +73,7 @@ void kbox_usage(const char *argv0)
         "loglevel=4)\n"
         "  -m, --mount-opts OPT       Mount option (repeatable)\n"
         "  -b, --bind-mount SRC:DST   Bind mount (repeatable)\n"
+        "  -V, --volume HOST:DST[:ro] Host volume bind mount (repeatable)\n"
         "  -0, --root-id              Force uid=0 gid=0 inside guest\n"
         "      --change-id UID:GID    Set explicit identity\n"
         "  -n, --normalize            Normalize file permissions\n"
@@ -167,6 +169,13 @@ int kbox_parse_args(int argc, char *argv[], struct kbox_image_args *img)
                 return -1;
             }
             img->bind_mounts[img->bind_mount_count++] = optarg;
+            break;
+        case 'V':
+            if (img->host_volume_count >= KBOX_MAX_HOST_VOLUMES) {
+                fprintf(stderr, "too many host volumes\n");
+                return -1;
+            }
+            img->host_volumes[img->host_volume_count++] = optarg;
             break;
         case '0':
             img->root_id = true;

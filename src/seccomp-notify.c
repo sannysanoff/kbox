@@ -37,6 +37,33 @@ int kbox_notify_send(int listener_fd, const void *resp)
     return 0;
 }
 
+int kbox_notify_respond(int listener_fd,
+                        uint64_t id,
+                        const struct kbox_dispatch *d)
+{
+    struct kbox_seccomp_notif_resp resp;
+
+    memset(&resp, 0, sizeof(resp));
+    resp.id = id;
+
+    switch (d->kind) {
+    case KBOX_DISPATCH_CONTINUE:
+        resp.flags = KBOX_NOTIF_FLAG_CONTINUE;
+        resp.val = 0;
+        resp.error = 0;
+        break;
+    case KBOX_DISPATCH_RETURN:
+        resp.flags = 0;
+        resp.val = d->val;
+        resp.error = d->error ? -d->error : 0;
+        break;
+    case KBOX_DISPATCH_DEFERRED:
+        return 0;
+    }
+
+    return kbox_notify_send(listener_fd, &resp);
+}
+
 int kbox_notify_addfd(int listener_fd,
                       uint64_t id,
                       int srcfd,

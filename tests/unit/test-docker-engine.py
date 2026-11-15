@@ -8,6 +8,7 @@ import os
 import struct
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 
@@ -367,6 +368,64 @@ class TestDockerEngine(unittest.TestCase):
 
         # Clean up health_stop
         rec["health_stop"].set()
+
+    def test_restart_resets_exit_status(self):
+        # The daemon's container_wait blocks until exit; make the stub behave
+        # the same so the exit watcher cannot fire during the test.
+        orig_call = self.rpc.call
+
+        def blocking_call(payload):
+            if payload.get("op") == "container_wait":
+                time.sleep(2)
+                return {"ok": True, "exit_code": 0}
+            return orig_call(payload)
+
+        self.rpc.call = blocking_call
+        rec = self.engine.create_container("restart", {"Image": "alpine:latest"})
+        self.engine.start_container(rec)
+        # Simulate the exit the watcher would record.
+        rec["status"] = "exited"
+        rec["exit_code"] = 137
+        rec["finished_at"] = 123
+        self.engine.start_container(rec)
+        self.assertEqual(rec["status"], "running")
+        self.assertEqual(rec["exit_code"], 0)
+        self.assertEqual(rec["finished_at"], 0)
+
+    def test_inspect_refreshes_exited_state(self):
+        rec = self.engine.create_container("gone", {"Image": "alpine:latest"})
+        self.engine.start_container(rec)
+
+        orig_call = self.rpc.call
+
+        def fake_call(payload):
+            if payload.get("op") == "container_inspect":
+                return {"ok": True, "state": "exited", "pid": 1234,
+                        "exit_code": 3}
+            if payload.get("op") == "container_wait":
+                time.sleep(2)
+                return {"ok": True, "exit_code": 0}
+            return orig_call(payload)
+
+        self.rpc.call = fake_call
+        srv = kbox_dockerd.ThreadingHTTPServer(
+            ("127.0.0.1", 0), kbox_dockerd.DockerHandler
+        )
+        srv.engine = self.engine
+        srv.verbose = False
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v1.47/containers/{rec['id']}/json"
+            ) as r:
+                info = json.loads(r.read().decode())
+            self.assertFalse(info["State"]["Running"])
+            self.assertEqual(info["State"]["ExitCode"], 3)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
     def test_rename_container_updates_name_and_dns(self):
         rec = self.engine.create_container("old-name", {"Image": "alpine:latest"})

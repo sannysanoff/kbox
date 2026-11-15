@@ -718,6 +718,13 @@ static struct kbox_dispatch dispatch_iov_transfer(
     if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
         return kbox_dispatch_continue();
 
+    if (is_write && ctx->verbose) {
+        long cur = kbox_lkl_lseek(ctx->sysnrs, lkl_fd, 0, SEEK_CUR);
+        fprintf(stderr,
+                "kbox: writev fd=%ld lkl=%ld host_fd=%ld cur_off=%ld\n", fd,
+                lkl_fd, entry ? entry->host_fd : -99, cur);
+    }
+
     if (is_write)
         invalidate_stat_cache_fd(ctx, lkl_fd);
 

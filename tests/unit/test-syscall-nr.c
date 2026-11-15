@@ -106,6 +106,8 @@ static void test_host_statfs_fchmod_fadvise_syscalls(void)
     ASSERT_EQ(HOST_NRS_GENERIC.fadvise64, 223);
     ASSERT_EQ(HOST_NRS_X86_64.rt_sigsuspend, 130);
     ASSERT_EQ(HOST_NRS_GENERIC.rt_sigsuspend, 133);
+    ASSERT_EQ(HOST_NRS_X86_64.rt_sigtimedwait, 128);
+    ASSERT_EQ(HOST_NRS_GENERIC.rt_sigtimedwait, 137);
     ASSERT_EQ(HOST_NRS_X86_64.socketpair, 53);
     ASSERT_EQ(HOST_NRS_GENERIC.socketpair, 199);
     ASSERT_EQ(HOST_NRS_X86_64.timer_create, 222);

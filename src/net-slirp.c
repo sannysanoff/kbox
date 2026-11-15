@@ -540,9 +540,10 @@ static int shadow_nonfatal_recv_error(const struct shadow_socket *sock, long r)
     return 0;
 }
 
-static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
+static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
 {
     int shadow_cnt = ctx->count - shadow_base;
+    int progressed = 0;
 
     pthread_mutex_lock(&shadow_lock);
     for (int si = 0; si < shadow_cnt; si++) {
@@ -595,6 +596,7 @@ static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
             if (n > 0) {
                 sock->to_lkl_off = 0;
                 sock->to_lkl_len = (size_t) n;
+                progressed = 1;
                 if (shadow_flush_to_lkl(sock) < 0) {
                     sock->active = 0;
                     close(sock->supervisor_fd);
@@ -642,6 +644,7 @@ static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
             if (r > 0) {
                 sock->to_supervisor_off = 0;
                 sock->to_supervisor_len = (size_t) r;
+                progressed = 1;
             } else if (r < 0 && !shadow_nonfatal_recv_error(sock, r)) {
                 sock->active = 0;
                 close(sock->supervisor_fd);
@@ -656,8 +659,13 @@ static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
             sock->supervisor_fd = -1;
             continue;
         }
+
+        /* Buffered data left over means another pass is needed right away. */
+        if (sock->to_lkl_len > 0 || sock->to_supervisor_len > 0)
+            progressed = 1;
     }
     pthread_mutex_unlock(&shadow_lock);
+    return progressed;
 }
 
 /* LKL virtio-net callbacks (iovec-based). */
@@ -849,6 +857,7 @@ static void *slirp_event_loop(void *arg)
 {
     (void) arg;
     struct poll_ctx ctx;
+    int busy = 0; /* shadow pump moved data: iterate again without blocking */
 
     while (__atomic_load_n(&slirp_running, __ATOMIC_RELAXED)) {
         ctx.count = 0;
@@ -893,6 +902,15 @@ static void *slirp_event_loop(void *arg)
         int timer_ms = next_timer_timeout_ms();
         if (timer_ms >= 0 && timer_ms < timeout_ms)
             timeout_ms = timer_ms;
+        /* LKL does not signal the host when a shadowed socket receives data,
+         * so those sockets are only drained by an explicit probe. Without a
+         * short cap every request/response hop waits for the 100 ms timeout,
+         * which shows up as ~300 ms per round trip inside the guest.
+         */
+        if (shadow_base < ctx.count && timeout_ms > 2)
+            timeout_ms = 2;
+        if (busy)
+            timeout_ms = 0;
 
         int ret = poll(ctx.pfds, (nfds_t) ctx.count, timeout_ms);
         if (ret < 0 && errno != EINTR)
@@ -919,7 +937,9 @@ static void *slirp_event_loop(void *arg)
 
         /* Pump shadow socket data. */
         if (shadow_base < ctx.count)
-            pump_shadow_sockets(&ctx, shadow_base);
+            busy = pump_shadow_sockets(&ctx, shadow_base);
+        else
+            busy = 0;
     }
     return NULL;
 }

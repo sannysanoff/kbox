@@ -2460,6 +2460,13 @@ int try_writeback_shadow_open(struct kbox_supervisor_ctx *ctx,
         return 0;
     if ((flags & O_ACCMODE) == O_RDONLY)
         return 0;
+    /* O_APPEND must keep the kernel's append semantics on the real file: the
+     * writable shadow is an independent copy with its own offset, so appending
+     * to it and copying back leaves holes (logs written after truncation get a
+     * NUL prefix the size of the data). Keep O_APPEND writes on the LKL FD.
+     */
+    if (flags & O_APPEND)
+        return 0;
     if (kbox_is_lkl_virtual_path(translated) ||
         kbox_is_tty_like_path(translated))
         return 0;
@@ -2889,6 +2896,10 @@ int sync_shadow_writeback(struct kbox_supervisor_ctx *ctx,
 
     if (fstat(entry->shadow_sp, &st) < 0)
         return -errno;
+    if (ctx->verbose)
+        fprintf(stderr,
+                "kbox: shadow writeback lkl_fd=%ld shadow_size=%lld\n",
+                entry->lkl_fd, (long long) st.st_size);
     if (kbox_lkl_ftruncate(ctx->sysnrs, entry->lkl_fd, (long) st.st_size) < 0)
         return -EIO;
     if (lseek(entry->shadow_sp, 0, SEEK_SET) < 0)
@@ -4399,6 +4410,7 @@ int kbox_dispatch_try_local_fast_path(const struct kbox_host_nrs *h,
         nr == h->madvise || nr == h->wait4 || nr == h->waitid ||
         nr == h->exit || nr == h->exit_group || nr == h->rt_sigreturn ||
         nr == h->rt_sigaltstack || nr == h->rt_sigsuspend ||
+        nr == h->rt_sigtimedwait ||
         nr == h->setitimer || nr == h->getitimer ||
         nr == h->setpgid || nr == h->getpgid || nr == h->getsid ||
         nr == h->setsid || nr == h->fork || nr == h->vfork ||
@@ -5880,6 +5892,12 @@ struct kbox_dispatch kbox_dispatch_request(
             return emulate_trap_rt_sigpending(req, ctx);
         return kbox_dispatch_continue();
     }
+    /* rt_sigtimedwait waits on the tracee's own pending signals; the host
+     * kernel owns those, so CONTINUE. ClickHouse's benchmark and client use
+     * it to poll for SIGINT.
+     */
+    if (nr == h->rt_sigtimedwait)
+        return kbox_dispatch_continue();
     if (h->alarm >= 0 && nr == h->alarm)
         return kbox_dispatch_continue();
 
@@ -6096,5 +6114,14 @@ struct kbox_dispatch kbox_dispatch_syscall(struct kbox_supervisor_ctx *ctx,
 
     if (kbox_syscall_request_from_notif(notif_ptr, &req) < 0)
         return kbox_dispatch_errno(EINVAL);
-    return kbox_dispatch_request(ctx, &req);
+    struct kbox_dispatch d = kbox_dispatch_request(ctx, &req);
+    /* Verbose diagnostics: name the syscall that was rejected, with its fd
+     * arguments. Without this an unexpected EBADF inside a program is opaque.
+     */
+    if (ctx->verbose && d.kind == KBOX_DISPATCH_RETURN && d.error)
+        fprintf(stderr, "kbox: deny nr=%d (%s) fd=%ld,%ld,%ld err=%d pid=%u\n",
+                (int) req.nr, syscall_name_from_nr(ctx->host_nrs, req.nr),
+                (long) req.args[0], (long) req.args[1], (long) req.args[2],
+                d.error, (unsigned) req.pid);
+    return d;
 }

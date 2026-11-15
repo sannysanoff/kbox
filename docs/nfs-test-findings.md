@@ -64,24 +64,28 @@ with `bind ... failed: Stale file handle`, indefinitely. The mount retry loop
 only runs at daemon startup, so there is no reconnect and no remount; recovery
 there means restarting kboxd.
 
-## Not measured: timeouts, and why
+## Timeouts: measured, and `soft` is not honoured
 
-`timeo`/`retrans` and the `soft` versus `hard` distinction still have no
-numbers. The harness, not the filesystem, is what is missing:
+The harness problem was mine, not NFS's: stopping a proxy process is not a
+blackout, because a stopped process still completes TCP handshakes from the
+kernel's accept queue, and SIGSTOP to a namespace's PID 1 is ignored outright.
+The measurement now drops packets instead: `iptables -I INPUT --dport 20490
+-j DROP` inside the (privileged) ganesha pod, with two direct handles mounted
+`hard,timeo=50,retrans=2` and `soft,timeo=50,retrans=2`.
 
-- `shopify/toxiproxy` publishes amd64 only, so it cannot run on an arm64 node;
-- the socat replacement cannot be silenced where it matters: SIGSTOP to PID 1
-  of a namespace is ignored by the kernel, and even once socat runs as a child,
-  a stopped process's listening socket still completes handshakes from the
-  kernel's accept queue, so "stop the proxy" is not a blackout;
-- with the handle pointed at the proxy's ClusterIP, 4 MB writes through
-  `nfs://soft_net` still landed on the export while the proxy pod's interface
-  counters did not move, so it is unproven that the traffic traversed the proxy
-  at all. Both handles did resolve to the proxy's ClusterIP
-  (`addr=192.168.194.202`) and the binds went through the right handle
-  (`/kbox-vol/nfs/soft_net/net`), so the next step is a blackout that cannot be
-  bypassed — a fixed pod IP, or `tc netem` on the link in front of ganesha —
-  rather than another process-level stop.
+With packets dropped under two running writers: both containers stay running
+for the whole blackout, neither returns an error, and when the drop is removed
+both complete and both 4 MB files land on the export. The soft handle, which
+should give up after roughly `timeo x (retrans + 1)` — fifteen seconds here —
+was still blocked after seventy. **`soft` is not honoured by the LKL NFS
+client, and no I/O error was ever produced for a silent server.**
 
-Lease renewal beyond a single in-place restart is unmeasured for the same
-reason.
+Two side effects worth knowing. Creating a container that needs the volume
+blocks while the server is silent, because the daemon creates the requested
+subtree on the export first, so the Docker API call never returns. And a
+container blocked in that I/O cannot be interrupted: `docker run` blocks with
+it and ignores SIGTERM.
+
+The guest's `/proc/mounts` lists no NFS lines at all, so the mount options
+cannot be confirmed from inside; the daemon's own log is the only place the
+`soft`/`hard` flags are visible.

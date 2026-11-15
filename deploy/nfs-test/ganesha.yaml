@@ -26,7 +26,7 @@ spec:
     spec:
       containers:
         - name: ganesha
-          image: kbox-nfs-test/ganesha:local
+          image: kbox-nfs-test/ganesha:net
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true

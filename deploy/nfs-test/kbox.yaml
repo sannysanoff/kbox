@@ -25,13 +25,14 @@ data:
       "nfs://mounted_here":
         source: ganesha.nfs-test.svc.cluster.local:/
         options: vers=4.2,proto=tcp,port=20490,rsize=65536,wsize=65536
-      # Through the socat proxy, so the server can be silenced on demand.
-      "nfs://hard_net":
-        source: toxiproxy.nfs-test.svc.cluster.local:/
-        options: vers=4.2,proto=tcp,port=20491,hard,timeo=50,retrans=2
-      "nfs://soft_net":
-        source: toxiproxy.nfs-test.svc.cluster.local:/
-        options: vers=4.2,proto=tcp,port=20491,soft,timeo=50,retrans=2
+      # Direct, with an explicit retransmit budget, so a silenced server is
+      # measurable: hard keeps retrying, soft gives up with EIO.
+      "nfs://hard_direct":
+        source: ganesha.nfs-test.svc.cluster.local:/
+        options: vers=4.2,proto=tcp,port=20490,hard,timeo=50,retrans=2
+      "nfs://soft_direct":
+        source: ganesha.nfs-test.svc.cluster.local:/
+        options: vers=4.2,proto=tcp,port=20490,soft,timeo=50,retrans=2
 ---
 apiVersion: apps/v1
 kind: Deployment

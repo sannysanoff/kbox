@@ -1558,8 +1558,18 @@ static void *container_worker_thread(void *arg)
     snprintf(rootfs, sizeof(rootfs), "/containers/%s/rootfs", c->id);
     snprintf(img_dir, sizeof(img_dir), "/images/%s", c->image_id);
 
-    lkl_mkdir_p(sysnrs, upper, 0755);
-    lkl_mkdir_p(sysnrs, work, 0755);
+    /* World-writable upper/work: a container that drops privileges writes as
+     * a non-root uid, and the check that matters is against the overlay inode
+     * the guest sees (1777 for /tmp), after which the real write lands in the
+     * upper layer -- which is owned by root. 0755 there fails such writes with
+     * EACCES even though the guest directory mode allows them. */
+    lkl_mkdir_p(sysnrs, upper, 0777);
+    lkl_mkdir_p(sysnrs, work, 0777);
+    /* mkdir applies the supervisor's umask, so a world-writable upper layer
+     * needs an explicit chmod; without it a container that drops privileges
+     * cannot write through the overlay. */
+    (void) kbox_lkl_fchmodat(sysnrs, AT_FDCWD_LINUX, upper, 0777, 0);
+    (void) kbox_lkl_fchmodat(sysnrs, AT_FDCWD_LINUX, work, 0777, 0);
     lkl_mkdir_p(sysnrs, rootfs, 0755);
 
     char ovl_opts[4096];
@@ -1600,6 +1610,19 @@ static void *container_worker_thread(void *arg)
         if (pr < 0 && g_verbose)
             fprintf(stderr, "kboxd: container procfs mount failed (%ld)\n",
                     pr);
+    }
+
+    /* kbox reports /tmp as world-writable sticky in stat(2) but the image's
+     * own mode is not preserved when the layer is unpacked, so a process that
+     * drops privileges -- postgres, and anything else that puts sockets or
+     * scratch files in /tmp -- gets EACCES on a directory the guest is told is
+     * 1777. Make the real mode match what the guest is shown. */
+    {
+        char tmp_p[256];
+        snprintf(tmp_p, sizeof(tmp_p), "%s/tmp", rootfs);
+        (void) kbox_lkl_fchmodat(sysnrs, AT_FDCWD_LINUX, tmp_p, 01777, 0);
+        snprintf(tmp_p, sizeof(tmp_p), "%s/var/tmp", rootfs);
+        (void) kbox_lkl_fchmodat(sysnrs, AT_FDCWD_LINUX, tmp_p, 01777, 0);
     }
 
     int vrc =
@@ -2657,7 +2680,7 @@ int kbox_daemon_run(const char *sock_path, const char *cmdline, int verbose)
     lkl_mkdir_p(g_sysnrs, "/etc", 0755);
     char tmpfs_opts[4096];
     memset(tmpfs_opts, 0, sizeof(tmpfs_opts));
-    snprintf(tmpfs_opts, sizeof(tmpfs_opts), "mode=0755");
+    snprintf(tmpfs_opts, sizeof(tmpfs_opts), "mode=0777");
     lkl_mkdir_p(g_sysnrs, "/images", 0755);
     kbox_lkl_mount(g_sysnrs, "tmpfs", "/images", "tmpfs", 0, tmpfs_opts);
     lkl_mkdir_p(g_sysnrs, "/containers", 0755);

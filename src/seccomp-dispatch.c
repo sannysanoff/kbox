@@ -870,6 +870,28 @@ static bool should_continue_virtual_path(const struct kbox_supervisor_ctx *ctx,
                                          size_t path_idx,
                                          const char *translated)
 {
+    /* fd magic links belong to the host: the descriptors a guest process sees
+     * are kbox-injected host fds (exec memfds, pipes, sockets), which a guest
+     * procfs knows nothing about, while execve through /proc/self/fd/N is how
+     * kbox hands executables to the kernel. */
+    {
+        const char *tail = NULL;
+        if (!strncmp(translated, "/proc/self/fd", 13))
+            tail = translated + 13;
+        else if (!strncmp(translated, "/proc/thread-self/fd", 20))
+            tail = translated + 20;
+        else if (!strncmp(translated, "/proc/", 6) && translated[6] >= '0' &&
+                 translated[6] <= '9') {
+            const char *p2 = translated + 6;
+            while (*p2 >= '0' && *p2 <= '9')
+                p2++;
+            if (!strncmp(p2, "/fd", 3))
+                tail = p2 + 3;
+        }
+        if (tail && (tail[0] == '\0' || tail[0] == '/'))
+            return true;
+    }
+
     /* A container with its own procfs resolves /proc inside LKL; continuing
      * it would read the host's, and the magic links there are blocked. */
     if (ctx->private_proc && !strncmp(translated, "/proc", 5) &&

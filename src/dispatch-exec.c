@@ -1200,15 +1200,6 @@ static struct kbox_dispatch forward_execve_impl(
  * "/proc/self/fd/N" where its own path used to be and every later fork in it
  * execs a descriptor that belongs to the child.
  */
-struct kbox_vfork_snapshot {
-    pid_t parent;
-    pid_t child;
-    uint64_t addr;
-    size_t len;
-    unsigned char *saved;
-    char child_exe[256]; /* the child's exe before the exec */
-};
-
 static pid_t tracee_parent_of(pid_t pid)
 {
     char path[64], buf[1024];
@@ -1228,38 +1219,6 @@ static pid_t tracee_parent_of(pid_t pid)
     if (sscanf(paren + 2, "%*c %d", &pp) != 1)
         return -1;
     return pp;
-}
-
-static void *vfork_restore_thread(void *arg)
-{
-    struct kbox_vfork_snapshot *snap = arg;
-    char link_path[64];
-    snprintf(link_path, sizeof(link_path), "/proc/%d/exe", (int) snap->child);
-
-    /* Wait for the child's exec to land. While it has not, the parent is still
-     * inside vfork holding the shared address space, and putting the bytes
-     * back now would revert the pathname the kernel has yet to read -- the
-     * exec would then fail with ENOENT on the guest path. The exe link changes
-     * exactly when the new image takes over.
-     */
-    for (int i = 0; i < 8000; i++) {
-        char cur[256];
-        ssize_t n = readlink(link_path, cur, sizeof(cur) - 1);
-        if (n < 0)
-            break; /* child gone (exec failed and it exited) */
-        cur[n] = '\0';
-        if (strcmp(cur, snap->child_exe) != 0)
-            break; /* exec done */
-        usleep(250);
-    }
-
-    struct iovec local = {.iov_base = snap->saved, .iov_len = snap->len};
-    struct iovec remote = {.iov_base = (void *) (uintptr_t) snap->addr,
-                           .iov_len = snap->len};
-    (void) process_vm_writev(snap->parent, &local, 1, &remote, 1, 0);
-    free(snap->saved);
-    free(snap);
-    return NULL;
 }
 
 static int vfork_parent_recorded(const struct kbox_supervisor_ctx *ctx,
@@ -1528,55 +1487,43 @@ static struct kbox_dispatch forward_execve_impl(
                                      : kbox_syscall_request_arg(req, 2);
 
     /* If this is a vfork child, the parent shares these pages and is suspended
-     * until the exec completes: snapshot what is about to be rewritten so it
-     * can be put back when the parent resumes. */
+     * until this exec completes. Record what is about to be rewritten so the
+     * parent's memory can be put back when it resumes -- otherwise it wakes up
+     * with "/proc/self/fd/N" where its own path used to be and every later
+     * fork in it execs a descriptor that belongs to this child. */
     {
         pid_t pp = tracee_parent_of(pid);
-        if (ctx->verbose)
-            fprintf(stderr, "kbox: exec: pid=%u ppid=%d vfork_parent=%d\n",
-                    (unsigned) pid, (int) pp,
-                    pp > 0 ? vfork_parent_recorded(ctx, pp) : 0);
         if (pp > 0 && vfork_parent_recorded(ctx, pp)) {
             uint64_t lo = path_addr < argv_addr ? path_addr : argv_addr;
             uint64_t hi = path_addr > argv_addr ? path_addr : argv_addr;
             const uint64_t margin = 32768;
             lo = lo > margin ? lo - margin : 0;
             size_t len = (size_t) (hi + margin - lo);
-            if (len > 262144)
-                len = 262144;
-            struct kbox_vfork_snapshot *snap = calloc(1, sizeof(*snap));
-            if (snap) {
-                snap->saved = malloc(len);
-                if (snap->saved &&
-                    guest_mem_read(ctx, pid, lo, snap->saved, len) == 0) {
-                    snap->parent = pp;
-                    snap->child = pid;
-                    snap->addr = lo;
-                    snap->len = len;
-                    {
-                        char lp[64];
-                        snprintf(lp, sizeof(lp), "/proc/%d/exe", (int) pid);
-                        ssize_t en = readlink(lp, snap->child_exe,
-                                              sizeof(snap->child_exe) - 1);
-                        snap->child_exe[en > 0 ? (size_t) en : 0] = '\0';
-                    }
-                    pthread_t th;
-                    if (pthread_create(&th, NULL, vfork_restore_thread, snap) ==
-                        0) {
-                        pthread_detach(th);
-                        if (ctx->verbose)
-                            fprintf(stderr,
-                                    "kbox: exec: vfork parent %d snapshotted "
-                                    "0x%llx+%zu\n",
-                                    (int) pp, (unsigned long long) lo, len);
-                    } else {
-                        free(snap->saved);
-                        free(snap);
-                    }
-                } else {
-                    free(snap->saved);
-                    free(snap);
+            if (len > 65536)
+                len = 65536;
+            for (size_t i = 0;
+                 i < sizeof(ctx->vfork_pending) / sizeof(ctx->vfork_pending[0]);
+                 i++) {
+                struct kbox_vfork_pending *slot = &ctx->vfork_pending[i];
+                if (slot->saved)
+                    continue;
+                unsigned char *buf = malloc(len);
+                if (!buf)
+                    break;
+                if (guest_mem_read(ctx, pid, lo, buf, len) != 0) {
+                    free(buf);
+                    break;
                 }
+                slot->parent = pp;
+                slot->addr = lo;
+                slot->len = len;
+                slot->saved = buf;
+                if (ctx->verbose)
+                    fprintf(stderr,
+                            "kbox: exec: vfork parent %d snapshotted "
+                            "0x%llx+%zu\n",
+                            (int) pp, (unsigned long long) lo, len);
+                break;
             }
         }
     }

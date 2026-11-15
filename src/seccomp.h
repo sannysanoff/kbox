@@ -205,6 +205,15 @@ struct kbox_supervisor_ctx {
      * snapshotted and undone once the parent leaves vfork. */
     pid_t vfork_parents[8];
     unsigned vfork_parent_next;
+    /* Exec rewrites that landed in a vfork parent's memory, waiting for that
+     * parent to resume: the parent is suspended until the child execs, so the
+     * first syscall it makes is the signal that the bytes can go back. */
+    struct kbox_vfork_pending {
+        pid_t parent;
+        uint64_t addr;
+        size_t len;
+        unsigned char *saved;
+    } vfork_pending[4];
 
     /* Optional external child-exit notification (used by multi-threaded
      * daemon mode where a central reaper handles SIGCHLD for all children).

@@ -5701,6 +5701,28 @@ struct kbox_dispatch kbox_dispatch_request(
     if (!ctx || !req)
         return kbox_dispatch_errno(EINVAL);
 
+    /* A vfork parent is suspended until its child execs, so its first syscall
+     * afterwards is the moment the exec rewrite can be undone. Doing it here,
+     * rather than from a watcher thread guessing when the exec landed, means
+     * the bytes are never restored while the kernel has yet to read them. */
+    for (size_t i = 0;
+         i < sizeof(ctx->vfork_pending) / sizeof(ctx->vfork_pending[0]); i++) {
+        struct kbox_vfork_pending *slot = &ctx->vfork_pending[i];
+        if (!slot->saved)
+            continue;
+        if (slot->parent != (pid_t) kbox_syscall_request_pid(req))
+            continue;
+        struct iovec local = {.iov_base = slot->saved, .iov_len = slot->len};
+        struct iovec remote = {.iov_base = (void *) (uintptr_t) slot->addr,
+                              .iov_len = slot->len};
+        (void) process_vm_writev(slot->parent, &local, 1, &remote, 1, 0);
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: exec: vfork parent %d restored\n",
+                    (int) slot->parent);
+        free(slot->saved);
+        slot->saved = NULL;
+    }
+
     kbox_dispatch_prepare_request_ctx(ctx, req);
     nr = req->nr;
 

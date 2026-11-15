@@ -112,6 +112,53 @@ struct kbox_dispatch forward_gettimeofday(
     return kbox_dispatch_value(0);
 }
 
+/* /proc inside a container is the host's procfs (paths under it are
+ * continued to the host kernel), so the magic links of the guest's own
+ * process describe kboxd rather than the guest, and kbox blocks them as
+ * escape paths. Official images depend on them -- gosu re-execs through
+ * /proc/self/exe, su-exec and tini do the same -- so synthesize the three
+ * that name guest state from state kbox already tracks.
+ *
+ * Returns the number of bytes to report, or 0 if the path is not one of
+ * ours. */
+static int synthesize_proc_magic_link(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx,
+                                      char *out, size_t out_size)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+    char path[KBOX_MAX_PATH];
+    int rc = guest_mem_read_string(ctx, pid, kbox_syscall_request_arg(req, 1),
+                                   path, sizeof(path));
+    if (rc < 0)
+        return 0;
+
+    const char *tail = NULL;
+    if (strncmp(path, "/proc/self/", 11) == 0)
+        tail = path + 11;
+    else if (strncmp(path, "/proc/thread-self/", 18) == 0)
+        tail = path + 18;
+    if (!tail)
+        return 0;
+
+    const char *target = NULL;
+    if (strcmp(tail, "exe") == 0) {
+        if (ctx->guest_exe[0])
+            target = ctx->guest_exe;
+    } else if (strcmp(tail, "cwd") == 0) {
+        target = ctx->host_cwd;
+    } else if (strcmp(tail, "root") == 0) {
+        target = "/";
+    }
+    if (!target)
+        return 0;
+
+    size_t n = strlen(target);
+    if (n > out_size)
+        n = out_size;
+    memcpy(out, target, n);
+    return (int) n;
+}
+
 struct kbox_dispatch forward_readlinkat(const struct kbox_syscall_request *req,
                                         struct kbox_supervisor_ctx *ctx)
 {
@@ -134,6 +181,22 @@ struct kbox_dispatch forward_readlinkat(const struct kbox_syscall_request *req,
 
     if (bufsiz > KBOX_MAX_PATH)
         bufsiz = KBOX_MAX_PATH;
+
+    /* Magic links of the guest's own process, before any path translation:
+     * kbox blocks them as host escape paths and they are not host paths. */
+    {
+        char magic[KBOX_MAX_PATH];
+        int mrc = synthesize_proc_magic_link(req, ctx, magic, sizeof(magic));
+        if (mrc > 0) {
+            size_t n = (size_t) mrc;
+            if (n > bufsiz)
+                n = bufsiz;
+            int wrc = guest_mem_write(ctx, pid, remote_buf, magic, n);
+            if (wrc < 0)
+                return kbox_dispatch_errno(-wrc);
+            return kbox_dispatch_value((int64_t) n);
+        }
+    }
 
     /* Host dirfd: call host readlinkat with a supervisor-owned copy. */
     if (should_continue_for_dirfd(lkl_dirfd)) {

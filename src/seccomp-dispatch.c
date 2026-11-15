@@ -870,6 +870,11 @@ static bool should_continue_virtual_path(const struct kbox_supervisor_ctx *ctx,
                                          size_t path_idx,
                                          const char *translated)
 {
+    /* A container with its own procfs resolves /proc inside LKL; continuing
+     * it would read the host's, and the magic links there are blocked. */
+    if (ctx->private_proc && !strncmp(translated, "/proc", 5) &&
+        (translated[5] == '\0' || translated[5] == '/'))
+        return false;
     return kbox_is_lkl_virtual_path(translated) &&
            guest_path_is_absolute(ctx, req, path_idx);
 }
@@ -4329,6 +4334,15 @@ static struct kbox_dispatch forward_newfstatat(
         return kbox_dispatch_errno(EFAULT);
 
     long flags = to_c_long_arg(kbox_syscall_request_arg(req, 3));
+
+    /* /proc is the container's own procfs, so /proc/self/exe names the memfd
+     * the supervisor exec'd; following it fails and official entrypoints
+     * (gosu, su-exec, tini) stat it before re-exec. Follow it to the guest
+     * path the container was started with instead. lstat stays on the real
+     * link, which is what `ls -l` wants. */
+    if (!(flags & AT_SYMLINK_NOFOLLOW) && ctx->guest_exe[0] &&
+        strcmp(translated, "/proc/self/exe") == 0)
+        snprintf(translated, sizeof(translated), "%s", ctx->guest_exe);
 
     /* Host dirfd or virtual path: call host fstatat with a local path copy
      * to eliminate the TOCTOU window where a sibling thread could swap the

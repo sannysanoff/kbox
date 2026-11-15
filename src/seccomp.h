@@ -194,6 +194,12 @@ struct kbox_supervisor_ctx {
     const struct kbox_host_bind *host_binds;
     size_t host_bind_count;
     char host_cwd[KBOX_MAX_PATH];
+    /* Absolute guest path of the executable, used to synthesize
+     * /proc/self/exe: /proc is the host's procfs, so the magic links of the
+     * guest's own process would otherwise describe kboxd. */
+    char guest_exe[KBOX_MAX_PATH];
+    /* /proc is the container's own procfs in LKL, not the host's. */
+    int private_proc;
 
     /* Optional external child-exit notification (used by multi-threaded
      * daemon mode where a central reaper handles SIGCHLD for all children).

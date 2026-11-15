@@ -74,6 +74,9 @@ struct port_binding_spec {
 
 struct daemon_proc_env {
     const struct kbox_host_bind *binds;
+    /* Container has its own procfs mounted in its rootfs, so /proc must be
+     * resolved inside LKL instead of being continued to the host kernel. */
+    int private_proc;
     size_t bind_count;
     const char *workdir;
     char *const *cmd;
@@ -1432,6 +1435,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     ctx.child_pid = pid;
     ctx.verbose = g_verbose;
     ctx.root_identity = 1;
+    ctx.private_proc = pe->private_proc;
     ctx.override_uid = (uid_t) -1;
     ctx.override_gid = (gid_t) -1;
     ctx.normalize = 1;
@@ -1440,6 +1444,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     ctx.host_bind_count = pe->bind_count;
     snprintf(ctx.host_cwd, sizeof(ctx.host_cwd), "%s",
              (pe->workdir && pe->workdir[0]) ? pe->workdir : "/");
+    snprintf(ctx.guest_exe, sizeof(ctx.guest_exe), "%s", resolved_cmd);
     ctx.exit_notify_fd = *hooks->exit_efd;
     ctx.exit_status_ptr = hooks->exit_status;
 
@@ -1580,6 +1585,23 @@ static void *container_worker_thread(void *arg)
         free(cbuf);
     }
 
+    /* A private procfs: with /proc continued to the host kernel, everything
+     * a guest reads from /proc describes kboxd (uid 0 in the guest but 65534
+     * in /proc/self/status, the host kernel version, kboxd's own cmdline) and
+     * the magic links have to be blocked as escape paths -- which breaks the
+     * official images, whose entrypoints re-exec through /proc/self/exe.
+     * Mounting a real procfs inside the container's mount namespace gives
+     * those links their guest meaning. */
+    {
+        char proc_dir[256];
+        snprintf(proc_dir, sizeof(proc_dir), "%s/proc", rootfs);
+        lkl_mkdir_p(sysnrs, proc_dir, 0555);
+        long pr = kbox_lkl_mount(sysnrs, "proc", proc_dir, "proc", 0, NULL);
+        if (pr < 0 && g_verbose)
+            fprintf(stderr, "kboxd: container procfs mount failed (%ld)\n",
+                    pr);
+    }
+
     int vrc =
         kbox_daemon_net_create_veth(sysnrs, c->host_if, "eth0", net_fd, c->ip);
     if (vrc < 0) {
@@ -1704,6 +1726,7 @@ static void *container_worker_thread(void *arg)
     struct daemon_proc_env pe = {
         .binds = c->binds,
         .bind_count = c->bind_count,
+        .private_proc = 1,
         .workdir = c->workdir,
         .cmd = c->cmd,
         .cmd_count = c->cmd_count,

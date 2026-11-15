@@ -117,7 +117,7 @@ def load_kbox_config(config_path=None):
     return cfg
 
 
-NFS_SCHEME = "nfs:/"
+NFS_SCHEME = "nfs://"
 
 
 def is_nfs_source(src):
@@ -128,7 +128,7 @@ def is_nfs_source(src):
 def split_bind_spec(spec):
     """Split docker short syntax SRC:DST[:MODE] into (src, dst, mode).
 
-    The nfs: scheme name carries a colon of its own ("nfs:/mounted_here/sub>x"),
+    The nfs: scheme name carries a colon of its own ("nfs://mounted_here/sub>x"),
     so a naive split on ':' would misread the handle as the source.
     """
     if not isinstance(spec, str):

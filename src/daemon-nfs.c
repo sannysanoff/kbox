@@ -6,14 +6,14 @@
  * "nfs:" refers to an export declared in the daemon config:
  *
  *     mounts:
- *       "nfs:/mounted_here":
+ *       "nfs://mounted_here":
  *         source: 10.0.0.7:/export/data
  *         options: vers=4.2,proto=tcp,port=20490
  *
  * and is requested by a service as
  *
  *     volumes:
- *       - "nfs:/mounted_here/subdir:/destination"
+ *       - "nfs://mounted_here/subdir:/destination"
  *
  * The export is mounted exactly once, by the daemon, inside LKL's initial
  * mount namespace at /kbox-vol/nfs/<name>. Containers never see that path:
@@ -47,7 +47,7 @@
 #define KBOX_NFS_RETRY_NS (2000L * 1000L * 1000L) /* 2s between attempts */
 #endif
 
-/* Split "nfs:/mounted_here/subdir" into name and subpath.
+/* Split "nfs://mounted_here/subdir" into name and subpath.
  * Returns 0 on success, -1 if the source is not a valid nfs handle or the
  * name is malformed.
  */
@@ -60,9 +60,9 @@ int kbox_nfs_split_source(const char *source,
     const char *p;
     size_t len = 0;
 
-    if (!source || strncmp(source, "nfs:/", 5) != 0)
+    if (!source || strncmp(source, "nfs://", 6) != 0)
         return -1;
-    p = source + 5; /* past "nfs:/" */
+    p = source + 6; /* past "nfs://" */
 
     while (p[len] && p[len] != '/')
         len++;
@@ -349,7 +349,7 @@ int kbox_daemon_nfs_bind_container(const struct kbox_sysnrs *s,
         if (!m) {
             snprintf(err, err_size,
                      "nfs volume %s is not declared in the kbox config "
-                     "(mounts: \"nfs:/%s\")",
+                     "(mounts: \"nfs://%s\")",
                      b->host_path, name);
             return -1;
         }

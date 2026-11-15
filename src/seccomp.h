@@ -106,7 +106,7 @@ struct kbox_host_bind {
     char guest_path[KBOX_MAX_PATH];
     size_t guest_len;
     int readonly;
-    /* Source was an "nfs:/<name>[/subdir]" reference rather than a host path;
+    /* Source was an "nfs://<name>[/subdir]" reference rather than a host path;
      * the daemon bind-mounts it instead of the dispatch layer redirecting it.
      */
     int is_nfs;

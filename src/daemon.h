@@ -27,7 +27,7 @@
 #define KBOX_NFS_OPTIONS_MAX 224
 
 struct kbox_nfs_mount {
-    char handle[KBOX_NFS_NAME_MAX + 8]; /* literal "nfs:/<name>" from config */
+    char handle[KBOX_NFS_NAME_MAX + 8]; /* literal "nfs://<name>" from config */
     char name[KBOX_NFS_NAME_MAX];       /* <name>, used in the LKL path */
     char source[KBOX_NFS_SOURCE_MAX];   /* "server:/export" */
     char options[KBOX_NFS_OPTIONS_MAX]; /* NFS mount options string */

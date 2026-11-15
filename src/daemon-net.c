@@ -245,7 +245,7 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
                     continue;
 
                 /* A quoted key may itself contain a colon, as the NFS mount
-                 * handles do ("nfs:/mounted_here":), so the generic
+                 * handles do ("nfs://mounted_here":), so the generic
                  * key/value split below would cut it in the wrong place.
                  */
                 if (line[0] == '"' || line[0] == '\'') {

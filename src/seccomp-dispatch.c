@@ -1342,14 +1342,14 @@ int kbox_parse_host_volume(const char *spec, struct kbox_host_bind *out)
         return -1;
     memset(out, 0, sizeof(*out));
 
-    /* "nfs:/<name>[/subdir]:<dest>[:ro]" — the scheme name is hard-coded and
+    /* "nfs://<name>[/subdir]:<dest>[:ro]" — the scheme name is hard-coded and
      * is not a host path, so the first colon cannot be the separator. The
      * reference part is kept verbatim and resolved by the daemon against the
      * "mounts:" section of the config.
      */
-    if (strncmp(spec, "nfs:/", 5) == 0) {
-        const char *sep = strchr(spec + 5, ':');
-        if (!sep || sep == spec + 5)
+    if (strncmp(spec, "nfs://", 6) == 0) {
+        const char *sep = strchr(spec + 6, ':');
+        if (!sep || sep == spec + 6)
             return -1;
         hlen = (size_t) (sep - spec);
         if (hlen >= sizeof(raw_host))

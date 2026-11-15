@@ -7,20 +7,35 @@ carries the handle:
 ```yaml
 # ~/.config/kbox-config.yaml
 mounts:
-  "nfs:/mounted_here":
+  "nfs://mounted_here":
     source: 10.0.0.7:/export/data
     options: vers=4.2,proto=tcp,port=20490
 ```
 
 ```bash
-docker run -v "nfs:/mounted_here/subdir:/destination" alpine:latest \
-  sh -c 'echo hello > /destination/probe.txt'
+docker run --mount type=bind,source=nfs://mounted_here/subdir,target=/destination \
+  alpine:latest sh -c 'echo hello > /destination/probe.txt'
 ```
 
 The daemon mounts the export once, retrying with a warning until it succeeds,
 and binds the requested subtree into each container's own mount namespace.
 Missing subdirectories are created on the export. The export root itself is
 never reachable from a container.
+
+## What each client actually accepts
+
+| Form | Result |
+|---|---|
+| `docker run --mount type=bind,source=nfs://h/sub,target=/dest` | works, read-write |
+| same, plus `,readonly` | works, enforced read-only |
+| `docker run -v nfs://h/sub:/dest` | works, read-write |
+| `docker run -v nfs://h/sub:/dest:ro` | **mode silently dropped** — binds read-write; use `--mount` |
+| `docker compose`, short syntax | unusable: compose parses the spec itself, splits on `:`, then reports "undefined volume nfs" |
+| `docker compose`, long syntax `type: bind` | unusable: compose rewrites a non-absolute source against the project directory, producing `<project>/nfs:/h/sub` |
+| Docker Engine API `Mounts` with `ReadOnly` | works (what `--mount` sends) |
+
+The `-v …:ro` row is the trap worth remembering: the Docker CLI accepts the
+string, drops the mode, and the mount comes up writable without a warning.
 
 ## Why the daemon mounts, not the guest
 
@@ -49,13 +64,3 @@ handles: ganesha's `FSAL_VFS` resolves them with `name_to_handle_at` and
 `open_by_handle_at`, and overlayfs or a btrfs subvolume answers `EOPNOTSUPP`,
 which the client sees as `EIO` on readdir. A loopback ext4 image is the
 portable answer in a container.
-
-## Limits worth knowing
-
-`docker compose` cannot carry this syntax: compose parses volume specs itself,
-splits on `:`, and its schema rejects volume names containing `:` or `/`, so
-`nfs:/mounted_here/subdir` never reaches the daemon. The same is true of the
-`:ro` suffix in `docker run -v`, which the Docker CLI rejects as "too many
-colons" before the request is sent. Read-only mounts are accepted by the daemon
-(in the `Mounts` form of the API) and by the bind layer, but not expressible
-through those two client-side parsers.

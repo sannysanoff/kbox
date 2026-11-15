@@ -64,9 +64,24 @@ with `bind ... failed: Stale file handle`, indefinitely. The mount retry loop
 only runs at daemon startup, so there is no reconnect and no remount; recovery
 there means restarting kboxd.
 
-## Not reached
+## Not measured: timeouts, and why
 
-`timeo`/`retrans` behaviour with injected latency or loss, and the `soft`
-versus `hard` distinction, were not measured: they need a proxy in front of the
-server to inject delay and drops. Lease renewal beyond a single in-place
-restart is likewise unmeasured.
+`timeo`/`retrans` and the `soft` versus `hard` distinction still have no
+numbers. The harness, not the filesystem, is what is missing:
+
+- `shopify/toxiproxy` publishes amd64 only, so it cannot run on an arm64 node;
+- the socat replacement cannot be silenced where it matters: SIGSTOP to PID 1
+  of a namespace is ignored by the kernel, and even once socat runs as a child,
+  a stopped process's listening socket still completes handshakes from the
+  kernel's accept queue, so "stop the proxy" is not a blackout;
+- with the handle pointed at the proxy's ClusterIP, 4 MB writes through
+  `nfs://soft_net` still landed on the export while the proxy pod's interface
+  counters did not move, so it is unproven that the traffic traversed the proxy
+  at all. Both handles did resolve to the proxy's ClusterIP
+  (`addr=192.168.194.202`) and the binds went through the right handle
+  (`/kbox-vol/nfs/soft_net/net`), so the next step is a blackout that cannot be
+  bypassed — a fixed pod IP, or `tc netem` on the link in front of ganesha —
+  rather than another process-level stop.
+
+Lease renewal beyond a single in-place restart is unmeasured for the same
+reason.

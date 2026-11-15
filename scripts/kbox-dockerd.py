@@ -117,6 +117,41 @@ def load_kbox_config(config_path=None):
     return cfg
 
 
+NFS_SCHEME = "nfs:/"
+
+
+def is_nfs_source(src):
+    """True for a volume source that names a kbox-declared NFS export."""
+    return isinstance(src, str) and src.startswith(NFS_SCHEME)
+
+
+def split_bind_spec(spec):
+    """Split docker short syntax SRC:DST[:MODE] into (src, dst, mode).
+
+    The nfs: scheme name carries a colon of its own ("nfs:/mounted_here/sub>x"),
+    so a naive split on ':' would misread the handle as the source.
+    """
+    if not isinstance(spec, str):
+        return None
+    if spec.startswith(NFS_SCHEME):
+        i = spec.find(":", len(NFS_SCHEME))
+        if i < 0:
+            return None
+        src, rest = spec[:i], spec[i + 1:]
+    else:
+        parts = spec.split(":", 2)
+        if len(parts) < 2:
+            return None
+        src, rest = parts[0], ":".join(parts[1:])
+    if ":" in rest:
+        dst, mode = rest.split(":", 1)
+    else:
+        dst, mode = rest, ""
+    if not dst.startswith("/"):
+        return None
+    return src, dst, mode
+
+
 def rfc3339(ts):
     if not ts or ts <= 0:
         return "0001-01-01T00:00:00Z"
@@ -812,34 +847,47 @@ class DockerEngineState:
         binds = []
         mounts_json = []
         for b in host_cfg.get("Binds") or []:
-            parts = b.split(":")
-            if len(parts) >= 2:
-                raw_src = parts[0]
-                dst = parts[1]
-                ro_flag = len(parts) >= 3 and parts[2] == "ro"
-                mode = ":ro" if ro_flag else ""
-                if not raw_src.startswith("/"):
-                    vobj = self.ensure_volume(raw_src, service=service_name)
-                    src = vobj["Mountpoint"]
-                    mounts_json.append({
-                        "Type": "volume",
-                        "Name": raw_src,
-                        "Source": src,
-                        "Destination": dst,
-                        "Driver": "local",
-                        "Mode": "ro" if ro_flag else "rw",
-                        "RW": not ro_flag,
-                    })
-                else:
-                    src = self.map_host_path(raw_src)
-                    mounts_json.append({
-                        "Type": "bind",
-                        "Source": src,
-                        "Destination": dst,
-                        "Mode": "ro" if ro_flag else "rw",
-                        "RW": not ro_flag,
-                    })
-                binds.append(f"{src}:{dst}{mode}")
+            parsed = split_bind_spec(b)
+            if parsed is None:
+                continue
+            raw_src, dst, mode_str = parsed
+            ro_flag = "ro" in mode_str.split(",")
+            mode = ":ro" if ro_flag else ""
+            if is_nfs_source(raw_src):
+                # Hard-coded scheme name: the volume lives on an NFS export
+                # declared in the kbox config, and the daemon bind-mounts the
+                # requested subtree. Passed through verbatim.
+                mounts_json.append({
+                    "Type": "bind",
+                    "Source": raw_src,
+                    "Destination": dst,
+                    "Mode": "ro" if ro_flag else "rw",
+                    "RW": not ro_flag,
+                })
+                binds.append(f"{raw_src}:{dst}{mode}")
+                continue
+            if not raw_src.startswith("/"):
+                vobj = self.ensure_volume(raw_src, service=service_name)
+                src = vobj["Mountpoint"]
+                mounts_json.append({
+                    "Type": "volume",
+                    "Name": raw_src,
+                    "Source": src,
+                    "Destination": dst,
+                    "Driver": "local",
+                    "Mode": "ro" if ro_flag else "rw",
+                    "RW": not ro_flag,
+                })
+            else:
+                src = self.map_host_path(raw_src)
+                mounts_json.append({
+                    "Type": "bind",
+                    "Source": src,
+                    "Destination": dst,
+                    "Mode": "ro" if ro_flag else "rw",
+                    "RW": not ro_flag,
+                })
+            binds.append(f"{src}:{dst}{mode}")
 
         for m in host_cfg.get("Mounts") or []:
             mtype = m.get("Type", "bind")
@@ -849,6 +897,16 @@ class DockerEngineState:
                 continue
             ro_flag = bool(m.get("ReadOnly"))
             ro = ":ro" if ro_flag else ""
+            if is_nfs_source(src):
+                mounts_json.append({
+                    "Type": "bind",
+                    "Source": src,
+                    "Destination": dst,
+                    "Mode": "ro" if ro_flag else "rw",
+                    "RW": not ro_flag,
+                })
+                binds.append(f"{src}:{dst}{ro}")
+                continue
             if mtype == "volume":
                 vname = src or secrets.token_hex(8)
                 vobj = self.ensure_volume(vname, service=service_name)

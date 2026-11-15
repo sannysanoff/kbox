@@ -43,7 +43,7 @@
 #define LKL_NR_IOCTL 29
 #define LKL_SIOCGIFINDEX 0x8933
 #define LKL_IFF_UP 0x1
-#define LKL_SHUT_WR   1
+#define LKL_SHUT_WR 1
 #define LKL_SHUT_RDWR 2
 
 #define UPSTREAM_DNS_IP "10.0.2.3"
@@ -210,6 +210,8 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
     snprintf(cfg->start_ip, sizeof(cfg->start_ip), "%s",
              KBOX_DAEMON_DEFAULT_START_IP);
     cfg->gateway_ip[0] = '\0';
+    memset(cfg->nfs, 0, sizeof(cfg->nfs));
+    cfg->nfs_count = 0;
 
     char resolved[512];
     const char *eff = path;
@@ -232,6 +234,7 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
         if (f) {
             char line[512];
             char section[64] = "";
+            char subsection[160] = "";
             while (fgets(line, sizeof(line), f)) {
                 char *hash = strchr(line, '#');
                 if (hash)
@@ -240,6 +243,32 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
                 trim_ws(line);
                 if (!line[0])
                     continue;
+
+                /* A quoted key may itself contain a colon, as the NFS mount
+                 * handles do ("nfs:/mounted_here":), so the generic
+                 * key/value split below would cut it in the wrong place.
+                 */
+                if (line[0] == '"' || line[0] == '\'') {
+                    char quote = line[0];
+                    char *close = strchr(line + 1, quote);
+                    if (close) {
+                        char *rest = close + 1;
+                        *close = '\0';
+                        trim_ws(rest);
+                        if (rest[0] == ':' && rest[1] == '\0') {
+                            const char *qname = line + 1;
+                            if (!indented) {
+                                snprintf(section, sizeof(section), "%.63s",
+                                         qname);
+                                subsection[0] = '\0';
+                            } else {
+                                snprintf(subsection, sizeof(subsection),
+                                         "%.159s", qname);
+                            }
+                            continue;
+                        }
+                    }
+                }
 
                 char *colon = strchr(line, ':');
                 if (!colon)
@@ -252,10 +281,21 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
 
                 if (!indented && !val[0]) {
                     snprintf(section, sizeof(section), "%.63s", key);
+                    subsection[0] = '\0';
                     continue;
                 }
-                if (!indented)
+                if (!indented) {
                     section[0] = '\0';
+                    subsection[0] = '\0';
+                }
+
+                if (strcmp(section, "mounts") == 0 && subsection[0]) {
+                    if (kbox_daemon_nfs_add(cfg, subsection, key, val) < 0)
+                        fprintf(stderr,
+                                "kboxd: config: bad mount entry %s.%s\n",
+                                subsection, key);
+                    continue;
+                }
 
                 int in_net = (!section[0] || strcmp(section, "network") == 0);
                 if (in_net && (strcmp(key, "start_ip") == 0 ||
@@ -315,8 +355,8 @@ static void lkl_write_sysctl(const struct kbox_sysnrs *sysnrs,
                              const char *path,
                              const char *val)
 {
-    long fd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, path,
-                              1 /* O_WRONLY */, 0);
+    long fd =
+        kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, path, 1 /* O_WRONLY */, 0);
     if (fd >= 0) {
         (void) kbox_lkl_write(sysnrs, fd, val, (long) strlen(val));
         (void) kbox_lkl_close(sysnrs, fd);
@@ -364,7 +404,8 @@ static struct rtattr *nl_nest_begin(struct nl_buf *b, unsigned short type)
 
 static void nl_nest_end(struct nl_buf *b, struct rtattr *nest)
 {
-    nest->rta_len = (unsigned short) ((uint8_t *) nl_tail(b) - (uint8_t *) nest);
+    nest->rta_len =
+        (unsigned short) ((uint8_t *) nl_tail(b) - (uint8_t *) nest);
 }
 
 static void nl_add_ifinfo_stub(struct nl_buf *b, struct ifinfomsg **out)
@@ -379,7 +420,8 @@ static void nl_add_ifinfo_stub(struct nl_buf *b, struct ifinfomsg **out)
                                        NLMSG_ALIGN(sizeof(struct ifinfomsg)));
 }
 
-static int lkl_netlink_talk(const struct kbox_sysnrs *sysnrs, struct nl_buf *req)
+static int lkl_netlink_talk(const struct kbox_sysnrs *sysnrs,
+                            struct nl_buf *req)
 {
     long fd =
         lkl_syscall6(sysnrs->socket, LKL_AF_NETLINK, LKL_SOCK_RAW, 0, 0, 0, 0);
@@ -432,8 +474,8 @@ static int lkl_get_ifindex(const struct kbox_sysnrs *sysnrs, const char *ifname)
     memset(&ifr, 0, sizeof(ifr));
     snprintf(ifr.name, sizeof(ifr.name), "%s", ifname);
 
-    long ret = lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCGIFINDEX, (long) &ifr, 0,
-                            0, 0);
+    long ret = lkl_syscall6(LKL_NR_IOCTL, sock, LKL_SIOCGIFINDEX, (long) &ifr,
+                            0, 0, 0);
     kbox_lkl_close(sysnrs, sock);
     if (ret < 0)
         return (int) ret;
@@ -851,7 +893,8 @@ size_t kbox_daemon_dns_format_hosts(char *buf, size_t cap)
 }
 
 /* Parse DNS QNAME starting at off in pkt[0..pkt_len], writing dotted name.
- * Returns offset right after the terminating 0-label (pointing at QTYPE), or -1.
+ * Returns offset right after the terminating 0-label (pointing at QTYPE), or
+ * -1.
  */
 static int dns_parse_qname(const uint8_t *pkt,
                            size_t pkt_len,
@@ -915,8 +958,8 @@ static int dns_forward_upstream(const struct kbox_sysnrs *sysnrs,
                                 uint8_t *resp,
                                 size_t resp_cap)
 {
-    long usock = kbox_lkl_socket(sysnrs, AF_INET,
-                                 LKL_SOCK_DGRAM | LKL_SOCK_NONBLOCK, 0);
+    long usock =
+        kbox_lkl_socket(sysnrs, AF_INET, LKL_SOCK_DGRAM | LKL_SOCK_NONBLOCK, 0);
     if (usock < 0)
         return -1;
 
@@ -951,8 +994,8 @@ static void *dns_server_thread(void *arg)
     (void) arg;
     const struct kbox_sysnrs *sysnrs = g_sysnrs;
 
-    long sock = kbox_lkl_socket(sysnrs, AF_INET,
-                                LKL_SOCK_DGRAM | LKL_SOCK_NONBLOCK, 0);
+    long sock =
+        kbox_lkl_socket(sysnrs, AF_INET, LKL_SOCK_DGRAM | LKL_SOCK_NONBLOCK, 0);
     if (sock < 0) {
         fprintf(stderr, "kboxd: dns socket failed: %ld\n", sock);
         return NULL;
@@ -989,8 +1032,8 @@ static void *dns_server_thread(void *arg)
         uint8_t pkt[DNS_BUF_LEN];
         struct sockaddr_in cli;
         socklen_t clilen = sizeof(cli);
-        long n = kbox_lkl_recvfrom(sysnrs, sock, pkt, sizeof(pkt), 0, &cli,
-                                   &clilen);
+        long n =
+            kbox_lkl_recvfrom(sysnrs, sock, pkt, sizeof(pkt), 0, &cli, &clilen);
         if (n < 12)
             continue;
 
@@ -1024,14 +1067,12 @@ static void *dns_server_thread(void *arg)
             if ((qtype == 1 || qtype == 255) && rlen + 16 <= sizeof(resp)) {
                 resp[6] = 0;
                 resp[7] = 1;
-                uint8_t ans[16] = {
-                    0xc0, 0x0c, /* pointer to offset 12 */
-                    0x00, 0x01, /* TYPE A */
-                    0x00, 0x01, /* CLASS IN */
-                    0x00, 0x00, 0x00, 0x05, /* TTL 5s */
-                    0x00, 0x04, /* RDLENGTH 4 */
-                    0, 0, 0, 0
-                };
+                uint8_t ans[16] = {0xc0, 0x0c, /* pointer to offset 12 */
+                                   0x00, 0x01, /* TYPE A */
+                                   0x00, 0x01, /* CLASS IN */
+                                   0x00, 0x00, 0x00, 0x05, /* TTL 5s */
+                                   0x00, 0x04,             /* RDLENGTH 4 */
+                                   0,    0,    0,    0};
                 memcpy(ans + 12, &ip_be, 4);
                 memcpy(resp + rlen, ans, 16);
                 rlen += 16;
@@ -1048,8 +1089,8 @@ static void *dns_server_thread(void *arg)
         }
 
         uint8_t uresp[DNS_BUF_LEN];
-        int urn = dns_forward_upstream(sysnrs, pkt, (size_t) n, uresp,
-                                       sizeof(uresp));
+        int urn =
+            dns_forward_upstream(sysnrs, pkt, (size_t) n, uresp, sizeof(uresp));
         if (urn > 0) {
             (void) kbox_lkl_sendto(sysnrs, sock, uresp, (long) urn, 0, &cli,
                                    (long) clilen);
@@ -1186,8 +1227,7 @@ static void *port_accept_thread(void *arg)
         if (host_fd < 0)
             continue;
 
-        long lkl_fd =
-            kbox_lkl_socket(pf->sysnrs, AF_INET, LKL_SOCK_STREAM, 0);
+        long lkl_fd = kbox_lkl_socket(pf->sysnrs, AF_INET, LKL_SOCK_STREAM, 0);
         if (lkl_fd < 0) {
             close(host_fd);
             continue;
@@ -1366,8 +1406,9 @@ int kbox_daemon_net_init(const struct kbox_sysnrs *sysnrs,
     g_verbose = verbose;
     __atomic_store_n(&g_running, 1, __ATOMIC_RELEASE);
 
-    const char *start_ip = (cfg && cfg->start_ip[0]) ? cfg->start_ip
-                                                     : KBOX_DAEMON_DEFAULT_START_IP;
+    const char *start_ip = (cfg && cfg->start_ip[0])
+                               ? cfg->start_ip
+                               : KBOX_DAEMON_DEFAULT_START_IP;
     const char *gw_ip = (cfg && cfg->gateway_ip[0]) ? cfg->gateway_ip
                                                     : KBOX_DAEMON_DEFAULT_GW_IP;
 

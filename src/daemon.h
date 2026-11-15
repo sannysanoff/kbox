@@ -19,9 +19,26 @@
 #define KBOX_DAEMON_MAX_HOSTS 512
 #define KBOX_DAEMON_MAX_ALIAS 128
 
+/* NFS-backed volumes (src/daemon-nfs.c). */
+#define KBOX_NFS_MAX_MOUNTS 8
+#define KBOX_NFS_NAME_MAX 64
+#define KBOX_NFS_ROOT "/kbox-vol/nfs"
+#define KBOX_NFS_SOURCE_MAX 256
+#define KBOX_NFS_OPTIONS_MAX 224
+
+struct kbox_nfs_mount {
+    char handle[KBOX_NFS_NAME_MAX + 8]; /* literal "nfs:/<name>" from config */
+    char name[KBOX_NFS_NAME_MAX];       /* <name>, used in the LKL path */
+    char source[KBOX_NFS_SOURCE_MAX];   /* "server:/export" */
+    char options[KBOX_NFS_OPTIONS_MAX]; /* NFS mount options string */
+    int mounted;
+};
+
 struct kbox_daemon_config {
     char start_ip[32];
     char gateway_ip[32];
+    struct kbox_nfs_mount nfs[KBOX_NFS_MAX_MOUNTS];
+    size_t nfs_count;
 };
 
 int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg);
@@ -53,5 +70,38 @@ int kbox_daemon_port_add(const struct kbox_sysnrs *sysnrs,
                          const char *container_ip,
                          int container_port);
 void kbox_daemon_port_remove_ip(const char *container_ip);
+
+/* True once SIGTERM/SIGINT has been seen; used by interruptible waits. */
+int kbox_daemon_stopping(void);
+
+/* mkdir -p inside LKL (daemon side, initial mount namespace). */
+int lkl_mkdir_p_daemon(const struct kbox_sysnrs *sysnrs,
+                       const char *path,
+                       int mode);
+
+/* NFS volumes (src/daemon-nfs.c). */
+int kbox_nfs_split_source(const char *source,
+                          char *name,
+                          size_t name_size,
+                          char *subpath,
+                          size_t subpath_size);
+int kbox_daemon_nfs_add(struct kbox_daemon_config *cfg,
+                        const char *handle,
+                        const char *key,
+                        const char *value);
+int kbox_daemon_nfs_mount_all(const struct kbox_sysnrs *sysnrs,
+                              struct kbox_daemon_config *cfg,
+                              int verbose);
+int kbox_daemon_nfs_bind_container(const struct kbox_sysnrs *sysnrs,
+                                   const struct kbox_daemon_config *cfg,
+                                   const char *rootfs,
+                                   const struct kbox_host_bind *binds,
+                                   size_t bind_count,
+                                   char *err,
+                                   size_t err_size);
+void kbox_daemon_nfs_unbind_container(const struct kbox_sysnrs *sysnrs,
+                                      const char *rootfs,
+                                      const struct kbox_host_bind *binds,
+                                      size_t bind_count);
 
 #endif /* KBOX_DAEMON_H */

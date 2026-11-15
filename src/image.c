@@ -876,6 +876,14 @@ int kbox_run_image(const struct kbox_image_args *args)
                     args->host_volumes[i]);
             return -1;
         }
+        if (host_binds[host_bind_count].is_nfs) {
+            fprintf(stderr,
+                    "nfs volume %s needs the kbox daemon: declare it under "
+                    "\"mounts:\" in ~/.config/kbox-config.yaml and run it as a "
+                    "daemon container\n",
+                    args->host_volumes[i]);
+            return -1;
+        }
         host_bind_count++;
     }
 

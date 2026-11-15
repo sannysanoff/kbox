@@ -133,7 +133,20 @@ if [ ! -f "${LKL_SRC}/.config" ]; then
         CONFIG_SCHED_DEBUG \
         CONFIG_PROC_SYSCTL \
         CONFIG_PRINTK \
-        CONFIG_DEBUG_FS; do
+        CONFIG_DEBUG_FS \
+        CONFIG_FILE_LOCKING \
+        CONFIG_FS_POSIX_ACL \
+        CONFIG_NETWORK_FILESYSTEMS \
+        CONFIG_DNS_RESOLVER \
+        CONFIG_KEYS \
+        CONFIG_NFS_FS \
+        CONFIG_NFS_V3 \
+        CONFIG_NFS_V4 \
+        CONFIG_NFS_V4_1 \
+        CONFIG_NFS_V4_2 \
+        CONFIG_NFS_USE_KERNEL_DNS \
+        CONFIG_LOCKD \
+        CONFIG_LOCKD_V4; do
         "${LKL_SRC}/scripts/config" --file "${LKL_SRC}/.config" --enable "${opt}"
     done
 
@@ -150,7 +163,6 @@ if [ ! -f "${LKL_SRC}/.config" ]; then
         CONFIG_SOUND \
         CONFIG_USB_SUPPORT \
         CONFIG_INPUT \
-        CONFIG_NFS_FS \
         CONFIG_CIFS; do
         "${LKL_SRC}/scripts/config" --file "${LKL_SRC}/.config" --disable "${opt}"
     done

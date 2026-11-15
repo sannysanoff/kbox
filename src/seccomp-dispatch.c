@@ -377,8 +377,8 @@ static unsigned ctx_lkl_fd_ref_count(const struct kbox_supervisor_ctx *ctx,
         unsigned total = 0;
         for (size_t i = 0; i < ctx->proc_fd_count; i++) {
             if (ctx->proc_fds[i].table)
-                total += kbox_fd_table_lkl_ref_count(ctx->proc_fds[i].table,
-                                                     lkl_fd);
+                total +=
+                    kbox_fd_table_lkl_ref_count(ctx->proc_fds[i].table, lkl_fd);
         }
         return total;
     }
@@ -598,8 +598,7 @@ static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
 
     if (!ctx->proc_fds) {
         ctx->root_fd_table = ctx->fd_table;
-        ctx->proc_fds =
-            calloc(KBOX_PROC_FD_TABLES_MAX, sizeof(*ctx->proc_fds));
+        ctx->proc_fds = calloc(KBOX_PROC_FD_TABLES_MAX, sizeof(*ctx->proc_fds));
         if (!ctx->proc_fds)
             return;
         ctx->proc_fds[0].tgid = ctx->child_pid;
@@ -1247,8 +1246,7 @@ static bool host_dirfd_targets_proc(pid_t pid, long fd)
 {
     char target[KBOX_MAX_PATH];
 
-    if (pid <= 0 ||
-        read_tracee_fd_link(pid, fd, target, sizeof(target)) < 0)
+    if (pid <= 0 || read_tracee_fd_link(pid, fd, target, sizeof(target)) < 0)
         return false;
 
     if (strcmp(target, "/proc") == 0)
@@ -1344,14 +1342,34 @@ int kbox_parse_host_volume(const char *spec, struct kbox_host_bind *out)
         return -1;
     memset(out, 0, sizeof(*out));
 
-    c1 = strchr(spec, ':');
-    if (!c1 || c1 == spec)
-        return -1;
-    hlen = (size_t) (c1 - spec);
-    if (hlen >= sizeof(raw_host))
-        return -1;
-    memcpy(raw_host, spec, hlen);
-    raw_host[hlen] = '\0';
+    /* "nfs:/<name>[/subdir]:<dest>[:ro]" — the scheme name is hard-coded and
+     * is not a host path, so the first colon cannot be the separator. The
+     * reference part is kept verbatim and resolved by the daemon against the
+     * "mounts:" section of the config.
+     */
+    if (strncmp(spec, "nfs:/", 5) == 0) {
+        const char *sep = strchr(spec + 5, ':');
+        if (!sep || sep == spec + 5)
+            return -1;
+        hlen = (size_t) (sep - spec);
+        if (hlen >= sizeof(raw_host))
+            return -1;
+        memcpy(raw_host, spec, hlen);
+        raw_host[hlen] = '\0';
+
+        c1 = sep; /* destination starts here, parsed by the common path below */
+        out->is_nfs = 1;
+        snprintf(out->host_path, sizeof(out->host_path), "%s", raw_host);
+    } else {
+        c1 = strchr(spec, ':');
+        if (!c1 || c1 == spec)
+            return -1;
+        hlen = (size_t) (c1 - spec);
+        if (hlen >= sizeof(raw_host))
+            return -1;
+        memcpy(raw_host, spec, hlen);
+        raw_host[hlen] = '\0';
+    }
 
     const char *dst_start = c1 + 1;
     c2 = strchr(dst_start, ':');
@@ -1364,6 +1382,11 @@ int kbox_parse_host_volume(const char *spec, struct kbox_host_bind *out)
     if (kbox_normalize_join("/", raw_dst, out->guest_path,
                             sizeof(out->guest_path)) < 0)
         return -1;
+
+    if (out->is_nfs) {
+        out->guest_len = strlen(out->guest_path);
+        goto parse_mode;
+    }
 
     if (realpath(raw_host, resolved_host) != NULL) {
         snprintf(out->host_path, sizeof(out->host_path), "%s", resolved_host);
@@ -1386,6 +1409,7 @@ int kbox_parse_host_volume(const char *spec, struct kbox_host_bind *out)
     }
     out->guest_len = strlen(out->guest_path);
 
+parse_mode:
     if (c2 && c2[1] != '\0') {
         const char *p = c2 + 1;
         while (*p) {
@@ -1441,6 +1465,10 @@ static int resolve_host_bind_canonical(const struct kbox_supervisor_ctx *ctx,
 
     for (size_t i = 0; i < ctx->host_bind_count; i++) {
         const struct kbox_host_bind *b = &ctx->host_binds[i];
+        /* NFS volumes are real mounts inside the guest kernel, not paths to
+         * redirect at dispatch time. */
+        if (b->is_nfs)
+            continue;
         if (path_has_prefix_dir(norm_out, b->guest_path, b->guest_len)) {
             if (!best || b->guest_len >= best->guest_len)
                 best = b;
@@ -1496,6 +1524,10 @@ int kbox_ensure_lkl_bind_stubs(const struct kbox_sysnrs *sysnrs,
         const struct kbox_host_bind *b = &binds[i];
         struct stat st;
         int is_dir = 1;
+
+        /* NFS volumes are bind-mounted by the daemon, not stubbed here. */
+        if (b->is_nfs)
+            continue;
         if (stat(b->host_path, &st) == 0 && !S_ISDIR(st.st_mode))
             is_dir = 0;
         if (is_dir) {
@@ -1585,9 +1617,9 @@ static int translate_request_path_or_bind(
         int rc = read_guest_string(ctx, pid, addr, pathbuf, sizeof(pathbuf));
         if (rc < 0)
             return rc;
-        int brc = resolve_host_bind_canonical(ctx, AT_FDCWD_LINUX, pathbuf,
-                                              norm, sizeof(norm), translated,
-                                              size, &ro);
+        int brc =
+            resolve_host_bind_canonical(ctx, AT_FDCWD_LINUX, pathbuf, norm,
+                                        sizeof(norm), translated, size, &ro);
         if (brc < 0)
             return brc;
         if (brc > 0) {
@@ -1664,9 +1696,8 @@ int translate_request_at_path(const struct kbox_syscall_request *req,
                                    pathbuf, sizeof(pathbuf));
         if (rc < 0)
             return rc;
-        int brc = resolve_host_bind_canonical(ctx, raw_dirfd, pathbuf, norm,
-                                              sizeof(norm), translated, size,
-                                              &ro);
+        int brc = resolve_host_bind_canonical(
+            ctx, raw_dirfd, pathbuf, norm, sizeof(norm), translated, size, &ro);
         if (brc < 0)
             return brc;
         if (brc > 0) {
@@ -1759,7 +1790,8 @@ long next_hostonly_fd_hint(const struct kbox_supervisor_ctx *ctx)
     return fd;
 }
 
-static long allocate_shadow_fd_from(struct kbox_supervisor_ctx *ctx, long min_fd)
+static long allocate_shadow_fd_from(struct kbox_supervisor_ctx *ctx,
+                                    long min_fd)
 {
     long base_fd = KBOX_FD_FAST_BASE;
     long end_fd = KBOX_FD_HOSTONLY_BASE;
@@ -2849,9 +2881,9 @@ static struct kbox_dispatch forward_open_legacy(
     long mode = to_c_long_arg(kbox_syscall_request_arg(req, 2));
 
     if (should_continue_for_dirfd(lkl_dirfd)) {
-        return emulate_host_at_open_tracked(ctx, req, AT_FDCWD_LINUX,
-                                            lkl_dirfd, translated,
-                                            host_flags_legacy, (mode_t) mode);
+        return emulate_host_at_open_tracked(ctx, req, AT_FDCWD_LINUX, lkl_dirfd,
+                                            translated, host_flags_legacy,
+                                            (mode_t) mode);
     }
 
     if (should_continue_virtual_path(ctx, req, 0, translated) ||
@@ -3307,8 +3339,8 @@ static struct kbox_dispatch forward_sendfile(
                     }
                     break;
                 }
-                nr = kbox_lkl_pread64(ctx->sysnrs, in_lkl, scratch, (long) chunk,
-                                      pread_off);
+                nr = kbox_lkl_pread64(ctx->sysnrs, in_lkl, scratch,
+                                      (long) chunk, pread_off);
             } else {
                 nr = kbox_lkl_read(ctx->sysnrs, in_lkl, scratch, (long) chunk);
             }
@@ -3352,9 +3384,9 @@ static struct kbox_dispatch forward_sendfile(
         size_t written = 0;
         while (written < n) {
             if (out_lkl >= 0) {
-                long wr = kbox_lkl_write(ctx->sysnrs, out_lkl,
-                                         scratch + written,
-                                         (long) (n - written));
+                long wr =
+                    kbox_lkl_write(ctx->sysnrs, out_lkl, scratch + written,
+                                   (long) (n - written));
                 if (wr <= 0) {
                     if (total + written == 0) {
                         result =
@@ -3672,7 +3704,8 @@ static int read_tracee_fd_flags(pid_t pid, int tracee_fd, int *out_flags)
 static int open_tracee_proc_fd(pid_t pid, int tracee_fd)
 {
     char path[64];
-    int n = snprintf(path, sizeof(path), "/proc/%d/fd/%d", (int) pid, tracee_fd);
+    int n =
+        snprintf(path, sizeof(path), "/proc/%d/fd/%d", (int) pid, tracee_fd);
     if (n < 0 || (size_t) n >= sizeof(path))
         return -ENAMETOOLONG;
 
@@ -3703,8 +3736,7 @@ static int open_tracee_pidfd(pid_t pid)
     if (pidfd >= 0)
         return pidfd;
     int saved_errno = errno;
-    if (saved_errno == EPERM || saved_errno == ENOSYS ||
-        saved_errno == EACCES)
+    if (saved_errno == EPERM || saved_errno == ENOSYS || saved_errno == EACCES)
         return -saved_errno;
     /* pidfd_open(..., 0) fails (EINVAL/ENOENT/ESRCH) on non-leader thread TIDs;
      * resolve the thread-group leader TGID whose FD table the thread shares.
@@ -3977,11 +4009,12 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
     return kbox_dispatch_value((int64_t) new_vfd);
 }
 
-static struct kbox_dispatch finish_shadow_dup_at(struct kbox_supervisor_ctx *ctx,
-                                                 struct kbox_fd_entry *orig,
-                                                 long newfd,
-                                                 int new_host,
-                                                 int cloexec)
+static struct kbox_dispatch finish_shadow_dup_at(
+    struct kbox_supervisor_ctx *ctx,
+    struct kbox_fd_entry *orig,
+    long newfd,
+    int new_host,
+    int cloexec)
 {
     long orig_lkl = orig->lkl_fd;
     int orig_sp = orig->shadow_sp;
@@ -4399,16 +4432,15 @@ int kbox_dispatch_try_local_fast_path(const struct kbox_host_nrs *h,
         nr == h->madvise || nr == h->wait4 || nr == h->waitid ||
         nr == h->exit || nr == h->exit_group || nr == h->rt_sigreturn ||
         nr == h->rt_sigaltstack || nr == h->rt_sigsuspend ||
-        nr == h->setitimer || nr == h->getitimer ||
-        nr == h->setpgid || nr == h->getpgid || nr == h->getsid ||
-        nr == h->setsid || nr == h->fork || nr == h->vfork ||
-        nr == h->sched_yield || nr == h->sched_setparam ||
-        nr == h->sched_getparam || nr == h->sched_setscheduler ||
-        nr == h->sched_getscheduler || nr == h->sched_get_priority_max ||
-        nr == h->sched_get_priority_min || nr == h->sched_setaffinity ||
-        nr == h->sched_getaffinity || nr == h->getrlimit ||
-        nr == h->getrusage || nr == h->ppoll || nr == h->pselect6 ||
-        nr == h->nanosleep || nr == h->clock_nanosleep ||
+        nr == h->setitimer || nr == h->getitimer || nr == h->setpgid ||
+        nr == h->getpgid || nr == h->getsid || nr == h->setsid ||
+        nr == h->fork || nr == h->vfork || nr == h->sched_yield ||
+        nr == h->sched_setparam || nr == h->sched_getparam ||
+        nr == h->sched_setscheduler || nr == h->sched_getscheduler ||
+        nr == h->sched_get_priority_max || nr == h->sched_get_priority_min ||
+        nr == h->sched_setaffinity || nr == h->sched_getaffinity ||
+        nr == h->getrlimit || nr == h->getrusage || nr == h->ppoll ||
+        nr == h->pselect6 || nr == h->nanosleep || nr == h->clock_nanosleep ||
         nr == h->timer_create || nr == h->timer_gettime ||
         nr == h->timer_getoverrun || nr == h->timer_settime ||
         nr == h->timer_delete || nr == h->sysinfo) {
@@ -4462,7 +4494,7 @@ static struct kbox_dispatch forward_statfs(
         return kbox_dispatch_errno(EFAULT);
 
     int rc = translate_request_path_or_bind(req, ctx, 0, translated,
-                                          sizeof(translated), &lkl_dirfd);
+                                            sizeof(translated), &lkl_dirfd);
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
 
@@ -5949,8 +5981,7 @@ struct kbox_dispatch kbox_dispatch_request(
         long ret = syscall(SYS_tgkill, real_tgid, real_tid, sig);
         if (ret < 0)
             return kbox_dispatch_errno(errno);
-        if (request_uses_trap_signals(req) &&
-            real_tid == caller_tid &&
+        if (request_uses_trap_signals(req) && real_tid == caller_tid &&
             trap_sigmask_contains_signal(sig))
             (void) kbox_syscall_trap_add_pending_signal(sig);
         return kbox_dispatch_value(0);

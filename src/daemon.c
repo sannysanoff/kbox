@@ -172,6 +172,10 @@ struct import_state {
 };
 
 static const struct kbox_sysnrs *g_sysnrs;
+
+/* Daemon config (network + declared NFS mounts), read once at startup and
+ * shared read-only with container workers. */
+static struct kbox_daemon_config g_config;
 static const struct kbox_host_nrs *g_host_nrs;
 static int g_verbose;
 static volatile int g_daemon_stop;
@@ -447,6 +451,13 @@ static int lkl_mkdir_p(const struct kbox_sysnrs *sysnrs,
                        const char *path,
                        unsigned int mode)
 {
+    return (int) lkl_mkdir_p_daemon(sysnrs, path, (int) mode);
+}
+
+int lkl_mkdir_p_daemon(const struct kbox_sysnrs *sysnrs,
+                       const char *path,
+                       int mode)
+{
     char tmp[PATH_MAX];
     size_t len = strlen(path);
     if (len == 0 || len >= sizeof(tmp))
@@ -706,8 +717,8 @@ static int copy_lkl_tree_rec(const struct kbox_sysnrs *sysnrs,
                     kbox_lkl_symlinkat(sysnrs, target, AT_FDCWD_LINUX, dpath);
                 }
             } else if (S_ISREG(lst.st_mode)) {
-                long sfd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, spath,
-                                           O_RDONLY, 0);
+                long sfd =
+                    kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, spath, O_RDONLY, 0);
                 if (sfd < 0)
                     continue;
                 long outfd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, dpath,
@@ -806,8 +817,7 @@ static int open_container_file(const struct kbox_sysnrs *sysnrs,
         return hfd;
     }
 
-    long lfd =
-        kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, guest_path, O_RDONLY, 0);
+    long lfd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, guest_path, O_RDONLY, 0);
     if (lfd < 0)
         return (int) lfd;
     *is_host_fd_out = 0;
@@ -825,8 +835,9 @@ static int resolve_cmd_path(const struct kbox_sysnrs *sysnrs,
         return 0;
     }
 
-    const char *path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:"
-                           "/usr/bin:/sbin:/bin";
+    const char *path_env =
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:"
+        "/usr/bin:/sbin:/bin";
     for (int i = 0; i < pe->env_count; i++) {
         if (strncmp(pe->env[i], "PATH=", 5) == 0) {
             path_env = pe->env[i] + 5;
@@ -965,9 +976,9 @@ static int prepare_exec_memfds(const struct kbox_sysnrs *sysnrs,
     if (kbox_read_elf_header_window_fd(memfd, &elf_buf, &elf_len) == 0) {
         char interp_path[256];
         uint64_t pt_off = 0, pt_filesz = 0;
-        int ilen = kbox_find_elf_interp_loc(elf_buf, elf_len, interp_path,
-                                            sizeof(interp_path), &pt_off,
-                                            &pt_filesz);
+        int ilen =
+            kbox_find_elf_interp_loc(elf_buf, elf_len, interp_path,
+                                     sizeof(interp_path), &pt_off, &pt_filesz);
         munmap(elf_buf, elf_len);
         if (ilen < 0) {
             close(memfd);
@@ -1095,8 +1106,8 @@ static void *log_pump_thread(void *arg)
                     if (lp->log_fd >= 0)
                         write_log_frame(lp->log_fd, (uint8_t) map[i], buf,
                                         (size_t) n);
-                } else if (n == 0 || (n < 0 && errno != EINTR &&
-                                      errno != EAGAIN)) {
+                } else if (n == 0 ||
+                           (n < 0 && errno != EINTR && errno != EAGAIN)) {
                     if (map[i] == 1)
                         open_out = 0;
                     else
@@ -1196,8 +1207,7 @@ static void *sigchld_reaper_thread(void *arg)
     return NULL;
 }
 
-static void fail_container_start(struct daemon_container *c,
-                                 const char *msg)
+static void fail_container_start(struct daemon_container *c, const char *msg)
 {
     pthread_mutex_lock(&c->lock);
     snprintf(c->start_err, sizeof(c->start_err), "%s", msg);
@@ -1291,8 +1301,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
         return -1;
     }
 
-    int log_fd =
-        open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     int devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
 
     *hooks->exit_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -1513,9 +1522,8 @@ static void *container_worker_thread(void *arg)
         return NULL;
     }
 
-    long ur = kbox_lkl_unshare(sysnrs,
-                               CLONE_FS | CLONE_NEWNS | CLONE_NEWNET |
-                                   CLONE_NEWUTS);
+    long ur = kbox_lkl_unshare(
+        sysnrs, CLONE_FS | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWUTS);
     if (ur < 0) {
         snprintf(err_msg, sizeof(err_msg), "lkl_unshare failed: %ld", ur);
         fail_container_start(c, err_msg);
@@ -1551,8 +1559,8 @@ static void *container_worker_thread(void *arg)
 
     char ovl_opts[4096];
     memset(ovl_opts, 0, sizeof(ovl_opts));
-    snprintf(ovl_opts, sizeof(ovl_opts),
-             "lowerdir=%s,upperdir=%s,workdir=%s", img_dir, upper, work);
+    snprintf(ovl_opts, sizeof(ovl_opts), "lowerdir=%s,upperdir=%s,workdir=%s",
+             img_dir, upper, work);
     long mr = kbox_lkl_mount(sysnrs, "overlay", rootfs, "overlay", 0, ovl_opts);
     if (mr < 0) {
         if (g_verbose)
@@ -1572,8 +1580,8 @@ static void *container_worker_thread(void *arg)
         free(cbuf);
     }
 
-    int vrc = kbox_daemon_net_create_veth(sysnrs, c->host_if, "eth0", net_fd,
-                                          c->ip);
+    int vrc =
+        kbox_daemon_net_create_veth(sysnrs, c->host_if, "eth0", net_fd, c->ip);
     if (vrc < 0) {
         if (mnt_fd >= 0)
             kbox_lkl_close(sysnrs, mnt_fd);
@@ -1629,7 +1637,30 @@ static void *container_worker_thread(void *arg)
         kbox_lkl_close(sysnrs, hfd);
     }
 
-    if (kbox_lkl_chroot(sysnrs, rootfs) < 0 || kbox_lkl_chdir(sysnrs, "/") < 0) {
+    /* NFS-backed volumes: bind the requested subtree of an already-mounted
+     * export onto the container's destination. Done before chroot because the
+     * export lives outside the container's rootfs; the mount namespace is
+     * already private to this container.
+     */
+    if (g_config.nfs_count > 0 && c->bind_count > 0) {
+        char nfs_err[256] = {0};
+        if (kbox_daemon_nfs_bind_container(sysnrs, &g_config, rootfs, c->binds,
+                                           c->bind_count, nfs_err,
+                                           sizeof(nfs_err)) < 0) {
+            if (mnt_fd >= 0)
+                kbox_lkl_close(sysnrs, mnt_fd);
+            kbox_lkl_close(sysnrs, net_fd);
+            if (uts_fd >= 0)
+                kbox_lkl_close(sysnrs, uts_fd);
+            fail_container_start(
+                c, nfs_err[0] ? nfs_err : "nfs volume bind failed");
+            kbox_daemon_net_delete_link(sysnrs, c->host_if, c->ip);
+            return NULL;
+        }
+    }
+
+    if (kbox_lkl_chroot(sysnrs, rootfs) < 0 ||
+        kbox_lkl_chdir(sysnrs, "/") < 0) {
         if (mnt_fd >= 0)
             kbox_lkl_close(sysnrs, mnt_fd);
         kbox_lkl_close(sysnrs, net_fd);
@@ -1658,8 +1689,7 @@ static void *container_worker_thread(void *arg)
                                        c->ports[i].host_port, c->ip,
                                        c->ports[i].container_port);
         if (prc < 0)
-            fprintf(stderr,
-                    "kboxd: port forward %s:%d -> %s:%d failed: %s\n",
+            fprintf(stderr, "kboxd: port forward %s:%d -> %s:%d failed: %s\n",
                     c->ports[i].host_ip, c->ports[i].host_port, c->ip,
                     c->ports[i].container_port, strerror(-prc));
     }
@@ -1688,8 +1718,7 @@ static void *container_worker_thread(void *arg)
         .on_running = cont_on_running,
         .on_failed = cont_on_failed,
     };
-    int exit_code =
-        launch_and_supervise_proc(sysnrs, &pe, c->log_path, &hooks);
+    int exit_code = launch_and_supervise_proc(sysnrs, &pe, c->log_path, &hooks);
 
     pthread_mutex_lock(&c->lock);
     c->state = CONT_EXITED;
@@ -1699,6 +1728,14 @@ static void *container_worker_thread(void *arg)
     pthread_cond_broadcast(&c->cv);
     while (c->active_execs > 0)
         pthread_cond_wait(&c->cv, &c->lock);
+
+    /* Release NFS subtree bind mounts before the namespace goes away. */
+    if (g_config.nfs_count > 0 && c->bind_count > 0) {
+        char rootfs[160];
+        snprintf(rootfs, sizeof(rootfs), "/containers/%s/rootfs", c->id);
+        kbox_daemon_nfs_unbind_container(sysnrs, rootfs, c->binds,
+                                         c->bind_count);
+    }
     close_container_ns_fds(c, sysnrs);
     pthread_mutex_unlock(&c->lock);
 
@@ -1774,9 +1811,10 @@ static void *exec_worker_thread(void *arg)
     long r_chr = kbox_lkl_chroot(sysnrs, ".");
     if (r_uts < 0 || r_net < 0 || r_mnt < 0 || r_chd < 0 || r_chr < 0) {
         char em[192];
-        snprintf(em, sizeof(em),
-                 "enter ns failed: uts=%ld net=%ld mnt=%ld fchdir=%ld chroot=%ld",
-                 r_uts, r_net, r_mnt, r_chd, r_chr);
+        snprintf(
+            em, sizeof(em),
+            "enter ns failed: uts=%ld net=%ld mnt=%ld fchdir=%ld chroot=%ld",
+            r_uts, r_net, r_mnt, r_chd, r_chr);
         fail_exec_start(e, em);
         goto dec_active;
     }
@@ -1805,8 +1843,7 @@ static void *exec_worker_thread(void *arg)
         .on_running = exec_on_running,
         .on_failed = exec_on_failed,
     };
-    int exit_code =
-        launch_and_supervise_proc(sysnrs, &pe, e->log_path, &hooks);
+    int exit_code = launch_and_supervise_proc(sysnrs, &pe, e->log_path, &hooks);
 
     pthread_mutex_lock(&e->lock);
     e->state = EXEC_EXITED;
@@ -1929,7 +1966,8 @@ static int parse_port_spec(const char *spec, struct port_binding_spec *out)
             return -EINVAL;
         size_t iplen = (size_t) (c1 - spec);
         size_t hlen = (size_t) (c2 - (c1 + 1));
-        if (iplen >= sizeof(out->host_ip) || hlen == 0 || hlen >= sizeof(hp_buf))
+        if (iplen >= sizeof(out->host_ip) || hlen == 0 ||
+            hlen >= sizeof(hp_buf))
             return -EINVAL;
         if (iplen == 0) {
             snprintf(out->host_ip, sizeof(out->host_ip), "0.0.0.0");
@@ -2015,7 +2053,8 @@ static void handle_rpc_line(int client_fd, const char *req)
             send_rpc_err(client_fd, "port_add invalid args");
             return;
         }
-        int rc = kbox_daemon_port_add(g_sysnrs, host_ip, (int) hp, ip, (int) cp);
+        int rc =
+            kbox_daemon_port_add(g_sysnrs, host_ip, (int) hp, ip, (int) cp);
         if (rc < 0) {
             char msg[128];
             snprintf(msg, sizeof(msg), "port_add failed: %s", strerror(-rc));
@@ -2075,8 +2114,8 @@ static void handle_rpc_line(int client_fd, const char *req)
         if (json_get_str(req, "hostname", slot->hostname,
                          sizeof(slot->hostname)) < 0)
             snprintf(slot->hostname, sizeof(slot->hostname), "%.12s", cid);
-        if (json_get_str(req, "workdir", slot->workdir,
-                         sizeof(slot->workdir)) < 0)
+        if (json_get_str(req, "workdir", slot->workdir, sizeof(slot->workdir)) <
+            0)
             snprintf(slot->workdir, sizeof(slot->workdir), "/");
 
         if (json_get_str(req, "ip", slot->ip, sizeof(slot->ip)) < 0 ||
@@ -2095,8 +2134,8 @@ static void handle_rpc_line(int client_fd, const char *req)
 
         char *bind_strs[KBOX_HOST_BINDS_MAX];
         memset(bind_strs, 0, sizeof(bind_strs));
-        int nb = json_get_str_array(req, "binds", bind_strs,
-                                    KBOX_HOST_BINDS_MAX);
+        int nb =
+            json_get_str_array(req, "binds", bind_strs, KBOX_HOST_BINDS_MAX);
         for (int i = 0; i < nb; i++) {
             if (kbox_parse_host_volume(bind_strs[i],
                                        &slot->binds[slot->bind_count]) == 0)
@@ -2108,8 +2147,8 @@ static void handle_rpc_line(int client_fd, const char *req)
         memset(alias_strs, 0, sizeof(alias_strs));
         int na = json_get_str_array(req, "aliases", alias_strs, MAX_ALIASES);
         for (int i = 0; i < na; i++) {
-            snprintf(slot->aliases[slot->alias_count++],
-                     KBOX_DAEMON_MAX_ALIAS, "%s", alias_strs[i]);
+            snprintf(slot->aliases[slot->alias_count++], KBOX_DAEMON_MAX_ALIAS,
+                     "%s", alias_strs[i]);
             kbox_daemon_dns_register(alias_strs[i], slot->ip);
             free(alias_strs[i]);
         }
@@ -2123,8 +2162,8 @@ static void handle_rpc_line(int client_fd, const char *req)
         int np = json_get_str_array(req, "ports", port_strs, 16);
         for (int i = 0; i < np; i++) {
             if (slot->port_count < 16 &&
-                parse_port_spec(port_strs[i],
-                                &slot->ports[slot->port_count]) == 0) {
+                parse_port_spec(port_strs[i], &slot->ports[slot->port_count]) ==
+                    0) {
                 slot->port_count++;
             }
             free(port_strs[i]);
@@ -2145,7 +2184,8 @@ static void handle_rpc_line(int client_fd, const char *req)
         char eid[80], cid_arg[80], wd[PATH_MAX];
         if (json_get_str(req, "exec_id", eid, sizeof(eid)) < 0 ||
             json_get_str(req, "container_id", cid_arg, sizeof(cid_arg)) < 0) {
-            send_rpc_err(client_fd, "exec_start requires exec_id and container_id");
+            send_rpc_err(client_fd,
+                         "exec_start requires exec_id and container_id");
             return;
         }
         pthread_mutex_lock(&g_cont_table_lock);
@@ -2189,7 +2229,8 @@ static void handle_rpc_line(int client_fd, const char *req)
         pthread_mutex_init(&eslot->lock, NULL);
         pthread_cond_init(&eslot->cv, NULL);
         snprintf(eslot->id, sizeof(eslot->id), "%s", eid);
-        snprintf(eslot->container_id, sizeof(eslot->container_id), "%s", tc->id);
+        snprintf(eslot->container_id, sizeof(eslot->container_id), "%s",
+                 tc->id);
         snprintf(eslot->log_path, sizeof(eslot->log_path), "%s/exec-%s.log",
                  DAEMON_LOG_DIR, eid);
 
@@ -2200,8 +2241,7 @@ static void handle_rpc_line(int client_fd, const char *req)
 
         eslot->cmd_count =
             json_get_str_array(req, "cmd", eslot->cmd, MAX_CMD_ARGS);
-        int req_env =
-            json_get_str_array(req, "env", eslot->env, MAX_ENV_VARS);
+        int req_env = json_get_str_array(req, "env", eslot->env, MAX_ENV_VARS);
         eslot->env_count = req_env;
         /* Merge container env if not already present in exec env. */
         for (int i = 0; i < tc->env_count && eslot->env_count < MAX_ENV_VARS;
@@ -2544,6 +2584,11 @@ static void on_term_signal(int sig)
     __atomic_store_n(&g_daemon_stop, 1, __ATOMIC_RELEASE);
 }
 
+int kbox_daemon_stopping(void)
+{
+    return __atomic_load_n(&g_daemon_stop, __ATOMIC_ACQUIRE) ? 1 : 0;
+}
+
 int kbox_daemon_run(const char *sock_path, const char *cmdline, int verbose)
 {
     const char *eff_sock =
@@ -2604,8 +2649,23 @@ int kbox_daemon_run(const char *sock_path, const char *cmdline, int verbose)
 
     struct kbox_daemon_config cfg;
     kbox_daemon_load_config(g_config_path, &cfg);
+    g_config = cfg;
 
     if (kbox_daemon_net_init(g_sysnrs, &cfg, verbose) < 0) {
+        kbox_halt_kernel();
+        kbox_net_cleanup();
+        return -1;
+    }
+
+    /* Mount declared NFS exports before accepting any container: a service
+     * that asks for a volume from a handle that never came up must not start
+     * with a half-working filesystem. The wait is unbounded by design (the
+     * NFS server is usually a sibling workload that starts after us) and is
+     * interruptible by SIGTERM/SIGINT.
+     */
+    if (kbox_daemon_nfs_mount_all(g_sysnrs, &g_config, verbose) < 0) {
+        fprintf(stderr, "kboxd: nfs mounts not established, shutting down\n");
+        kbox_daemon_net_cleanup();
         kbox_halt_kernel();
         kbox_net_cleanup();
         return -1;

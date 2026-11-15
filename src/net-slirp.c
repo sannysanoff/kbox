@@ -546,6 +546,13 @@ static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
     int progressed = 0;
 
     pthread_mutex_lock(&shadow_lock);
+
+    /* One IRQ flush per pass instead of one per socket: lkl_cpu_get/put runs
+     * pending softirqs, which is what delivers packets to the socket layer,
+     * and doing it once is enough for every socket in this pass. */
+    if (shadow_cnt > 0 && net_sysnrs)
+        kbox_lkl_getuid(net_sysnrs);
+
     for (int si = 0; si < shadow_cnt; si++) {
         int slot = ctx->shadow_slots[si];
         if (slot < 0 || slot >= MAX_SHADOW_SOCKETS || !shadow_sockets[slot].active)
@@ -625,18 +632,11 @@ static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
         }
 
         /* LKL socket -> supervisor_fd.
-         * Probe every loop iteration so TCP/UDP responses are drained even when
-         * the host socketpair itself had no readable event this cycle.
-         *
-         * Flush pending IRQs first: lkl_cpu_get+put triggers IRQ processing in
-         * lkl_cpu_put, which runs softirqs that deliver packets from virtio-net
-         * driver to the socket layer. Without this, recvfrom may return EAGAIN
-         * even though net_rx already delivered a packet to the kernel.
+         * Probe every pass so TCP/UDP responses are drained even when the host
+         * socketpair had no readable event this cycle. Pending IRQs were
+         * flushed once at the top of the pass.
          */
         if (sock->to_supervisor_len == 0) {
-            /* Flush pending LKL IRQs so socket data is available. */
-            kbox_lkl_getuid(net_sysnrs);
-
             long r = kbox_lkl_recvfrom(net_sysnrs, sock->lkl_fd,
                                        sock->to_supervisor_buf,
                                        (long) sizeof(sock->to_supervisor_buf),

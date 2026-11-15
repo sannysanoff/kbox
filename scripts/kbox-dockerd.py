@@ -1110,7 +1110,28 @@ class DockerEngineState:
             if stop_ev.wait(timeout=wait_s):
                 break
 
+    def _ensure_mount_sources(self, c):
+        """Recreate volume directories that disappeared while the container
+        existed. Docker keeps named volumes across container restarts, so a
+        missing directory must not turn into a broken mount (the guest then
+        dies with "mkdir: cannot create directory ...: No such file or
+        directory" and exit 127).
+        """
+        for m in c.get("mounts_json") or []:
+            src = m.get("Source")
+            if not src or not os.path.isabs(src):
+                continue
+            try:
+                owned = os.path.commonpath(
+                    [os.path.abspath(src), self.vol_root]
+                ) == self.vol_root
+            except ValueError:
+                owned = False
+            if owned:
+                os.makedirs(src, exist_ok=True)
+
     def start_container(self, c):
+        self._ensure_mount_sources(c)
         resp = self.rpc.call({"op": "container_start", "id": c["id"]})
         c["status"] = "running"
         c["pid"] = resp.get("pid", 0)

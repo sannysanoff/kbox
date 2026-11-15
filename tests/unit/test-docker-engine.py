@@ -369,6 +369,29 @@ class TestDockerEngine(unittest.TestCase):
         # Clean up health_stop
         rec["health_stop"].set()
 
+    def test_start_recreates_missing_volume_dir(self):
+        rec = self.engine.create_container(
+            "vol",
+            {
+                "Image": "alpine:latest",
+                "HostConfig": {
+                    "Mounts": [
+                        {"Type": "volume", "Source": "vd", "Target": "/data"}
+                    ]
+                },
+            },
+        )
+        src = next(
+            m["Source"]
+            for m in rec["mounts_json"]
+            if m.get("Destination") == "/data"
+        )
+        os.rmdir(src)
+        self.assertFalse(os.path.isdir(src))
+
+        self.engine.start_container(rec)
+        self.assertTrue(os.path.isdir(src))
+
     def test_restart_resets_exit_status(self):
         # The daemon's container_wait blocks until exit; make the stub behave
         # the same so the exit watcher cannot fire during the test.

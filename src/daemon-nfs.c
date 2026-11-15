@@ -413,6 +413,10 @@ void kbox_daemon_nfs_unbind_container(const struct kbox_sysnrs *s,
                               binds[i].guest_path) >= sizeof(dst))
             continue;
         /* Lazy detach: the container may still hold cwd or open files. */
-        (void) kbox_lkl_umount2(s, dst, KBOX_MNT_DETACH);
+        {
+            long ur = kbox_lkl_umount2(s, dst, KBOX_MNT_DETACH);
+            fprintf(stderr, "kboxd: nfs: released %s (detach=%ld %s)\n", dst,
+                    ur, ur < 0 ? kbox_err_text(ur) : "ok");
+        }
     }
 }

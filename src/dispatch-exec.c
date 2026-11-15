@@ -1161,9 +1161,33 @@ fail:
     }
 }
 
+static struct kbox_dispatch forward_execve_impl(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    int is_execveat);
+
 struct kbox_dispatch forward_execve(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx,
                                     int is_execveat)
+{
+    struct kbox_dispatch d = forward_execve_impl(req, ctx, is_execveat);
+    if (ctx->verbose && d.kind == KBOX_DISPATCH_RETURN && d.error) {
+        char pbuf[KBOX_MAX_PATH] = {0};
+        (void) guest_mem_read_string(
+            ctx, kbox_syscall_request_pid(req),
+            kbox_syscall_request_arg(req, is_execveat ? 1 : 0), pbuf,
+            sizeof(pbuf));
+        fprintf(stderr, "kbox: exec denied: %s path=%s (pid=%u)\n",
+                kbox_err_text(-d.error), pbuf,
+                (unsigned) kbox_syscall_request_pid(req));
+    }
+    return d;
+}
+
+static struct kbox_dispatch forward_execve_impl(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    int is_execveat)
 {
     pid_t pid = kbox_syscall_request_pid(req);
 

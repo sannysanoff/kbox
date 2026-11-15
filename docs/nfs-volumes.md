@@ -37,6 +37,12 @@ never reachable from a container.
 The `-v …:ro` row is the trap worth remembering: the Docker CLI accepts the
 string, drops the mode, and the mount comes up writable without a warning.
 
+## Known problems
+
+The kernel-side path is not yet trustworthy under load: `fcntl` locks on an
+NFS file crash the daemon, and concurrent or repeated small writes lose data.
+`docs/nfs-test-findings.md` has the measurements and the reproductions.
+
 ## Why the daemon mounts, not the guest
 
 Guest processes in LKL run with no capabilities (`CapEff` is zero by

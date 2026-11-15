@@ -200,6 +200,11 @@ struct kbox_supervisor_ctx {
     char guest_exe[KBOX_MAX_PATH];
     /* /proc is the container's own procfs in LKL, not the host's. */
     int private_proc;
+    /* Pids that issued clone(CLONE_VM|CLONE_VFORK). Their child shares the
+     * address space, so an in-place exec rewrite corrupts them; the rewrite is
+     * snapshotted and undone once the parent leaves vfork. */
+    pid_t vfork_parents[8];
+    unsigned vfork_parent_next;
 
     /* Optional external child-exit notification (used by multi-threaded
      * daemon mode where a central reaper handles SIGCHLD for all children).

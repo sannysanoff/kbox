@@ -1620,7 +1620,10 @@ static void *container_worker_thread(void *arg)
     {
         char tmp_p[256];
         snprintf(tmp_p, sizeof(tmp_p), "%s/tmp", rootfs);
-        (void) kbox_lkl_fchmodat(sysnrs, AT_FDCWD_LINUX, tmp_p, 01777, 0);
+        long cr = kbox_lkl_fchmodat(sysnrs, AT_FDCWD_LINUX, tmp_p, 01777, 0);
+        if (g_verbose)
+            fprintf(stderr, "kboxd: chmod %s -> %ld\n", tmp_p, cr);
+        (void) cr;
         snprintf(tmp_p, sizeof(tmp_p), "%s/var/tmp", rootfs);
         (void) kbox_lkl_fchmodat(sysnrs, AT_FDCWD_LINUX, tmp_p, 01777, 0);
     }

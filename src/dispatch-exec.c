@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,6 +17,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "dispatch-internal.h"
@@ -276,6 +278,28 @@ struct kbox_dispatch forward_clone3(const struct kbox_syscall_request *req,
     /* In trap/rewrite mode, block thread creation (CLONE_THREAD).
      * Multi-threaded guests require --syscall-mode=seccomp.
      */
+    /* vfork. kbox performs an exec by rewriting the pathname in the tracee's
+     * memory, which is unsafe for a child that shares the parent's address
+     * space: the rewrite lands in the parent's stack, so after the child
+     * execs the parent resumes with "/proc/self/fd/N" where its own path used
+     * to be and every later fork execs that stale descriptor (initdb's
+     * bootstrap, popen, system all go through CLONE_VM|CLONE_VFORK).
+     *
+     * Turn it into a plain fork. The child still execs immediately and the
+     * parent still waits for it to exit, which is all posix_spawn and popen
+     * need; the only difference is that the parent may run alongside the child
+     * until it execs, which nothing in this path observes.
+     */
+    if (flags & CLONE_VFORK) {
+        flags &= ~(uint64_t) (CLONE_VFORK | CLONE_VM | CLONE_SIGHAND |
+                              CLONE_THREAD);
+        flags |= SIGCHLD;
+        if (ctx->verbose)
+            fprintf(stderr,
+                    "kbox: clone3: vfork downgraded to fork (pid=%u)\n",
+                    kbox_syscall_request_pid(req));
+    }
+
     if ((flags & CLONE_THREAD) && request_uses_trap_signals(req)) {
         if (ctx->verbose)
             fprintf(stderr,
@@ -1166,6 +1190,89 @@ static struct kbox_dispatch forward_execve_impl(
     struct kbox_supervisor_ctx *ctx,
     int is_execveat);
 
+
+/* Undo an exec rewrite that landed in a vfork parent's memory.
+ *
+ * A vfork child shares its parent's address space, and the exec path rewrites
+ * the pathname in place (and relocates argv/envp when it does not fit). The
+ * parent is suspended until the child execs, so the bytes can be restored as
+ * soon as it leaves the vfork wait -- otherwise the parent resumes with
+ * "/proc/self/fd/N" where its own path used to be and every later fork in it
+ * execs a descriptor that belongs to the child.
+ */
+struct kbox_vfork_snapshot {
+    pid_t parent;
+    pid_t child;
+    uint64_t addr;
+    size_t len;
+    unsigned char *saved;
+    char child_exe[256]; /* the child's exe before the exec */
+};
+
+static pid_t tracee_parent_of(pid_t pid)
+{
+    char path[64], buf[1024];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int) pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+    char *paren = strrchr(buf, ')');
+    if (!paren)
+        return -1;
+    pid_t pp = -1;
+    if (sscanf(paren + 2, "%*c %d", &pp) != 1)
+        return -1;
+    return pp;
+}
+
+static void *vfork_restore_thread(void *arg)
+{
+    struct kbox_vfork_snapshot *snap = arg;
+    char link_path[64];
+    snprintf(link_path, sizeof(link_path), "/proc/%d/exe", (int) snap->child);
+
+    /* Wait for the child's exec to land. While it has not, the parent is still
+     * inside vfork holding the shared address space, and putting the bytes
+     * back now would revert the pathname the kernel has yet to read -- the
+     * exec would then fail with ENOENT on the guest path. The exe link changes
+     * exactly when the new image takes over.
+     */
+    for (int i = 0; i < 8000; i++) {
+        char cur[256];
+        ssize_t n = readlink(link_path, cur, sizeof(cur) - 1);
+        if (n < 0)
+            break; /* child gone (exec failed and it exited) */
+        cur[n] = '\0';
+        if (strcmp(cur, snap->child_exe) != 0)
+            break; /* exec done */
+        usleep(250);
+    }
+
+    struct iovec local = {.iov_base = snap->saved, .iov_len = snap->len};
+    struct iovec remote = {.iov_base = (void *) (uintptr_t) snap->addr,
+                           .iov_len = snap->len};
+    (void) process_vm_writev(snap->parent, &local, 1, &remote, 1, 0);
+    free(snap->saved);
+    free(snap);
+    return NULL;
+}
+
+static int vfork_parent_recorded(const struct kbox_supervisor_ctx *ctx,
+                                 pid_t pp)
+{
+    size_t n = sizeof(ctx->vfork_parents) / sizeof(ctx->vfork_parents[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (ctx->vfork_parents[i] == pp)
+            return 1;
+    }
+    return 0;
+}
+
 struct kbox_dispatch forward_execve(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx,
                                     int is_execveat)
@@ -1209,6 +1316,13 @@ static struct kbox_dispatch forward_execve_impl(
         guest_mem_read_string(ctx, pid, path_addr, pathbuf, sizeof(pathbuf));
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
+
+    /* Already a descriptor path: that descriptor is a host fd kbox injected
+     * (the exec memfd itself, on a re-exec through /proc/self/exe), so the
+     * host kernel can resolve it directly and LKL cannot resolve it at all. */
+    if (strncmp(pathbuf, "/proc/self/fd/", 14) == 0 ||
+        strncmp(pathbuf, "/proc/thread-self/fd/", 21) == 0)
+        return kbox_dispatch_continue();
 
     /* Resolve host bind mount or translate path for LKL. */
     char translated[KBOX_MAX_PATH];
@@ -1412,6 +1526,60 @@ static struct kbox_dispatch forward_execve_impl(
                                      : kbox_syscall_request_arg(req, 1);
     uint64_t envp_addr = is_execveat ? kbox_syscall_request_arg(req, 3)
                                      : kbox_syscall_request_arg(req, 2);
+
+    /* If this is a vfork child, the parent shares these pages and is suspended
+     * until the exec completes: snapshot what is about to be rewritten so it
+     * can be put back when the parent resumes. */
+    {
+        pid_t pp = tracee_parent_of(pid);
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: exec: pid=%u ppid=%d vfork_parent=%d\n",
+                    (unsigned) pid, (int) pp,
+                    pp > 0 ? vfork_parent_recorded(ctx, pp) : 0);
+        if (pp > 0 && vfork_parent_recorded(ctx, pp)) {
+            uint64_t lo = path_addr < argv_addr ? path_addr : argv_addr;
+            uint64_t hi = path_addr > argv_addr ? path_addr : argv_addr;
+            const uint64_t margin = 32768;
+            lo = lo > margin ? lo - margin : 0;
+            size_t len = (size_t) (hi + margin - lo);
+            if (len > 262144)
+                len = 262144;
+            struct kbox_vfork_snapshot *snap = calloc(1, sizeof(*snap));
+            if (snap) {
+                snap->saved = malloc(len);
+                if (snap->saved &&
+                    guest_mem_read(ctx, pid, lo, snap->saved, len) == 0) {
+                    snap->parent = pp;
+                    snap->child = pid;
+                    snap->addr = lo;
+                    snap->len = len;
+                    {
+                        char lp[64];
+                        snprintf(lp, sizeof(lp), "/proc/%d/exe", (int) pid);
+                        ssize_t en = readlink(lp, snap->child_exe,
+                                              sizeof(snap->child_exe) - 1);
+                        snap->child_exe[en > 0 ? (size_t) en : 0] = '\0';
+                    }
+                    pthread_t th;
+                    if (pthread_create(&th, NULL, vfork_restore_thread, snap) ==
+                        0) {
+                        pthread_detach(th);
+                        if (ctx->verbose)
+                            fprintf(stderr,
+                                    "kbox: exec: vfork parent %d snapshotted "
+                                    "0x%llx+%zu\n",
+                                    (int) pp, (unsigned long long) lo, len);
+                    } else {
+                        free(snap->saved);
+                        free(snap);
+                    }
+                } else {
+                    free(snap->saved);
+                    free(snap);
+                }
+            }
+        }
+    }
 
     rc = relocate_overlapping_exec_vecs(ctx, pid, path_addr, total_write,
                                         argv_addr, envp_addr);

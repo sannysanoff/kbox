@@ -6079,6 +6079,26 @@ struct kbox_dispatch kbox_dispatch_request(
                         kbox_syscall_request_pid(req));
             return kbox_dispatch_errno(EPERM);
         }
+        /* CLONE_VM|CLONE_VFORK: the child shares the parent's address space,
+         * and kbox performs an exec by rewriting the pathname in tracee
+         * memory. The rewrite therefore lands in the parent too, which then
+         * resumes with "/proc/self/fd/N" where its own path used to be, and
+         * every later fork in that process execs the stale descriptor
+         * (posix_spawn, popen and system all take this path). clone's flags
+         * arrive in a register and cannot be rewritten the way clone3's struct
+         * can, so remember the parent and let the exec path snapshot and undo
+         * its own writes when the parent leaves vfork. */
+        if ((cflags & (CLONE_VM | CLONE_VFORK)) ==
+            (CLONE_VM | CLONE_VFORK)) {
+            pid_t vp = (pid_t) kbox_syscall_request_pid(req);
+            ctx->vfork_parents[ctx->vfork_parent_next %
+                                (sizeof(ctx->vfork_parents) /
+                                 sizeof(ctx->vfork_parents[0]))] = vp;
+            ctx->vfork_parent_next++;
+            if (ctx->verbose)
+                fprintf(stderr, "kbox: clone: vfork parent recorded (pid=%d)\n",
+                        (int) vp);
+        }
         if ((cflags & CLONE_THREAD) && request_uses_trap_signals(req)) {
             if (ctx->verbose)
                 fprintf(stderr,

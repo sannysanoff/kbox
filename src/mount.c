@@ -117,8 +117,13 @@ int kbox_apply_recommended_mounts(const struct kbox_sysnrs *s,
                     "warning: devpts unavailable (CONFIG_DEVPTS_FS?)\n");
     }
 
-    /* tmpfs on /tmp is always useful */
-    if (do_mkdir_mount(s, "/tmp", "tmpfs", "tmpfs") < 0)
+    /* tmpfs on /tmp is always useful -- and it has to be world-writable: kbox
+     * reports /tmp as 1777, and the processes that rely on it after dropping
+     * privileges (postgres sockets, scratch files) get EACCES on a root-owned
+     * 0755 tmpfs while stat(2) tells them the directory is fine. */
+    if (kbox_lkl_mkdir(s, "/tmp", 01777) < 0)
+        return -1;
+    if (kbox_lkl_mount(s, "tmpfs", "/tmp", "tmpfs", 0, "mode=1777") < 0)
         return -1;
 
     return 0;

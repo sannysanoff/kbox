@@ -135,6 +135,9 @@ if [ ! -f "${LKL_SRC}/.config" ]; then
         CONFIG_PRINTK \
         CONFIG_DEBUG_FS \
         CONFIG_FILE_LOCKING \
+        CONFIG_SIGNALFD \
+        CONFIG_TIMERFD \
+        CONFIG_EVENTFD \
         CONFIG_FS_POSIX_ACL \
         CONFIG_NETWORK_FILESYSTEMS \
         CONFIG_DNS_RESOLVER \

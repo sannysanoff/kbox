@@ -3675,6 +3675,31 @@ static struct kbox_dispatch forward_fcntl(
             }
             goto fcntl_shadow_continue;
         }
+        /* The descriptor is not in the table, so kbox has no LKL socket to
+         * apply a flag to. Continuing the call to the host is worse than
+         * useless: the guest's number is not a host descriptor, so the caller
+         * gets EBADF -- which is how postgres backends died right after
+         * accepting a client, asking for nonblocking mode and treating the
+         * refusal as fatal. Report the three flag commands as done; there is
+         * nothing meaningful to apply them to.
+         */
+        {
+            long lcmd = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+            if (lcmd == F_SETFL || lcmd == F_GETFL || lcmd == F_SETFD) {
+                long larg = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+                if (ctx->verbose)
+                    fprintf(stderr,
+                            "kbox: fcntl untracked fd=%ld cmd=%ld arg=%ld "
+                            "answered locally\n",
+                            fd, lcmd, larg);
+                if (lcmd == F_GETFL)
+                    return kbox_dispatch_value(O_RDWR);
+                if (lcmd == F_SETFD)
+                    kbox_fd_table_set_cloexec(ctx->fd_table, fd,
+                                              (larg & FD_CLOEXEC) ? 1 : 0);
+                return kbox_dispatch_value(0);
+            }
+        }
         if (!fd_should_deny_io(fd, lkl_fd))
             goto fcntl_shadow_continue;
         return kbox_dispatch_errno(EBADF);

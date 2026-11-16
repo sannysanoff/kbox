@@ -71,7 +71,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kboxd
-          image: kbox-nfs-test/kbox:v71
+          image: kbox-nfs-test/kbox:v78
           imagePullPolicy: IfNotPresent
           args:
             - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml
@@ -83,6 +83,8 @@ spec:
           env:
             - name: HOME
               value: /dev/shm
+            - name: KBOX_NET_TRACE
+              value: "1"
           ports:
             - name: docker-api
               containerPort: 2376
@@ -112,7 +114,7 @@ spec:
             periodSeconds: 2
             failureThreshold: 150
         - name: shim
-          image: kbox-nfs-test/kbox:v71
+          image: kbox-nfs-test/kbox:v78
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

@@ -259,6 +259,9 @@ static struct kbox_dispatch complete_accept_result(
         while (recv(entry->shadow_sp, drain, sizeof(drain), MSG_DONTWAIT) > 0)
             ;
         kbox_net_clear_listening_notify((int) listen_lkl_fd);
+        if (getenv("KBOX_NET_TRACE"))
+            fprintf(stderr, "kbox: net: accept done lkl=%ld -> cleared notify\n",
+                    listen_lkl_fd);
     }
 
     if (client_lkl < 0)

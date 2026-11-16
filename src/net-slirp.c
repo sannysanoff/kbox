@@ -575,6 +575,12 @@ static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
                     if (wn == 1)
                         sock->listen_notified = 1;
                 }
+                if (getenv("KBOX_NET_TRACE"))
+                    fprintf(stderr,
+                            "kbox: net: listen slot=%d lkl=%ld notified=%d "
+                            "pr=%ld revents=%#x\n",
+                            slot, sock->lkl_fd, sock->listen_notified, pr,
+                            (unsigned) lpfd.revents);
             }
             continue;
         }

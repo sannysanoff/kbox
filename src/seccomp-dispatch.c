@@ -3302,6 +3302,14 @@ static struct kbox_dispatch forward_sendfile(
             out_lkl = kbox_fd_table_get_lkl(ctx->fd_table, vfd);
     }
 
+    if (ctx->verbose)
+        fprintf(stderr,
+                "kbox: sendfile in=%ld lkl=%ld out=%ld lkl=%ld deny_in=%d "
+                "deny_out=%d\n",
+                in_fd, in_lkl, out_fd, out_lkl,
+                fd_should_deny_io_ctx(ctx->fd_table, in_fd, in_lkl),
+                fd_should_deny_io_ctx(ctx->fd_table, out_fd, out_lkl));
+
     /* Both FDs have no LKL backing: the host kernel handles sendfile
      * if both are known host FDs. Deny if either is in a denied range.
      */

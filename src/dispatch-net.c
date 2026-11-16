@@ -281,6 +281,11 @@ static struct kbox_dispatch complete_accept_result(
         }
     }
 
+    /* The accepted connection keeps its shadow: the shadow is what tells the
+     * tracee its socket became readable, and dropping it makes the very first
+     * read block forever. Whatever strands the answer on the second
+     * self-connection, it is not the shadow's existence.
+     */
     if (!entry || entry->shadow_sp < 0 || !kbox_net_is_active()) {
         long vfd = kbox_fd_table_insert(ctx->fd_table, client_lkl, 0);
         if (vfd < 0) {

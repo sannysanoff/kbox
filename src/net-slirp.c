@@ -1347,6 +1347,21 @@ int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type)
      */
     int reserved = 0;
     pthread_mutex_lock(&shadow_lock);
+    /* A closed socket does not always get deregistered -- the close path only
+     * does that when the descriptor was known to be a network socket -- and LKL
+     * reuses fd numbers immediately. A stale slot then answers every lookup for
+     * the new connection and readiness is delivered to a socketpair nobody
+     * holds, so the tracee waits forever on a reply that already arrived. The
+     * newcomer owns the number now: retire the stale slot. Its supervisor_fd is
+     * deliberately not closed here, because that number may already belong to
+     * something else.
+     */
+    for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
+        if (shadow_sockets[i].active && shadow_sockets[i].lkl_fd == lkl_fd) {
+            shadow_sockets[i].active = 0;
+            shadow_sockets[i].supervisor_fd = -1;
+        }
+    }
     for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
         if (!shadow_sockets[i].active) {
             shadow_sockets[i].lkl_fd = lkl_fd;

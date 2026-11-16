@@ -2761,8 +2761,16 @@ static struct kbox_dispatch forward_epoll_ctl_gated(
             }
         }
     }
-    if (target < 0)
+    if (target < 0) {
+        /* A descriptor with no shadow is usually a real host one -- a pipe or
+         * an eventfd, which is exactly what a database's latch is. Those must
+         * go to the host, not be refused here.
+         */
+        if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+            (he && he->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW))
+            return kbox_dispatch_continue();
         return kbox_dispatch_errno(EBADF);
+    }
 
     pid_t pid = kbox_syscall_request_pid(req);
 

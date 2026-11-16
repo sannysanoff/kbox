@@ -292,19 +292,7 @@ static struct kbox_dispatch complete_accept_result(
      * read block forever. Whatever strands the answer on the second
      * self-connection, it is not the shadow's existence.
      */
-    /* Every accepted connection gets a shadow when one can be made. A socket
-     * that lives only inside LKL has no host descriptor, and the epoll calls
-     * are passed straight to the host, so registering such a socket fails with
-     * EBADF -- postgres aborts every backend on exactly that. Without a shadow
-     * the connection still works for plain read and write, so a failure to
-     * attach one falls back to a bare virtual descriptor.
-     */
-    int64_t out_fd = -1;
-    int rc = -1;
-    if (kbox_net_is_active())
-        rc = attach_shadow_socket(req, ctx, client_lkl, SOCK_STREAM, flags,
-                                  &out_fd);
-    if (rc < 0) {
+    if (!entry || entry->shadow_sp < 0 || !kbox_net_is_active()) {
         long vfd = kbox_fd_table_insert(ctx->fd_table, client_lkl, 0);
         if (vfd < 0) {
             lkl_close_and_invalidate(ctx, client_lkl);
@@ -312,9 +300,15 @@ static struct kbox_dispatch complete_accept_result(
         }
         if (flags & SOCK_CLOEXEC)
             kbox_fd_table_set_cloexec(ctx->fd_table, vfd, 1);
-        if (getenv("KBOX_NET_TRACE"))
-            fprintf(stderr, "kbox: net: accepted no-shadow vfd=%ld\n", vfd);
         return kbox_dispatch_value((int64_t) vfd);
+    }
+
+    int64_t out_fd = -1;
+    int rc = attach_shadow_socket(req, ctx, client_lkl, SOCK_STREAM, flags,
+                                  &out_fd);
+    if (rc < 0) {
+        lkl_close_and_invalidate(ctx, client_lkl);
+        return kbox_dispatch_errno(-rc);
     }
     if (getenv("KBOX_NET_TRACE"))
         fprintf(stderr, "kbox: net: accepted lkl=%ld vfd=%lld\n", client_lkl,

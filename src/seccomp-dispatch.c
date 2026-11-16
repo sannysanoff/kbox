@@ -3656,6 +3656,42 @@ static struct kbox_dispatch forward_fcntl(
         return kbox_dispatch_continue();
     }
 
+    /* An FD that has both a virtual number and a host shadow (an accepted
+     * socket is one) must answer here. Its virtual number is not a host
+     * descriptor, so CONTINUE would run fcntl on a number the host does not
+     * have and answer EBADF -- which is how every postgres backend died with
+     * "could not set socket to nonblocking mode: Bad file descriptor" right
+     * after accepting a client.
+     */
+    {
+        long pt_cmd = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+        long pt_arg = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+        struct kbox_fd_entry *he = fd_table_entry(ctx->fd_table, fd);
+
+        if (he && he->shadow_sp >= 0 &&
+            (pt_cmd == F_SETFL || pt_cmd == F_GETFL || pt_cmd == F_SETFD)) {
+            if (pt_cmd == F_SETFD) {
+                kbox_fd_table_set_cloexec(ctx->fd_table, fd,
+                                          (pt_arg & FD_CLOEXEC) ? 1 : 0);
+                return kbox_dispatch_value(0);
+            }
+            if (pt_cmd == F_SETFL) {
+                if (lkl_fd >= 0)
+                    (void) kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, F_SETFL,
+                                          host_to_lkl_open_flags(pt_arg));
+                if (fcntl(he->shadow_sp, F_SETFL, (int) pt_arg) < 0)
+                    return kbox_dispatch_errno(errno);
+                return kbox_dispatch_value(0);
+            }
+            {
+                long hr = fcntl(he->shadow_sp, F_GETFL);
+                if (hr < 0)
+                    return kbox_dispatch_errno(errno);
+                return kbox_dispatch_value(lkl_to_host_open_flags(hr));
+            }
+        }
+    }
+
     long cmd = to_c_long_arg(kbox_syscall_request_arg(req, 1));
     long arg = to_c_long_arg(kbox_syscall_request_arg(req, 2));
 
@@ -3700,6 +3736,18 @@ static struct kbox_dispatch forward_fcntl(
         arg = host_to_lkl_open_flags(arg);
 
     long ret = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, cmd, arg);
+
+    if (ret < 0 && ctx->verbose)
+        fprintf(stderr,
+                "kbox: fcntl fd=%ld lkl=%ld cmd=%ld arg=%ld -> %ld (host_fd=%d "
+                "shadow=%d)\n",
+                fd, lkl_fd, cmd, arg, ret,
+                fd_table_entry(ctx->fd_table, fd)
+                    ? fd_table_entry(ctx->fd_table, fd)->host_fd
+                    : -999,
+                fd_table_entry(ctx->fd_table, fd)
+                    ? fd_table_entry(ctx->fd_table, fd)->shadow_sp
+                    : -999);
 
     /* F_GETFL: translate LKL open flags back to host before returning. */
     if (cmd == F_GETFL && ret >= 0)

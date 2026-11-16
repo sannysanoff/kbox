@@ -1449,15 +1449,32 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     ctx.exit_status_ptr = hooks->exit_status;
 
     int exit_code = kbox_supervise_ctx(&ctx);
+
+    /* The container's init exiting does not end the rest of its processes, and
+     * once the supervisor has returned nobody is servicing their syscalls: they
+     * stay parked in the notification queue forever. postgres is the visible
+     * case -- its backends keep the data directory and the SysV segment
+     * attached, so the next start of the same service refused with
+     * "pre-existing shared memory block ... is still in use".
+     */
+    kill(-pid, SIGKILL);
+    for (size_t i = 0; ctx.proc_fds && i < ctx.proc_fd_count; i++) {
+        if (ctx.proc_fds[i].tgid > 1)
+            kill(ctx.proc_fds[i].tgid, SIGKILL);
+    }
+    for (int spin = 0; spin < 200; spin++) {
+        if (waitpid(-pid, NULL, WNOHANG) < 0 && errno == ECHILD)
+            break;
+        struct timespec nap = {0, 10 * 1000 * 1000};
+        nanosleep(&nap, NULL);
+    }
+
     kbox_dispatch_cleanup_proc_fds(&ctx);
     if (ctx.proc_mem_fd >= 0)
         close(ctx.proc_mem_fd);
     if (ctx.proc_self_fd_dirfd >= 0)
         close(ctx.proc_self_fd_dirfd);
     close(listener_fd);
-
-    if (exit_code < 0)
-        kill(-pid, SIGKILL);
 
     if (has_log_thr)
         pthread_join(log_thr, NULL);

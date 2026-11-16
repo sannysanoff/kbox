@@ -2191,6 +2191,8 @@ static struct kbox_dispatch finish_open_dispatch(
         lkl_close_and_invalidate(ctx, lkl_fd);
         return kbox_dispatch_errno(EMFILE);
     }
+    fprintf(stderr, "kboxdbg: open %s -> vfd=%ld lkl=%ld\n",
+            translated ? translated : "?", vfd, lkl_fd);
     if (flags & O_CLOEXEC)
         kbox_fd_table_set_cloexec(ctx->fd_table, vfd, 1);
     return kbox_dispatch_value((int64_t) vfd);
@@ -2987,6 +2989,9 @@ static struct kbox_dispatch forward_close(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
     int same_fd_shadow = entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW;
+    if (fd <= 2)
+        fprintf(stderr, "kboxdbg: close fd=%ld lkl=%ld pid=%u\n", fd, lkl_fd,
+                kbox_syscall_request_pid(req));
 
     if (lkl_fd >= 0)
         invalidate_stat_cache_fd(ctx, lkl_fd);
@@ -3021,12 +3026,17 @@ static struct kbox_dispatch forward_close(
         if (ret < 0 && fd >= KBOX_FD_BASE)
             return kbox_dispatch_errno((int) (-ret));
 
-        /* Low FD redirect (from dup2): close the LKL side above,
-         * then CONTINUE so the host kernel also closes its copy of
-         * this FD number.
+        /* Low FD redirect (from dup2/dup3): the LKL side is closed above.
+         * Do NOT continue to the host: a redirect onto 0/1/2 replaces the
+         * host descriptor with a purely virtual one, and shells do close the
+         * real stdio descriptor beforehand -- so there is nothing left at that
+         * number and the host would answer EBADF for a close that the guest
+         * has every right to expect to succeed. dash reports exactly that
+         * ("cat: closing standard input: Bad file descriptor") and then
+         * refuses to run, which is what broke postgres' bootstrap.
          */
         if (fd < KBOX_LOW_FD_MAX)
-            return kbox_dispatch_continue();
+            return kbox_dispatch_value(0);
 
         return kbox_dispatch_value(0);
     }
@@ -3065,6 +3075,10 @@ static struct kbox_dispatch forward_read_like(
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (fd <= 2)
+        fprintf(stderr, "kboxdbg: read fd=%ld lkl=%ld n=%ld pid=%u\n", fd,
+                lkl_fd, to_c_long_arg(kbox_syscall_request_arg(req, 2)),
+                kbox_syscall_request_pid(req));
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
         (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
         return kbox_dispatch_continue();
@@ -4144,6 +4158,53 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
     if (oldfd == newfd)
         return kbox_dispatch_value((int64_t) newfd);
 
+    /* Redirect onto a low FD (0/1/2). Those descriptors are the guest's
+     * stdio: the guest reads and closes them through the host, so the host has
+     * to own whatever lands there. The file behind the source FD is only
+     * reachable through a supervisor shadow -- kbox keeps read shadows local
+     * and never injects them at the source number -- so a plain CONTINUE would
+     * dup a host number that does not exist. Inject the shadow at the target
+     * number and mark the entry as a same-fd shadow instead: reads then
+     * continue to the host and see the file's bytes. Without this, postgres'
+     * bootstrap read its own input as EBADF and died with "input in flex
+     * scanner failed".
+     */
+    if (newfd < KBOX_LOW_FD_MAX) {
+        struct kbox_fd_entry *src = fd_table_entry(ctx->fd_table, oldfd);
+        int memfd = (src && src->shadow_sp >= 0) ? src->shadow_sp : -1;
+        int own_memfd = 0;
+        int writeback = src ? src->shadow_writeback : 0;
+
+        if (memfd < 0) {
+            memfd = kbox_shadow_create(ctx->sysnrs, lkl_old);
+            if (memfd < 0)
+                return kbox_dispatch_errno(-memfd);
+            kbox_shadow_seal(memfd);
+            own_memfd = 1;
+        }
+
+        int injected = request_addfd_at(ctx, req, memfd, (int) newfd, 0);
+        if (injected < 0) {
+            if (own_memfd)
+                close(memfd);
+            return kbox_dispatch_errno(-injected);
+        }
+
+        cleanup_replaced_fd_tracking(ctx, newfd);
+        if (kbox_fd_table_insert_at(ctx->fd_table, newfd, lkl_old, 0) < 0) {
+            if (own_memfd)
+                close(memfd);
+            return kbox_dispatch_errno(EBADF);
+        }
+        struct kbox_fd_entry *dst = fd_table_entry(ctx->fd_table, newfd);
+        if (dst) {
+            dst->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
+            dst->shadow_sp = own_memfd ? memfd : -1;
+            dst->shadow_writeback = writeback;
+        }
+        return kbox_dispatch_value((int64_t) newfd);
+    }
+
     struct kbox_fd_entry *orig = fd_table_entry(ctx->fd_table, oldfd);
     if (orig && orig->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW &&
         orig->shadow_sp >= 0)
@@ -4238,6 +4299,53 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
 
     if (oldfd == newfd)
         return kbox_dispatch_errno(EINVAL);
+
+    /* Redirect onto a low FD (0/1/2). Those descriptors are the guest's
+     * stdio: the guest reads and closes them through the host, so the host has
+     * to own whatever lands there. The file behind the source FD is only
+     * reachable through a supervisor shadow -- kbox keeps read shadows local
+     * and never injects them at the source number -- so a plain CONTINUE would
+     * dup a host number that does not exist. Inject the shadow at the target
+     * number and mark the entry as a same-fd shadow instead: reads then
+     * continue to the host and see the file's bytes. Without this, postgres'
+     * bootstrap read its own input as EBADF and died with "input in flex
+     * scanner failed".
+     */
+    if (newfd < KBOX_LOW_FD_MAX) {
+        struct kbox_fd_entry *src = fd_table_entry(ctx->fd_table, oldfd);
+        int memfd = (src && src->shadow_sp >= 0) ? src->shadow_sp : -1;
+        int own_memfd = 0;
+        int writeback = src ? src->shadow_writeback : 0;
+
+        if (memfd < 0) {
+            memfd = kbox_shadow_create(ctx->sysnrs, lkl_old);
+            if (memfd < 0)
+                return kbox_dispatch_errno(-memfd);
+            kbox_shadow_seal(memfd);
+            own_memfd = 1;
+        }
+
+        int injected = request_addfd_at(ctx, req, memfd, (int) newfd, 0);
+        if (injected < 0) {
+            if (own_memfd)
+                close(memfd);
+            return kbox_dispatch_errno(-injected);
+        }
+
+        cleanup_replaced_fd_tracking(ctx, newfd);
+        if (kbox_fd_table_insert_at(ctx->fd_table, newfd, lkl_old, 0) < 0) {
+            if (own_memfd)
+                close(memfd);
+            return kbox_dispatch_errno(EBADF);
+        }
+        struct kbox_fd_entry *dst = fd_table_entry(ctx->fd_table, newfd);
+        if (dst) {
+            dst->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
+            dst->shadow_sp = own_memfd ? memfd : -1;
+            dst->shadow_writeback = writeback;
+        }
+        return kbox_dispatch_value((int64_t) newfd);
+    }
 
     struct kbox_fd_entry *orig = fd_table_entry(ctx->fd_table, oldfd);
     if (orig && orig->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW &&
@@ -5580,6 +5688,10 @@ static struct kbox_dispatch forward_chown_legacy(
     _(shutdown, forward_shutdown)                                             \
     /* I/O extended. */                                                       \
     _(pwrite64, forward_pwrite64)                                             \
+    _(pwritev, forward_pwritev)                                               \
+    _(preadv, forward_preadv)                                                 \
+    _(pwritev2, forward_pwritev2)                                             \
+    _(preadv2, forward_preadv2)                                               \
     _(writev, forward_writev)                                                 \
     _(readv, forward_readv)                                                   \
     _(ftruncate, forward_ftruncate)                                           \
@@ -5622,6 +5734,7 @@ static struct kbox_dispatch forward_chown_legacy(
     /* FD-creating syscalls tracked as host-passthrough. */                   \
     _(eventfd2, forward_eventfd)                                              \
     _(timerfd_create, forward_timerfd_create)                                 \
+    _(signalfd4, forward_signalfd4)                                           \
     _(epoll_create1, forward_epoll_create1)                                   \
     /* FD-consuming syscalls gated by deny check (were in CONTINUE table). */ \
     _(epoll_ctl, forward_epoll_ctl_gated)                                     \
@@ -5717,8 +5830,9 @@ struct kbox_dispatch kbox_dispatch_request(
                               .iov_len = slot->len};
         (void) process_vm_writev(slot->parent, &local, 1, &remote, 1, 0);
         if (ctx->verbose)
-            fprintf(stderr, "kbox: exec: vfork parent %d restored\n",
-                    (int) slot->parent);
+            fprintf(stderr,
+                    "kbox: exec: vfork parent %d restored on syscall nr=%d\n",
+                    (int) slot->parent, (int) req->nr);
         free(slot->saved);
         slot->saved = NULL;
     }
@@ -5777,6 +5891,18 @@ struct kbox_dispatch kbox_dispatch_request(
      * getpid()/gettid() (e.g. glibc nptl_setxid). Trap/rewrite modes keep
      * constant virtualization.
      */
+
+    /* SysV IPC lives in the pod's IPC namespace and its segments are mapped
+     * into the tracee's own address space, so the host kernel has to be the
+     * one handling these. Left to the default they were refused with ENOSYS,
+     * and postgres died in bootstrap: its shared memory is shmget(posix is
+     * only chosen when sysv is unavailable, which is never on a real host).
+     */
+    if (nr == h->shmget || nr == h->shmat || nr == h->shmdt ||
+        nr == h->shmctl || nr == h->semget || nr == h->semop ||
+        nr == h->semctl || nr == h->semtimedop || nr == h->msgget ||
+        nr == h->msgsnd || nr == h->msgrcv || nr == h->msgctl)
+        return kbox_dispatch_continue();
 
     if (nr == h->getpid) {
         if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP)

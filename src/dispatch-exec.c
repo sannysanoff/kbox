@@ -1086,39 +1086,25 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
      * would look for an applet called "10". Point the shebang at a symlink
      * that keeps the interpreter's own name and resolves, in the tracee's
      * context, to the injected memfd. */
+    /* The interpreter is referenced by descriptor, not by a symlink under the
+     * daemon's /tmp: that directory is the supervisor's, the guest has its own
+     * /tmp (a tmpfs), and a shebang naming a path only the daemon can see makes
+     * the kernel answer ENOENT for the whole exec. Scripts run from initdb,
+     * popen and other spawn helpers died exactly that way.
+     *
+     * The cost is that argv[0] of the interpreter reads "/proc/self/fd/<n>",
+     * which matters only to applets that dispatch on their own name (busybox).
+     */
     char interp_name[128];
     {
         const char *slash = strrchr(interp, '/');
         snprintf(interp_name, sizeof(interp_name), "%s",
                  (slash && slash[1]) ? slash + 1 : interp);
     }
-
-    static unsigned exec_link_seq;
-    (void) mkdir("/tmp/kbox-exec-links", 0777);
-    char link_dir[160];
-    char link_path[320] = {0};
-    int have_link = 0;
-    for (unsigned attempt = 0; attempt < 32 && !have_link; attempt++) {
-        unsigned seq = __atomic_add_fetch(&exec_link_seq, 1, __ATOMIC_RELAXED);
-        snprintf(link_dir, sizeof(link_dir), "/tmp/kbox-exec-links/%d-%u",
-                 (int) getpid(), seq);
-        if (mkdir(link_dir, 0777) == 0) {
-            snprintf(link_path, sizeof(link_path), "%s/%s", link_dir,
-                     interp_name);
-            char target[64];
-            snprintf(target, sizeof(target), "/proc/self/fd/%d",
-                     tracee_interp_fd);
-            if (symlink(target, link_path) == 0) {
-                have_link = 1;
-            } else {
-                (void) rmdir(link_dir);
-            }
-        }
-    }
+    const char *interp_ref = NULL;
 
     char shebang[512];
     int shebang_len;
-    const char *interp_ref = have_link ? link_path : NULL;
     if (!interp_ref) {
         /* Fall back to the memfd path: fine for interpreters that do not
          * dispatch on argv[0], broken for busybox. */
@@ -1314,6 +1300,7 @@ static struct kbox_dispatch forward_execve_impl(
         if (kbox_is_lkl_virtual_path(translated))
             return kbox_dispatch_errno(EACCES);
 
+
         /* Open the binary from LKL. */
         long lkl_fd = kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX, translated,
                                       O_RDONLY, 0);
@@ -1470,6 +1457,14 @@ static struct kbox_dispatch forward_execve_impl(
 
     if (tracee_exec_fd < 0)
         return kbox_dispatch_errno(-tracee_exec_fd);
+
+    if (ctx->verbose) {
+        char fdp[64];
+        struct stat st;
+        snprintf(fdp, sizeof(fdp), "/proc/%d/fd/%d", (int) pid, tracee_exec_fd);
+        fprintf(stderr, "kbox: exec %s: tracee fd %d present=%d\n", pathbuf,
+                tracee_exec_fd, stat(fdp, &st) == 0);
+    }
 
     /* Overwrite the pathname in the tracee's memory with /proc/self/fd/<N>.
      * Relocate any overlapping argv[]/envp[] strings (including aliased

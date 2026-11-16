@@ -1752,7 +1752,13 @@ static void *container_worker_thread(void *arg)
     struct daemon_proc_env pe = {
         .binds = c->binds,
         .bind_count = c->bind_count,
-        .private_proc = 1,
+        /* 0: the container sees the host procfs, so the exec path rewrite to
+         * /proc/self/fd/<n> resolves for the kernel that performs the exec.
+         * With an LKL-only procfs it does not, and every exec past the first
+         * failed with ENOENT -- which is what killed postgres' bootstrap. The
+         * guest-meaning /proc/self/{exe,cwd,root} links are synthesised in the
+         * dispatch, so they do not need a private procfs. */
+        .private_proc = 0,
         .workdir = c->workdir,
         .cmd = c->cmd,
         .cmd_count = c->cmd_count,

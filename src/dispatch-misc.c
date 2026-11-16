@@ -15,6 +15,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/file.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -768,7 +769,9 @@ static __thread uint8_t iov_scratch[IOV_MAX_COUNT * IOV_ENTRY_SIZE];
 static struct kbox_dispatch dispatch_iov_transfer(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx,
-    int is_write)
+    int is_write,
+    int have_offset,
+    int64_t start_offset)
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
@@ -838,10 +841,19 @@ static struct kbox_dispatch dispatch_iov_transfer(
                 }
             }
 
-            long ret =
-                is_write
-                    ? kbox_lkl_write(ctx->sysnrs, lkl_fd, scratch, (long) chunk)
-                    : kbox_lkl_read(ctx->sysnrs, lkl_fd, scratch, (long) chunk);
+            int64_t at = start_offset + (int64_t) total;
+            long ret;
+            if (have_offset)
+                ret = is_write ? kbox_lkl_pwrite64(ctx->sysnrs, lkl_fd, scratch,
+                                                   (long) chunk, (long) at)
+                               : kbox_lkl_pread64(ctx->sysnrs, lkl_fd, scratch,
+                                                  (long) chunk, (long) at);
+            else
+                ret = is_write
+                          ? kbox_lkl_write(ctx->sysnrs, lkl_fd, scratch,
+                                           (long) chunk)
+                          : kbox_lkl_read(ctx->sysnrs, lkl_fd, scratch,
+                                          (long) chunk);
             if (ret < 0) {
                 err = (int) (-ret);
                 goto done;
@@ -880,13 +892,57 @@ done:
 struct kbox_dispatch forward_writev(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx)
 {
-    return dispatch_iov_transfer(req, ctx, 1);
+    return dispatch_iov_transfer(req, ctx, 1, 0, 0);
 }
 
 struct kbox_dispatch forward_readv(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx)
 {
-    return dispatch_iov_transfer(req, ctx, 0);
+    return dispatch_iov_transfer(req, ctx, 0, 0, 0);
+}
+
+/* Vector I/O at an explicit offset. postgres writes its WAL and its relation
+ * pages this way; without it the syscall fell through to the unknown-syscall
+ * denial and bootstrap died on "could not write to file ... Function not
+ * implemented".
+ */
+static struct kbox_dispatch dispatch_iov_at_offset(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    int is_write,
+    int has_flags)
+{
+    if (has_flags) {
+        long flags = to_c_long_arg(kbox_syscall_request_arg(req, 4));
+        if (flags != 0)
+            return kbox_dispatch_errno(ENOSYS);
+    }
+    int64_t offset = (int64_t) to_c_long_arg(kbox_syscall_request_arg(req, 3));
+    return dispatch_iov_transfer(req, ctx, is_write, 1, offset);
+}
+
+struct kbox_dispatch forward_pwritev(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx)
+{
+    return dispatch_iov_at_offset(req, ctx, 1, 0);
+}
+
+struct kbox_dispatch forward_preadv(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx)
+{
+    return dispatch_iov_at_offset(req, ctx, 0, 0);
+}
+
+struct kbox_dispatch forward_pwritev2(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx)
+{
+    return dispatch_iov_at_offset(req, ctx, 1, 1);
+}
+
+struct kbox_dispatch forward_preadv2(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx)
+{
+    return dispatch_iov_at_offset(req, ctx, 0, 1);
 }
 
 struct kbox_dispatch forward_ftruncate(const struct kbox_syscall_request *req,
@@ -1333,6 +1389,46 @@ struct kbox_dispatch forward_eventfd(const struct kbox_syscall_request *req,
 
     track_host_passthrough_fd(ctx->fd_table, tracee_fd);
     if (flags & EFD_CLOEXEC)
+        kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
+
+    return kbox_dispatch_value(tracee_fd);
+}
+
+/* signalfd: the descriptor has to live in the host, like eventfd and
+ * timerfd, because the signals it reports are delivered to the host process.
+ * Without this the syscall never reached anyone -- kbox denies syscalls it does
+ * not know with ENOSYS -- and postgres' postmaster died on it at startup. */
+struct kbox_dispatch forward_signalfd4(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx)
+{
+    int ufd = (int) to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    uint64_t mask_addr = kbox_syscall_request_arg(req, 1);
+    size_t sizemask =
+        (size_t) to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    int flags = (int) to_c_long_arg(kbox_syscall_request_arg(req, 3));
+    pid_t pid = kbox_syscall_request_pid(req);
+
+    if (sizemask > sizeof(sigset_t))
+        sizemask = sizeof(sigset_t);
+
+    sigset_t mask;
+    memset(&mask, 0, sizeof(mask));
+    if (sizemask > 0 &&
+        guest_mem_read(ctx, pid, mask_addr, &mask, sizemask) != 0)
+        return kbox_dispatch_errno(EFAULT);
+
+    int host_fd = signalfd(ufd, &mask, flags & ~SFD_CLOEXEC);
+    if (host_fd < 0)
+        return kbox_dispatch_errno(errno);
+
+    uint32_t addfd_flags = (flags & SFD_CLOEXEC) ? O_CLOEXEC : 0;
+    int tracee_fd = request_addfd(ctx, req, host_fd, addfd_flags);
+    close(host_fd);
+    if (tracee_fd < 0)
+        return kbox_dispatch_errno(-tracee_fd);
+
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+    if (flags & SFD_CLOEXEC)
         kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
 
     return kbox_dispatch_value(tracee_fd);

@@ -475,6 +475,18 @@ struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_pwritev(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_preadv(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_pwritev2(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_preadv2(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_writev(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_readv(const struct kbox_syscall_request *req,
@@ -507,6 +519,10 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
                                   struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_eventfd(const struct kbox_syscall_request *req,
                                      struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_signalfd4(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+
 struct kbox_dispatch forward_timerfd_create(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx);

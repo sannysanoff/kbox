@@ -119,6 +119,14 @@ struct kbox_proc_fd_entry {
     char host_cwd[KBOX_MAX_PATH];
 };
 
+#define KBOX_PENDING_FORKS_MAX 64
+
+struct kbox_pending_fork {
+    pid_t parent_tgid;
+    struct kbox_fd_table *table;
+    char host_cwd[KBOX_MAX_PATH];
+};
+
 struct kbox_pid_tgid_entry {
     pid_t pid;
     pid_t tgid;
@@ -190,6 +198,8 @@ struct kbox_supervisor_ctx {
     struct kbox_proc_fd_entry *proc_fds;
     size_t proc_fd_count;
     struct kbox_proc_fd_entry *active_proc;
+    struct kbox_pending_fork *pending_forks;
+    size_t pending_fork_count;
     struct kbox_pid_tgid_entry pid_tgid_cache[KBOX_PID_TGID_CACHE_MAX];
 
     const struct kbox_host_bind *host_binds;

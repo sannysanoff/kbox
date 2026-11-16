@@ -62,18 +62,92 @@
  */
 static uint64_t reexec_current_stack_top;
 
-/* /proc/self/exe for a given process: the path it last exec'd, else the one the
- * container was started with. */
-const char *kbox_guest_exe_for(struct kbox_supervisor_ctx *ctx, pid_t pid)
+static pid_t tracee_parent_of(pid_t pid)
 {
-    for (size_t i = 0; i < sizeof(ctx->exe_map) / sizeof(ctx->exe_map[0]); i++) {
+    char path[64], buf[1024];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int) pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+    char *paren = strrchr(buf, ')');
+    if (!paren)
+        return -1;
+    pid_t pp = -1;
+    if (sscanf(paren + 2, "%*c %d", &pp) != 1)
+        return -1;
+    return pp;
+}
+
+static pid_t tracee_tgid_of(pid_t pid)
+{
+    char path[64], buf[512];
+    snprintf(path, sizeof(path), "/proc/%d/status", (int) pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+    const char *p = strstr(buf, "Tgid:");
+    if (!p)
+        return -1;
+    pid_t tgid = -1;
+    if (sscanf(p + 5, "%d", &tgid) != 1)
+        return -1;
+    return tgid;
+}
+
+static const char *find_guest_exe_exact(const struct kbox_supervisor_ctx *ctx,
+                                        pid_t pid)
+{
+    if (pid <= 0)
+        return NULL;
+    for (size_t i = 0; i < sizeof(ctx->exe_map) / sizeof(ctx->exe_map[0]);
+         i++) {
         if (ctx->exe_map[i].pid == pid && ctx->exe_map[i].path[0])
             return ctx->exe_map[i].path;
+    }
+    return NULL;
+}
+
+/* /proc/self/exe for a given process: the path it last exec'd, else its thread
+ * group leader / recent ancestor's exe_map entry, else the container's initial
+ * guest_exe. */
+const char *kbox_guest_exe_for(struct kbox_supervisor_ctx *ctx, pid_t pid)
+{
+    const char *found = find_guest_exe_exact(ctx, pid);
+    if (found)
+        return found;
+
+    pid_t tgid = tracee_tgid_of(pid);
+    if (tgid > 0 && tgid != pid) {
+        found = find_guest_exe_exact(ctx, tgid);
+        if (found)
+            return found;
+    }
+
+    pid_t cur = (tgid > 0) ? tgid : pid;
+    for (int depth = 0; depth < 4 && cur > 1; depth++) {
+        pid_t pp = tracee_parent_of(cur);
+        if (pp <= 1)
+            break;
+        found = find_guest_exe_exact(ctx, pp);
+        if (found)
+            return found;
+        cur = pp;
     }
     return ctx->guest_exe;
 }
 
-void kbox_guest_exe_set(struct kbox_supervisor_ctx *ctx, pid_t pid,
+void kbox_guest_exe_set(struct kbox_supervisor_ctx *ctx,
+                        pid_t pid,
                         const char *path)
 {
     size_t n = sizeof(ctx->exe_map) / sizeof(ctx->exe_map[0]);
@@ -166,6 +240,8 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
             if (host == KBOX_FD_LOCAL_ONLY_SHADOW && entry &&
                 entry->shadow_sp >= 0) {
                 memfd = entry->shadow_sp;
+            } else if (kbox_reopen_writeback_shadow_ro(ctx, lkl_fd, &memfd)) {
+                own_memfd = 1;
             } else {
                 memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
                 if (memfd < 0)
@@ -331,12 +407,11 @@ struct kbox_dispatch forward_clone3(const struct kbox_syscall_request *req,
      * until it execs, which nothing in this path observes.
      */
     if (flags & CLONE_VFORK) {
-        flags &= ~(uint64_t) (CLONE_VFORK | CLONE_VM | CLONE_SIGHAND |
-                              CLONE_THREAD);
+        flags &=
+            ~(uint64_t) (CLONE_VFORK | CLONE_VM | CLONE_SIGHAND | CLONE_THREAD);
         flags |= SIGCHLD;
         if (ctx->verbose)
-            fprintf(stderr,
-                    "kbox: clone3: vfork downgraded to fork (pid=%u)\n",
+            fprintf(stderr, "kbox: clone3: vfork downgraded to fork (pid=%u)\n",
                     kbox_syscall_request_pid(req));
     }
 
@@ -362,6 +437,11 @@ struct kbox_dispatch forward_clone3(const struct kbox_syscall_request *req,
                               sizeof(flags));
     if (wrc < 0)
         return kbox_dispatch_errno(-wrc);
+#ifndef CLONE_FILES
+#define CLONE_FILES 0x00000400
+#endif
+    if (!(flags & (CLONE_THREAD | CLONE_FILES)))
+        kbox_dispatch_snapshot_fork(ctx, kbox_syscall_request_pid(req));
     return kbox_dispatch_continue();
 }
 
@@ -981,7 +1061,8 @@ static int relocate_overlapping_exec_vecs(const struct kbox_supervisor_ctx *ctx,
     if (!packed)
         return -ENOMEM;
     for (size_t r = 0; r < reloc_cnt; r++)
-        memcpy(packed + relocs[r].offset, relocs[r].str, relocs[r].len_with_nul);
+        memcpy(packed + relocs[r].offset, relocs[r].str,
+               relocs[r].len_with_nul);
 
     /* Place packed strings safely below tracee stack pointer (past redzone). */
     uint64_t scratch = (sp - 512 - (uint64_t) total_bytes) & ~(uint64_t) 15;
@@ -991,7 +1072,8 @@ static int relocate_overlapping_exec_vecs(const struct kbox_supervisor_ctx *ctx,
         return rc;
 
     for (size_t s = 0; s < slot_cnt; s++) {
-        uint64_t new_ptr = scratch + (uint64_t) relocs[slots[s].reloc_idx].offset;
+        uint64_t new_ptr =
+            scratch + (uint64_t) relocs[slots[s].reloc_idx].offset;
         rc = write_guest_mem_any(ctx, pid, slots[s].slot_addr, &new_ptr,
                                  sizeof(new_ptr));
         if (rc < 0)
@@ -1035,7 +1117,8 @@ static void shell_quote_into(char *out, size_t size, const char *s)
 
 /* Does this shebang run a POSIX shell? Either the interpreter itself is one, or
  * it is an exec wrapper (env, busybox) whose first argument names one. */
-static int shebang_runs_a_shell(const char *interp_name, const char *arg,
+static int shebang_runs_a_shell(const char *interp_name,
+                                const char *arg,
                                 size_t arg_len)
 {
     static const char *const shells[] = {"sh",  "bash", "dash", "ash",
@@ -1063,7 +1146,8 @@ static int shebang_runs_a_shell(const char *interp_name, const char *arg,
 
 static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
                                   const struct kbox_syscall_request *req,
-                                  int *exec_memfd, const char *pathbuf)
+                                  int *exec_memfd,
+                                  const char *pathbuf)
 {
     unsigned char hdr[512];
     ssize_t hn = pread(*exec_memfd, hdr, sizeof(hdr), 0);
@@ -1074,8 +1158,7 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
     while (i < (size_t) hn && (hdr[i] == ' ' || hdr[i] == '\t'))
         i++;
     size_t interp_start = i;
-    while (i < (size_t) hn && hdr[i] != '\n' && hdr[i] != ' ' &&
-           hdr[i] != '\t')
+    while (i < (size_t) hn && hdr[i] != '\n' && hdr[i] != ' ' && hdr[i] != '\t')
         i++;
     size_t interp_len = i - interp_start;
     if (interp_len == 0 || interp_len >= 256)
@@ -1102,8 +1185,8 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
     if (body < 0)
         return -ENOEXEC;
 
-    long interp_lkl = kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX, interp,
-                                      O_RDONLY, 0);
+    long interp_lkl =
+        kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX, interp, O_RDONLY, 0);
     if (interp_lkl < 0)
         return (int) interp_lkl;
 
@@ -1137,14 +1220,14 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
                         kbox_shadow_create(ctx->sysnrs, loader_lkl);
                     lkl_close_and_invalidate(ctx, loader_lkl);
                     if (loader_memfd >= 0) {
-                        int tracee_loader_fd = request_addfd(
-                            ctx, req, loader_memfd, O_CLOEXEC);
+                        int tracee_loader_fd =
+                            request_addfd(ctx, req, loader_memfd, O_CLOEXEC);
                         close(loader_memfd);
                         if (tracee_loader_fd >= 0) {
                             char patched[64];
-                            int plen = snprintf(patched, sizeof(patched),
-                                                "/proc/self/fd/%d",
-                                                tracee_loader_fd);
+                            int plen =
+                                snprintf(patched, sizeof(patched),
+                                         "/proc/self/fd/%d", tracee_loader_fd);
                             char patch[256];
                             size_t pl = (size_t) pt_filesz;
                             if (pl > sizeof(patch))
@@ -1235,10 +1318,10 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
             }
         }
 
-        if (link_path[0])
+        if (link_path[0]) {
             have_link_ref = 1;
-        if (link_path[0])
             memcpy(interp_link, link_path, sizeof(interp_link));
+        }
     }
 
 
@@ -1263,8 +1346,7 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
         shebang_len = snprintf(shebang, sizeof(shebang), "#!%s %.*s\n",
                                interp_ref, (int) arg_len, hdr + arg_start);
     else
-        shebang_len = snprintf(shebang, sizeof(shebang), "#!%s\n",
-                               interp_ref);
+        shebang_len = snprintf(shebang, sizeof(shebang), "#!%s\n", interp_ref);
     if (shebang_len <= 0 || (size_t) shebang_len >= sizeof(shebang))
         return -ENAMETOOLONG;
 
@@ -1298,9 +1380,9 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
             memcpy(argbuf, hdr + arg_start, arg_len);
             argbuf[arg_len] = '\0';
             shell_quote_into(qarg, sizeof(qarg), argbuf);
-            prologue_len = snprintf(prologue, sizeof(prologue),
-                                    "exec %s %s %s \"$@\"\n", qinterp, qarg,
-                                    qscript);
+            prologue_len =
+                snprintf(prologue, sizeof(prologue), "exec %s %s %s \"$@\"\n",
+                         qinterp, qarg, qscript);
         } else {
             prologue_len = snprintf(prologue, sizeof(prologue),
                                     "exec %s %s \"$@\"\n", qinterp, qscript);
@@ -1345,12 +1427,11 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
     *exec_memfd = script_memfd;
     return 0;
 
-fail:
-    {
-        int saved = errno ? errno : EIO;
-        close(script_memfd);
-        return -saved;
-    }
+fail: {
+    int saved = errno ? errno : EIO;
+    close(script_memfd);
+    return -saved;
+}
 }
 
 static struct kbox_dispatch forward_execve_impl(
@@ -1368,27 +1449,7 @@ static struct kbox_dispatch forward_execve_impl(
  * "/proc/self/fd/N" where its own path used to be and every later fork in it
  * execs a descriptor that belongs to the child.
  */
-static pid_t tracee_parent_of(pid_t pid)
-{
-    char path[64], buf[1024];
-    snprintf(path, sizeof(path), "/proc/%d/stat", (int) pid);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return -1;
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0)
-        return -1;
-    buf[n] = '\0';
-    char *paren = strrchr(buf, ')');
-    if (!paren)
-        return -1;
-    pid_t pp = -1;
-    if (sscanf(paren + 2, "%*c %d", &pp) != 1)
-        return -1;
-    return pp;
-}
-
+/* Record that vfork parent is waiting for exec. */
 static int vfork_parent_recorded(const struct kbox_supervisor_ctx *ctx,
                                  pid_t pp)
 {
@@ -1451,12 +1512,24 @@ static struct kbox_dispatch forward_execve_impl(
         strncmp(pathbuf, "/proc/thread-self/fd/", 21) == 0)
         return kbox_dispatch_continue();
 
+    /* Re-exec through /proc/self/exe (e.g. Chromium zygote/GPU/network
+     * subprocess spawning): /proc/self/exe is blocked as a virtual path and
+     * on host procfs names kbox's memfd, so resolve it to the guest binary path
+     * tracked in exe_map / ctx->guest_exe.
+     */
+    if (strcmp(pathbuf, "/proc/self/exe") == 0 ||
+        strcmp(pathbuf, "/proc/thread-self/exe") == 0) {
+        const char *exe = kbox_guest_exe_for(ctx, pid);
+        if (exe && exe[0])
+            snprintf(pathbuf, sizeof(pathbuf), "%s", exe);
+    }
+
     /* Resolve host bind mount or translate path for LKL. */
     char translated[KBOX_MAX_PATH];
     int bind_ro = 0;
-    long raw_dirfd =
-        is_execveat ? to_dirfd_arg(kbox_syscall_request_arg(req, 0))
-                    : AT_FDCWD_LINUX;
+    long raw_dirfd = is_execveat
+                         ? to_dirfd_arg(kbox_syscall_request_arg(req, 0))
+                         : AT_FDCWD_LINUX;
     int brc = kbox_resolve_host_bind_at(ctx, raw_dirfd, pathbuf, translated,
                                         sizeof(translated), &bind_ro);
     if (brc < 0)
@@ -1521,10 +1594,12 @@ static struct kbox_dispatch forward_execve_impl(
     int exec_fd_cloexec = O_CLOEXEC;
     {
         unsigned char elf_magic[4];
-        if (pread(exec_memfd, elf_magic, 4, 0) != 4 ||
-            memcmp(elf_magic, "\x7f" "ELF", 4) != 0) {
-            int rewritten = rewrite_script_shebang(ctx, req, &exec_memfd,
-                                                   pathbuf);
+        if (pread(exec_memfd, elf_magic, 4, 0) != 4 || memcmp(elf_magic,
+                                                              "\x7f"
+                                                              "ELF",
+                                                              4) != 0) {
+            int rewritten =
+                rewrite_script_shebang(ctx, req, &exec_memfd, pathbuf);
             if (rewritten < 0 && ctx->verbose)
                 fprintf(stderr, "kbox: exec %s: shebang rewrite failed: %s\n",
                         pathbuf, kbox_err_text(rewritten));
@@ -1686,9 +1761,9 @@ static struct kbox_dispatch forward_execve_impl(
              * what system(), popen and initdb all use -- then dies with
              * SIGSEGV before it can report anything.
              */
-            for (size_t i = 0; s_kbox_vfork_snapshot &&
-                                i < sizeof(ctx->vfork_pending) /
-                                        sizeof(ctx->vfork_pending[0]);
+            for (size_t i = 0;
+                 s_kbox_vfork_snapshot &&
+                 i < sizeof(ctx->vfork_pending) / sizeof(ctx->vfork_pending[0]);
                  i++) {
                 struct kbox_vfork_pending *slot = &ctx->vfork_pending[i];
                 if (slot->saved)

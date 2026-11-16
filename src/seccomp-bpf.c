@@ -455,7 +455,6 @@ static int install_seccomp_filter(
     emit_fast_shadow_allow(filter, &idx, h->pread64);
     emit_fast_shadow_allow(filter, &idx, h->write);
     emit_fast_shadow_allow(filter, &idx, h->lseek);
-    emit_fast_shadow_allow(filter, &idx, h->fstat);
     emit_host_fd_band_allow(filter, &idx, h->read, KBOX_FD_HOSTONLY_BASE);
     emit_host_fd_band_allow(filter, &idx, h->pread64, KBOX_FD_HOSTONLY_BASE);
     emit_host_fd_band_allow(filter, &idx, h->lseek, KBOX_FD_HOSTONLY_BASE);
@@ -656,7 +655,6 @@ install_seccomp_trap_ranges_ex(
     emit_fast_shadow_allow(filter, &idx, h->pread64);
     emit_fast_shadow_allow(filter, &idx, h->write);
     emit_fast_shadow_allow(filter, &idx, h->lseek);
-    emit_fast_shadow_allow(filter, &idx, h->fstat);
     emit_host_fd_band_allow(filter, &idx, h->read, KBOX_FD_HOSTONLY_BASE);
     emit_host_fd_band_allow(filter, &idx, h->pread64, KBOX_FD_HOSTONLY_BASE);
     emit_host_fd_band_allow(filter, &idx, h->lseek, KBOX_FD_HOSTONLY_BASE);

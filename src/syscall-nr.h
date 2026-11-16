@@ -39,6 +39,7 @@
     X(accept)                  \
     X(accept4)                 \
     X(sendto)                  \
+    X(sendmmsg)                \
     X(recvfrom)                \
     X(recvmsg)                 \
     X(getsockopt)              \
@@ -166,18 +167,18 @@
     X(ppoll)                   \
     X(pselect6)                \
     X(poll)                    \
-    X(shmget)             \
-    X(shmat)              \
-    X(shmdt)              \
-    X(shmctl)             \
-    X(semget)             \
-    X(semop)              \
-    X(semctl)             \
-    X(semtimedop)         \
-    X(msgget)             \
-    X(msgsnd)             \
-    X(msgrcv)             \
-    X(msgctl)             \
+    X(shmget)                  \
+    X(shmat)                   \
+    X(shmdt)                   \
+    X(shmctl)                  \
+    X(semget)                  \
+    X(semop)                   \
+    X(semctl)                  \
+    X(semtimedop)              \
+    X(msgget)                  \
+    X(msgsnd)                  \
+    X(msgrcv)                  \
+    X(msgctl)                  \
     X(nanosleep)               \
     X(clock_nanosleep)         \
     X(timerfd_create)          \

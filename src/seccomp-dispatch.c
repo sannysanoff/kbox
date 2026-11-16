@@ -373,17 +373,24 @@ static unsigned ctx_lkl_fd_ref_count(const struct kbox_supervisor_ctx *ctx,
 {
     if (!ctx || lkl_fd < 0)
         return 0;
+    unsigned total = 0;
     if (ctx->proc_fds && ctx->proc_fd_count > 0) {
-        unsigned total = 0;
         for (size_t i = 0; i < ctx->proc_fd_count; i++) {
             if (ctx->proc_fds[i].table)
                 total +=
                     kbox_fd_table_lkl_ref_count(ctx->proc_fds[i].table, lkl_fd);
         }
-        return total;
+    } else if (ctx->fd_table) {
+        total += kbox_fd_table_lkl_ref_count(ctx->fd_table, lkl_fd);
     }
-    return ctx->fd_table ? kbox_fd_table_lkl_ref_count(ctx->fd_table, lkl_fd)
-                         : 0;
+    if (ctx->pending_forks) {
+        for (size_t i = 0; i < ctx->pending_fork_count; i++) {
+            if (ctx->pending_forks[i].table)
+                total += kbox_fd_table_lkl_ref_count(
+                    ctx->pending_forks[i].table, lkl_fd);
+        }
+    }
+    return total;
 }
 
 static long ctx_close_lkl_if_unreferenced(struct kbox_supervisor_ctx *ctx,
@@ -591,6 +598,112 @@ static void reap_dead_proc_fds(struct kbox_supervisor_ctx *ctx)
     }
 }
 
+static void release_pending_fork_slot(struct kbox_supervisor_ctx *ctx,
+                                      size_t idx)
+{
+    if (!ctx || !ctx->pending_forks || idx >= ctx->pending_fork_count)
+        return;
+
+    struct kbox_fd_table *snap = ctx->pending_forks[idx].table;
+    for (size_t i = idx; i + 1 < ctx->pending_fork_count; i++)
+        ctx->pending_forks[i] = ctx->pending_forks[i + 1];
+    ctx->pending_fork_count--;
+    memset(&ctx->pending_forks[ctx->pending_fork_count], 0,
+           sizeof(ctx->pending_forks[0]));
+
+    if (snap) {
+        release_table_entries_close_lkl(ctx, snap);
+        free(snap);
+    }
+}
+
+static void reap_dead_pending_forks(struct kbox_supervisor_ctx *ctx)
+{
+    if (!ctx || !ctx->pending_forks)
+        return;
+
+    for (size_t i = 0; i < ctx->pending_fork_count;) {
+        char state = '\0';
+        int rc = read_proc_tgid_ppid(ctx->pending_forks[i].parent_tgid, NULL,
+                                     NULL, &state);
+        if (rc < 0 || state == 'Z' || state == 'X') {
+            release_pending_fork_slot(ctx, i);
+            continue;
+        }
+        i++;
+    }
+}
+
+/* Snapshot the parent's FD table when clone/clone3/fork/vfork creates a child
+ * with a private file descriptor table (!(flags & (CLONE_THREAD|CLONE_FILES))).
+ * This closes the race where the parent closes an inherited FD before the
+ * child makes its first seccomp-trapped syscall.
+ */
+void kbox_dispatch_snapshot_fork(struct kbox_supervisor_ctx *ctx,
+                                 pid_t caller_pid)
+{
+    if (!ctx || !ctx->fd_table || caller_pid <= 0)
+        return;
+
+    pid_t parent_tgid = 0;
+    const char *cwd = ctx->host_cwd;
+    if (ctx->active_proc && ctx->active_proc->tgid > 0) {
+        parent_tgid = ctx->active_proc->tgid;
+        cwd = ctx->active_proc->host_cwd;
+    } else if (read_proc_tgid_ppid(caller_pid, &parent_tgid, NULL, NULL) < 0 ||
+               parent_tgid <= 0) {
+        return;
+    }
+
+    if (!ctx->pending_forks) {
+        ctx->pending_forks =
+            calloc(KBOX_PENDING_FORKS_MAX, sizeof(*ctx->pending_forks));
+        if (!ctx->pending_forks)
+            return;
+    }
+
+    if (ctx->pending_fork_count >= KBOX_PENDING_FORKS_MAX)
+        reap_dead_pending_forks(ctx);
+    if (ctx->pending_fork_count >= KBOX_PENDING_FORKS_MAX)
+        release_pending_fork_slot(ctx, 0);
+
+    struct kbox_fd_table *snap_tab = calloc(1, sizeof(*snap_tab));
+    if (!snap_tab)
+        return;
+    memcpy(snap_tab, ctx->fd_table, sizeof(*snap_tab));
+    dup_table_supervisor_fds(snap_tab);
+
+    struct kbox_pending_fork *pf =
+        &ctx->pending_forks[ctx->pending_fork_count++];
+    pf->parent_tgid = parent_tgid;
+    pf->table = snap_tab;
+    snprintf(pf->host_cwd, sizeof(pf->host_cwd), "%s", cwd ? cwd : "/");
+}
+
+static int take_pending_fork_table(struct kbox_supervisor_ctx *ctx,
+                                   pid_t parent_tgid,
+                                   struct kbox_fd_table **out_tab,
+                                   char *out_cwd,
+                                   size_t cwd_len)
+{
+    if (!ctx || !ctx->pending_forks || parent_tgid <= 0)
+        return 0;
+
+    for (size_t i = 0; i < ctx->pending_fork_count; i++) {
+        if (ctx->pending_forks[i].parent_tgid != parent_tgid)
+            continue;
+        *out_tab = ctx->pending_forks[i].table;
+        snprintf(out_cwd, cwd_len, "%s", ctx->pending_forks[i].host_cwd);
+        for (size_t j = i; j + 1 < ctx->pending_fork_count; j++)
+            ctx->pending_forks[j] = ctx->pending_forks[j + 1];
+        ctx->pending_fork_count--;
+        memset(&ctx->pending_forks[ctx->pending_fork_count], 0,
+               sizeof(ctx->pending_forks[0]));
+        return 1;
+    }
+    return 0;
+}
+
 static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
 {
     if (!ctx || !ctx->fd_table || ctx->child_pid <= 0 || pid <= 0)
@@ -636,6 +749,8 @@ static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
     if (ctx->proc_fd_count >= KBOX_PROC_FD_TABLES_MAX - 1 ||
         ctx->proc_fd_count >= 16)
         reap_dead_proc_fds(ctx);
+    if (ctx->pending_fork_count >= 16)
+        reap_dead_pending_forks(ctx);
     if (ctx->proc_fd_count >= KBOX_PROC_FD_TABLES_MAX) {
         ctx->fd_table = ctx->root_fd_table;
         sync_ctx_host_cwd(ctx, &ctx->proc_fds[0]);
@@ -643,34 +758,45 @@ static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
     }
 
     struct kbox_proc_fd_entry *parent_entry = NULL;
+    struct kbox_fd_table *child_tab = NULL;
+    char child_cwd[KBOX_MAX_PATH];
+    child_cwd[0] = '\0';
+
     pid_t walk = ppid;
     for (int hop = 0; hop < 4 && walk > 1 && !parent_entry; hop++) {
         pid_t w_tgid = 0;
         pid_t w_ppid = -1;
         if (read_proc_tgid_ppid(walk, &w_tgid, &w_ppid, NULL) < 0)
             break;
+        if (take_pending_fork_table(ctx, w_tgid, &child_tab, child_cwd,
+                                    sizeof(child_cwd)))
+            break;
         parent_entry = find_proc_fd_entry(ctx, w_tgid);
         walk = w_ppid;
     }
-    if (!parent_entry)
-        parent_entry = &ctx->proc_fds[0];
-    struct kbox_fd_table *parent_tab =
-        parent_entry->table ? parent_entry->table : ctx->root_fd_table;
 
-    struct kbox_fd_table *child_tab = calloc(1, sizeof(*child_tab));
     if (!child_tab) {
-        ctx->fd_table = ctx->root_fd_table;
-        sync_ctx_host_cwd(ctx, &ctx->proc_fds[0]);
-        return;
+        if (!parent_entry)
+            parent_entry = &ctx->proc_fds[0];
+        struct kbox_fd_table *parent_tab =
+            parent_entry->table ? parent_entry->table : ctx->root_fd_table;
+
+        child_tab = calloc(1, sizeof(*child_tab));
+        if (!child_tab) {
+            ctx->fd_table = ctx->root_fd_table;
+            sync_ctx_host_cwd(ctx, &ctx->proc_fds[0]);
+            return;
+        }
+        memcpy(child_tab, parent_tab, sizeof(*child_tab));
+        dup_table_supervisor_fds(child_tab);
+        snprintf(child_cwd, sizeof(child_cwd), "%s", parent_entry->host_cwd);
     }
-    memcpy(child_tab, parent_tab, sizeof(*child_tab));
-    dup_table_supervisor_fds(child_tab);
 
     struct kbox_proc_fd_entry *ce = &ctx->proc_fds[ctx->proc_fd_count];
     ce->tgid = tgid;
     ce->owned = 1;
     ce->table = child_tab;
-    snprintf(ce->host_cwd, sizeof(ce->host_cwd), "%s", parent_entry->host_cwd);
+    snprintf(ce->host_cwd, sizeof(ce->host_cwd), "%s", child_cwd);
     ctx->proc_fd_count++;
     ctx->fd_table = child_tab;
     sync_ctx_host_cwd(ctx, ce);
@@ -680,6 +806,12 @@ void kbox_dispatch_cleanup_proc_fds(struct kbox_supervisor_ctx *ctx)
 {
     if (!ctx)
         return;
+    if (ctx->pending_forks) {
+        while (ctx->pending_fork_count > 0)
+            release_pending_fork_slot(ctx, ctx->pending_fork_count - 1);
+        free(ctx->pending_forks);
+        ctx->pending_forks = NULL;
+    }
     if (ctx->root_fd_table)
         ctx->fd_table = ctx->root_fd_table;
     if (ctx->proc_fds) {
@@ -1972,6 +2104,81 @@ int reopen_cached_shadow_fd(struct kbox_supervisor_ctx *ctx,
     return openat(dirfd, fd_name, O_RDONLY | O_CLOEXEC);
 }
 
+static int find_writeback_sp_in_range(const struct kbox_supervisor_ctx *ctx,
+                                      const struct kbox_fd_entry *entries,
+                                      long count,
+                                      long target_lkl_fd,
+                                      const struct kbox_lkl_stat *target_st)
+{
+    for (long i = 0; i < count; i++) {
+        const struct kbox_fd_entry *cand = &entries[i];
+        struct kbox_lkl_stat cand_st;
+
+        if (cand->lkl_fd < 0 || !cand->shadow_writeback || cand->shadow_sp < 0)
+            continue;
+        if (cand->lkl_fd == target_lkl_fd)
+            return cand->shadow_sp;
+        memset(&cand_st, 0, sizeof(cand_st));
+        if (kbox_lkl_fstat(ctx->sysnrs, cand->lkl_fd, &cand_st) == 0 &&
+            cand_st.st_dev == target_st->st_dev &&
+            cand_st.st_ino == target_st->st_ino) {
+            return cand->shadow_sp;
+        }
+    }
+    return -1;
+}
+
+int kbox_find_active_writeback_shadow_sp(struct kbox_supervisor_ctx *ctx,
+                                         long lkl_fd)
+{
+    struct kbox_lkl_stat target_st;
+    int sp;
+
+    if (!ctx || !ctx->fd_table || ctx->active_writeback_shadows == 0 ||
+        lkl_fd < 0)
+        return -1;
+
+    memset(&target_st, 0, sizeof(target_st));
+    if (kbox_lkl_fstat(ctx->sysnrs, lkl_fd, &target_st) < 0)
+        return -1;
+
+    sp = find_writeback_sp_in_range(ctx, ctx->fd_table->entries,
+                                    KBOX_FD_TABLE_MAX, lkl_fd, &target_st);
+    if (sp >= 0)
+        return sp;
+    sp = find_writeback_sp_in_range(ctx, ctx->fd_table->low_fds,
+                                    KBOX_LOW_FD_MAX, lkl_fd, &target_st);
+    if (sp >= 0)
+        return sp;
+    return find_writeback_sp_in_range(ctx, ctx->fd_table->mid_fds,
+                                      KBOX_MID_FD_MAX, lkl_fd, &target_st);
+}
+
+int kbox_reopen_writeback_shadow_ro(struct kbox_supervisor_ctx *ctx,
+                                    long lkl_fd,
+                                    int *out_memfd)
+{
+    int sp = kbox_find_active_writeback_shadow_sp(ctx, lkl_fd);
+    int dirfd;
+    char fd_name[32];
+    int ro_fd;
+
+    if (sp < 0 || !out_memfd)
+        return 0;
+
+    dirfd = ensure_proc_self_fd_dir(ctx);
+    if (dirfd < 0)
+        return 0;
+
+    snprintf(fd_name, sizeof(fd_name), "%d", sp);
+    ro_fd = openat(dirfd, fd_name, O_RDONLY | O_CLOEXEC);
+    if (ro_fd < 0)
+        return 0;
+
+    *out_memfd = ro_fd;
+    return 1;
+}
+
 /* Promote a read-only regular LKL FD to a host-visible shadow at the same guest
  * FD number on first eligible read-only access. This avoids paying memfd copy
  * cost at open time while still letting later read/lseek/fstat/mmap operations
@@ -2011,10 +2218,12 @@ int ensure_same_fd_shadow(struct kbox_supervisor_ctx *ctx,
     if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY)
         return 0;
 
-    memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
-    if (memfd < 0)
-        return -1;
-    kbox_shadow_seal(memfd);
+    if (!kbox_reopen_writeback_shadow_ro(ctx, lkl_fd, &memfd)) {
+        memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
+        if (memfd < 0)
+            return -1;
+        kbox_shadow_seal(memfd);
+    }
 
     cur_off = (off_t) kbox_lkl_lseek(ctx->sysnrs, lkl_fd, 0, SEEK_CUR);
     if (cur_off >= 0 && lseek(memfd, cur_off, SEEK_SET) < 0) {
@@ -2137,27 +2346,6 @@ static struct kbox_dispatch forward_local_shadow_lseek(
 
     (void) kbox_lkl_lseek(ctx->sysnrs, lkl_fd, (long) ret, SEEK_SET);
     return kbox_dispatch_value((int64_t) ret);
-}
-
-static struct kbox_dispatch forward_local_shadow_fstat(
-    const struct kbox_syscall_request *req,
-    struct kbox_supervisor_ctx *ctx,
-    struct kbox_fd_entry *entry)
-{
-    struct stat host_stat;
-    uint64_t remote_stat = kbox_syscall_request_arg(req, 1);
-
-    if (!entry || entry->shadow_sp < 0)
-        return kbox_dispatch_continue();
-    if (remote_stat == 0)
-        return kbox_dispatch_errno(EFAULT);
-    if (fstat(entry->shadow_sp, &host_stat) < 0)
-        return kbox_dispatch_errno(errno);
-    if (guest_mem_write(ctx, kbox_syscall_request_pid(req), remote_stat,
-                        &host_stat, sizeof(host_stat)) < 0) {
-        return kbox_dispatch_errno(EFAULT);
-    }
-    return kbox_dispatch_value(0);
 }
 
 /* statx struct field offsets (standard on x86_64 and aarch64). */
@@ -2477,15 +2665,11 @@ void close_cloexec_with_writeback(struct kbox_supervisor_ctx *ctx)
                                      KBOX_MID_FD_MAX);
     sync_cloexec_writebacks_in_range(ctx, ctx->fd_table->entries,
                                      KBOX_FD_TABLE_MAX);
-    if (ctx->proc_fd_count > 1) {
-        close_cloexec_range(ctx, ctx->fd_table->low_fds, KBOX_LOW_FD_MAX, 0);
-        close_cloexec_range(ctx, ctx->fd_table->mid_fds, KBOX_MID_FD_MAX,
-                            KBOX_LOW_FD_MAX);
-        close_cloexec_range(ctx, ctx->fd_table->entries, KBOX_FD_TABLE_MAX,
-                            KBOX_FD_BASE);
-        return;
-    }
-    kbox_fd_table_close_cloexec(ctx->fd_table, ctx->sysnrs);
+    close_cloexec_range(ctx, ctx->fd_table->low_fds, KBOX_LOW_FD_MAX, 0);
+    close_cloexec_range(ctx, ctx->fd_table->mid_fds, KBOX_MID_FD_MAX,
+                        KBOX_LOW_FD_MAX);
+    close_cloexec_range(ctx, ctx->fd_table->entries, KBOX_FD_TABLE_MAX,
+                        KBOX_FD_BASE);
 }
 
 static long remove_fd_table_entry_with_writeback(
@@ -2667,10 +2851,10 @@ static struct kbox_dispatch forward_epoll_ctl_gated(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     /* A descriptor the table does not know about is not kbox's to refuse: the
      * call is continued to the host anyway, and the host returns EBADF by
-     * itself when the descriptor really is invalid. Answering EBADF here aborted
-     * postgres backends -- they register the client socket they inherited from
-     * the postmaster, and kbox had no entry for that number, so the backend died
-     * before it could serve a single query.
+     * itself when the descriptor really is invalid. Answering EBADF here
+     * aborted postgres backends -- they register the client socket they
+     * inherited from the postmaster, and kbox had no entry for that number, so
+     * the backend died before it could serve a single query.
      */
     if (fd_should_deny_io_ctx(ctx->fd_table, epfd, lkl_ep) ||
         fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)) {
@@ -3817,17 +4001,13 @@ static struct kbox_dispatch forward_fcntl(
 
     long ret = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, cmd, arg);
 
-    if (ret < 0 && ctx->verbose)
-        fprintf(stderr,
-                "kbox: fcntl fd=%ld lkl=%ld cmd=%ld arg=%ld -> %ld (host_fd=%d "
-                "shadow=%d)\n",
-                fd, lkl_fd, cmd, arg, ret,
-                fd_table_entry(ctx->fd_table, fd)
-                    ? fd_table_entry(ctx->fd_table, fd)->host_fd
-                    : -999,
-                fd_table_entry(ctx->fd_table, fd)
-                    ? fd_table_entry(ctx->fd_table, fd)->shadow_sp
-                    : -999);
+    if (ret < 0 && ctx->verbose) {
+        const struct kbox_fd_entry *fe = fd_table_entry(ctx->fd_table, fd);
+        fprintf(stderr, "kbox: fcntl fd=%ld lkl=%ld cmd=%ld arg=%ld -> %ld", fd,
+                lkl_fd, cmd, arg, ret);
+        fprintf(stderr, " (host_fd=%ld shadow=%d)\n", fe ? fe->host_fd : -999L,
+                fe ? fe->shadow_sp : -999);
+    }
 
     /* F_GETFL: translate LKL open flags back to host before returning. */
     if (cmd == F_GETFL && ret >= 0)
@@ -4333,8 +4513,7 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
                     close(memfd);
                 return kbox_dispatch_errno(EBADF);
             }
-            struct kbox_fd_entry *dst =
-                fd_table_entry(ctx->fd_table, newfd);
+            struct kbox_fd_entry *dst = fd_table_entry(ctx->fd_table, newfd);
             if (dst) {
                 dst->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
                 dst->shadow_sp = own_memfd ? memfd : -1;
@@ -4486,8 +4665,7 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
                     close(memfd);
                 return kbox_dispatch_errno(EBADF);
             }
-            struct kbox_fd_entry *dst =
-                fd_table_entry(ctx->fd_table, newfd);
+            struct kbox_fd_entry *dst = fd_table_entry(ctx->fd_table, newfd);
             if (dst) {
                 dst->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
                 dst->shadow_sp = own_memfd ? memfd : -1;
@@ -4535,37 +4713,43 @@ static struct kbox_dispatch forward_fstat(
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
-    /* If a shadow already exists (from a prior mmap), let the host handle
-     * fstat against the memfd.  Do NOT create a shadow here; fstat is a
-     * metadata query that LKL answers directly without the expensive
-     * memfd_create + pread loop.
-     */
-    {
-        struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
-        if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
-            return kbox_dispatch_continue();
-        if (entry && entry->host_fd == KBOX_FD_LOCAL_ONLY_SHADOW)
-            return forward_local_shadow_fstat(req, ctx, entry);
-    }
 
     uint64_t remote_stat = kbox_syscall_request_arg(req, 1);
     if (remote_stat == 0)
         return kbox_dispatch_errno(EFAULT);
 
-    /* Check the stat cache first to avoid an LKL round-trip. */
+    struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
+    int wb_sp = -1;
+    if (entry && entry->shadow_writeback && entry->shadow_sp >= 0)
+        wb_sp = entry->shadow_sp;
+    else if (ctx->active_writeback_shadows > 0)
+        wb_sp = kbox_find_active_writeback_shadow_sp(ctx, lkl_fd);
+    int skip_cache = (wb_sp >= 0) || (ctx->active_writeback_shadows > 0);
+
+    /* Check the stat cache first to avoid an LKL round-trip.  Skip the static
+     * LKL cache when any writeback shadow is active because writes/ftruncate
+     * mutate the live memfd size before writeback.
+     */
 #if KBOX_STAT_CACHE_ENABLED
-    for (int ci = 0; ci < KBOX_STAT_CACHE_MAX; ci++) {
-        if (ctx->stat_cache[ci].lkl_fd == lkl_fd) {
-            int wrc = guest_mem_write_small_metadata(
-                ctx, kbox_syscall_request_pid(req), remote_stat,
-                &ctx->stat_cache[ci].st, sizeof(ctx->stat_cache[ci].st));
-            if (wrc < 0)
-                return kbox_dispatch_errno(-wrc);
-            return kbox_dispatch_value(0);
+    if (!skip_cache) {
+        for (int ci = 0; ci < KBOX_STAT_CACHE_MAX; ci++) {
+            if (ctx->stat_cache[ci].lkl_fd == lkl_fd) {
+                int wrc = guest_mem_write_small_metadata(
+                    ctx, kbox_syscall_request_pid(req), remote_stat,
+                    &ctx->stat_cache[ci].st, sizeof(ctx->stat_cache[ci].st));
+                if (wrc < 0)
+                    return kbox_dispatch_errno(-wrc);
+                return kbox_dispatch_value(0);
+            }
         }
     }
 #endif
 
+    /* Always source identity/permission metadata (st_dev, st_ino, st_mode,
+     * st_uid, st_gid, st_nlink) from LKL rather than an anonymous shadow memfd
+     * so writable shadows and read-only FDs to the same inode agree on
+     * st_dev/st_ino (e.g. Chromium PlatformSharedMemoryRegion::Create).
+     */
     struct kbox_lkl_stat kst;
     memset(&kst, 0, sizeof(kst));
     long ret = kbox_lkl_fstat(ctx->sysnrs, lkl_fd, &kst);
@@ -4575,9 +4759,17 @@ static struct kbox_dispatch forward_fstat(
     struct stat host_stat;
     kbox_lkl_stat_to_host(&kst, &host_stat);
 
+    if (wb_sp >= 0) {
+        struct stat mem_stat;
+        if (fstat(wb_sp, &mem_stat) == 0) {
+            host_stat.st_size = mem_stat.st_size;
+            host_stat.st_blocks = mem_stat.st_blocks;
+        }
+    }
+
     /* Insert into stat cache (overwrite oldest slot via round-robin). */
 #if KBOX_STAT_CACHE_ENABLED
-    {
+    if (!skip_cache) {
         static __thread unsigned stat_cache_rr;
         unsigned slot = stat_cache_rr % KBOX_STAT_CACHE_MAX;
         stat_cache_rr++;
@@ -4622,7 +4814,8 @@ static struct kbox_dispatch forward_newfstatat(
      * link, which is what `ls -l` wants. */
     if (!(flags & AT_SYMLINK_NOFOLLOW) &&
         strcmp(translated, "/proc/self/exe") == 0) {
-        const char *exe = kbox_guest_exe_for(ctx, kbox_syscall_request_pid(req));
+        const char *exe =
+            kbox_guest_exe_for(ctx, kbox_syscall_request_pid(req));
         if (exe[0])
             snprintf(translated, sizeof(translated), "%s", exe);
     }
@@ -5832,6 +6025,7 @@ static struct kbox_dispatch forward_chown_legacy(
     _(accept4, forward_accept4)                                               \
     _(connect, forward_connect)                                               \
     _(sendto, forward_sendto)                                                 \
+    _(sendmmsg, forward_sendmmsg)                                             \
     _(recvfrom, forward_recvfrom)                                             \
     _(recvmsg, forward_recvmsg)                                               \
     _(getsockopt, forward_getsockopt)                                         \
@@ -5908,7 +6102,7 @@ static struct kbox_dispatch forward_chown_legacy(
     _(exit) _(exit_group) _(rt_sigreturn) _(rt_sigaltstack) _(rt_sigsuspend)  \
     _(setitimer)                                                               \
     _(getitimer) _(set_tid_address) _(set_robust_list) _(futex) _(rseq)        \
-    _(fork) _(vfork) _(membarrier) _(madvise) _(getrlimit) _(getrusage)        \
+    _(membarrier) _(madvise) _(getrlimit) _(getrusage)                         \
     /* Scheduling. */                                                          \
     _(sched_yield) _(sched_setparam) _(sched_getparam) _(sched_setscheduler)   \
     _(sched_getscheduler) _(sched_get_priority_max) _(sched_get_priority_min)  \
@@ -5980,7 +6174,7 @@ struct kbox_dispatch kbox_dispatch_request(
             continue;
         struct iovec local = {.iov_base = slot->saved, .iov_len = slot->len};
         struct iovec remote = {.iov_base = (void *) (uintptr_t) slot->addr,
-                              .iov_len = slot->len};
+                               .iov_len = slot->len};
         (void) process_vm_writev(slot->parent, &local, 1, &remote, 1, 0);
         if (ctx->verbose)
             fprintf(stderr,
@@ -6043,8 +6237,7 @@ struct kbox_dispatch kbox_dispatch_request(
         fprintf(stderr, "kbox: msync seen nr=%d table_msync=%d\n", nr,
                 h->msync);
 
-    if (nr == h->msync ||
-        ((h->msync <= 0) && (nr == 26 || nr == 227))) {
+    if (nr == h->msync || ((h->msync <= 0) && (nr == 26 || nr == 227))) {
         /* The mapping lives in the tracee's own address space: file mappings
          * are served from host shadows, so the kernel that has to write the
          * pages back is the host one. Asking LKL about that address answers
@@ -6407,12 +6600,11 @@ struct kbox_dispatch kbox_dispatch_request(
          * arrive in a register and cannot be rewritten the way clone3's struct
          * can, so remember the parent and let the exec path snapshot and undo
          * its own writes when the parent leaves vfork. */
-        if ((cflags & (CLONE_VM | CLONE_VFORK)) ==
-            (CLONE_VM | CLONE_VFORK)) {
+        if ((cflags & (CLONE_VM | CLONE_VFORK)) == (CLONE_VM | CLONE_VFORK)) {
             pid_t vp = (pid_t) kbox_syscall_request_pid(req);
             ctx->vfork_parents[ctx->vfork_parent_next %
-                                (sizeof(ctx->vfork_parents) /
-                                 sizeof(ctx->vfork_parents[0]))] = vp;
+                               (sizeof(ctx->vfork_parents) /
+                                sizeof(ctx->vfork_parents[0]))] = vp;
             ctx->vfork_parent_next++;
             if (ctx->verbose)
                 fprintf(stderr, "kbox: clone: vfork parent recorded (pid=%d)\n",
@@ -6426,6 +6618,16 @@ struct kbox_dispatch kbox_dispatch_request(
                         kbox_syscall_request_pid(req));
             return kbox_dispatch_errno(EPERM);
         }
+#ifndef CLONE_FILES
+#define CLONE_FILES 0x00000400
+#endif
+        if (!(cflags & (CLONE_THREAD | CLONE_FILES)))
+            kbox_dispatch_snapshot_fork(ctx, kbox_syscall_request_pid(req));
+        return kbox_dispatch_continue();
+    }
+
+    if ((h->fork >= 0 && nr == h->fork) || (h->vfork >= 0 && nr == h->vfork)) {
+        kbox_dispatch_snapshot_fork(ctx, kbox_syscall_request_pid(req));
         return kbox_dispatch_continue();
     }
 

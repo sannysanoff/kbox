@@ -277,7 +277,7 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
         if (ctx->pending_accept_count > 0)
             kbox_dispatch_poll_pending(ctx);
 
-        poll_timeout = ctx->pending_accept_count > 0 ? 5 : -1;
+        poll_timeout = ctx->pending_accept_count > 0 ? 10 : -1;
 #ifdef KBOX_HAS_WEB
         if (ctx->web && (poll_timeout < 0 || poll_timeout > 100))
             poll_timeout = 100;

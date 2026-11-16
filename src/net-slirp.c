@@ -54,10 +54,10 @@
 #define MAX_PKT_SIZE 65535
 
 /* Maximum number of shadow sockets tracked by the event loop */
-#define MAX_SHADOW_SOCKETS 512
+#define MAX_SHADOW_SOCKETS 1024
 
 /* Maximum pollfd entries: SLIRP FDs + shadow sockets + wakeup pipe */
-#define MAX_POLLFDS 1024
+#define MAX_POLLFDS 2048
 
 /* RX pipe: length-prefixed framing. */
 
@@ -189,22 +189,39 @@ static int wakeup_pipe[2] = {-1, -1};
 
 /* Shadow socket table. */
 
+#define DGRAM_ADDR_QUEUE_LEN 64
+
+struct dgram_addr_entry {
+    uint8_t addr[128];
+    unsigned int addrlen;
+};
+
 struct shadow_socket {
     int lkl_fd;        /* LKL-side socket FD */
     int supervisor_fd; /* supervisor end of the socketpair */
     int sock_type;     /* SOCK_STREAM or SOCK_DGRAM */
     int listening;     /* 1 after listen() on this socket */
     int listen_notified;
+    int lkl_eof;         /* 1 after LKL recvfrom returned 0 (peer FIN) */
+    int sp_eof;          /* 1 after read(supervisor_fd) returned 0 */
+    int lkl_wr_shutdown; /* 1 after SHUT_WR forwarded to LKL */
+    int sp_wr_shutdown;  /* 1 after SHUT_WR sent to supervisor_fd */
     size_t to_lkl_off;
     size_t to_lkl_len;
     uint8_t to_lkl_buf[65536];
     size_t to_supervisor_off;
     size_t to_supervisor_len;
     uint8_t to_supervisor_buf[65536];
+    struct dgram_addr_entry pending_dgram_addr;
+    struct dgram_addr_entry dgram_q[DGRAM_ADDR_QUEUE_LEN];
+    unsigned int dgram_head;
+    unsigned int dgram_tail;
+    uint64_t gen;
     int active;
 };
 
 static struct shadow_socket shadow_sockets[MAX_SHADOW_SOCKETS];
+static uint64_t next_shadow_gen = 1;
 static pthread_mutex_t shadow_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* SLIRP timers (sorted linked list). */
@@ -417,6 +434,7 @@ static const SlirpCb slirp_callbacks = {
 struct poll_ctx {
     struct pollfd pfds[MAX_POLLFDS];
     int shadow_slots[MAX_SHADOW_SOCKETS];
+    uint64_t shadow_gens[MAX_SHADOW_SOCKETS];
     int count;
     int slirp_base; /* index where SLIRP entries start */
 };
@@ -481,6 +499,15 @@ static int get_revents_cb(int idx, void *opaque)
 #define LKL_SIOCADDRT 0x890B
 #define LKL_SIOCDELRT 0x890C
 
+static void retire_shadow_socket(struct shadow_socket *sock)
+{
+    sock->active = 0;
+    if (sock->supervisor_fd >= 0) {
+        close(sock->supervisor_fd);
+        sock->supervisor_fd = -1;
+    }
+}
+
 static int shadow_flush_to_lkl(struct shadow_socket *sock)
 {
     while (sock->to_lkl_len > 0) {
@@ -499,7 +526,25 @@ static int shadow_flush_to_lkl(struct shadow_socket *sock)
             return 0;
         return -1;
     }
+    if (sock->sp_eof && !sock->lkl_wr_shutdown &&
+        sock->sock_type == SOCK_STREAM && net_sysnrs) {
+        kbox_lkl_shutdown(net_sysnrs, sock->lkl_fd, 1 /* SHUT_WR */);
+        sock->lkl_wr_shutdown = 1;
+    }
     return 0;
+}
+
+static void push_dgram_addr_locked(struct shadow_socket *sock)
+{
+    if (sock->sock_type != SOCK_DGRAM || sock->pending_dgram_addr.addrlen == 0)
+        return;
+
+    unsigned int next_tail = (sock->dgram_tail + 1) % DGRAM_ADDR_QUEUE_LEN;
+    if (next_tail == sock->dgram_head)
+        sock->dgram_head = (sock->dgram_head + 1) % DGRAM_ADDR_QUEUE_LEN;
+    sock->dgram_q[sock->dgram_tail] = sock->pending_dgram_addr;
+    sock->dgram_tail = next_tail;
+    sock->pending_dgram_addr.addrlen = 0;
 }
 
 static int shadow_flush_to_supervisor(struct shadow_socket *sock)
@@ -511,14 +556,21 @@ static int shadow_flush_to_supervisor(struct shadow_socket *sock)
         if (n > 0) {
             sock->to_supervisor_off += (size_t) n;
             sock->to_supervisor_len -= (size_t) n;
-            if (sock->to_supervisor_len == 0)
+            if (sock->to_supervisor_len == 0) {
                 sock->to_supervisor_off = 0;
+                push_dgram_addr_locked(sock);
+            }
             continue;
         }
         if (n < 0 &&
             (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
             return 0;
         return -1;
+    }
+    if (sock->lkl_eof && !sock->sp_wr_shutdown &&
+        sock->sock_type == SOCK_STREAM && sock->supervisor_fd >= 0) {
+        shutdown(sock->supervisor_fd, SHUT_WR);
+        sock->sp_wr_shutdown = 1;
     }
     return 0;
 }
@@ -540,47 +592,74 @@ static int shadow_nonfatal_recv_error(const struct shadow_socket *sock, long r)
     return 0;
 }
 
+static void pump_shadow_lkl_read(struct shadow_socket *sock)
+{
+    void *addr_arg = NULL;
+    unsigned int *addrlen_arg = NULL;
+    if (sock->sock_type == SOCK_DGRAM) {
+        sock->pending_dgram_addr.addrlen =
+            (unsigned int) sizeof(sock->pending_dgram_addr.addr);
+        addr_arg = sock->pending_dgram_addr.addr;
+        addrlen_arg = &sock->pending_dgram_addr.addrlen;
+    }
+
+    long r =
+        kbox_lkl_recvfrom(net_sysnrs, sock->lkl_fd, sock->to_supervisor_buf,
+                          (long) sizeof(sock->to_supervisor_buf),
+                          LKL_MSG_DONTWAIT, addr_arg, addrlen_arg);
+    if (r > 0) {
+        sock->to_supervisor_off = 0;
+        sock->to_supervisor_len = (size_t) r;
+        if (shadow_flush_to_supervisor(sock) < 0)
+            retire_shadow_socket(sock);
+    } else if (r == 0) {
+        sock->pending_dgram_addr.addrlen = 0;
+        if (sock->sock_type == SOCK_STREAM) {
+            sock->lkl_eof = 1;
+            if (sock->to_supervisor_len == 0 && !sock->sp_wr_shutdown &&
+                sock->supervisor_fd >= 0) {
+                shutdown(sock->supervisor_fd, SHUT_WR);
+                sock->sp_wr_shutdown = 1;
+            }
+        }
+    } else {
+        sock->pending_dgram_addr.addrlen = 0;
+        if (!shadow_nonfatal_recv_error(sock, r))
+            retire_shadow_socket(sock);
+    }
+}
+
 static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
 {
     int shadow_cnt = ctx->count - shadow_base;
+    struct pollfd lkl_pfds[MAX_SHADOW_SOCKETS];
+    int lkl_slots[MAX_SHADOW_SOCKETS];
+    int npoll = 0;
 
     pthread_mutex_lock(&shadow_lock);
     for (int si = 0; si < shadow_cnt; si++) {
         int slot = ctx->shadow_slots[si];
-        if (slot < 0 || slot >= MAX_SHADOW_SOCKETS || !shadow_sockets[slot].active)
+        int pidx = shadow_base + si;
+        if (slot < 0 || slot >= MAX_SHADOW_SOCKETS ||
+            !shadow_sockets[slot].active ||
+            shadow_sockets[slot].gen != ctx->shadow_gens[si] ||
+            shadow_sockets[slot].supervisor_fd != ctx->pfds[pidx].fd)
             continue;
 
         struct shadow_socket *sock = &shadow_sockets[slot];
-        int pidx = shadow_base + si;
 
         if (sock->listening) {
             if (ctx->pfds[pidx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-                sock->active = 0;
-                close(sock->supervisor_fd);
-                sock->supervisor_fd = -1;
+                retire_shadow_socket(sock);
                 continue;
             }
-            if (!sock->listen_notified && net_sysnrs) {
-                struct pollfd lpfd = {
-                    .fd = sock->lkl_fd,
-                    .events = POLLIN,
-                    .revents = 0,
-                };
-                struct timespec zero_ts = {0, 0};
-                long pr = kbox_lkl_ppoll(net_sysnrs, &lpfd, 1, &zero_ts, NULL,
-                                         0);
-                if (pr > 0 && (lpfd.revents & (POLLIN | POLLERR | POLLHUP))) {
-                    char wake = 'A';
-                    ssize_t wn = write(sock->supervisor_fd, &wake, 1);
-                    if (wn == 1)
-                        sock->listen_notified = 1;
-                }
-                if (getenv("KBOX_NET_TRACE"))
-                    fprintf(stderr,
-                            "kbox: net: listen slot=%d lkl=%ld notified=%d "
-                            "pr=%ld revents=%#x\n",
-                            slot, sock->lkl_fd, sock->listen_notified, pr,
-                            (unsigned) lpfd.revents);
+            if (!sock->listen_notified && net_sysnrs &&
+                npoll < MAX_SHADOW_SOCKETS) {
+                lkl_pfds[npoll].fd = sock->lkl_fd;
+                lkl_pfds[npoll].events = POLLIN;
+                lkl_pfds[npoll].revents = 0;
+                lkl_slots[npoll] = slot;
+                npoll++;
             }
             continue;
         }
@@ -588,79 +667,123 @@ static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
         /* Retry any buffered stream data before reading more. */
         if (shadow_flush_to_lkl(sock) < 0 ||
             shadow_flush_to_supervisor(sock) < 0) {
-            sock->active = 0;
-            close(sock->supervisor_fd);
-            sock->supervisor_fd = -1;
+            retire_shadow_socket(sock);
             continue;
         }
 
-        /* supervisor_fd -> LKL socket (non-blocking via sendto) */
-        if ((ctx->pfds[pidx].revents & POLLIN) && sock->to_lkl_len == 0) {
-            ssize_t n = read(sock->supervisor_fd, sock->to_lkl_buf,
-                             sizeof(sock->to_lkl_buf));
-            if (n > 0) {
-                sock->to_lkl_off = 0;
-                sock->to_lkl_len = (size_t) n;
-                if (shadow_flush_to_lkl(sock) < 0) {
-                    sock->active = 0;
-                    close(sock->supervisor_fd);
-                    continue;
+        /* supervisor_fd -> LKL socket (non-blocking via sendto). For datagram
+         * sockets, drain up to 8 queued messages (e.g. glibc sendmmsg A+AAAA)
+         * in one pass.
+         */
+        if ((ctx->pfds[pidx].revents & POLLIN) && sock->to_lkl_len == 0 &&
+            !sock->sp_eof) {
+            int max_reads = (sock->sock_type == SOCK_DGRAM) ? 8 : 1;
+            for (int riter = 0; riter < max_reads && sock->to_lkl_len == 0;
+                 riter++) {
+                ssize_t n = read(sock->supervisor_fd, sock->to_lkl_buf,
+                                 sizeof(sock->to_lkl_buf));
+                if (n > 0) {
+                    sock->to_lkl_off = 0;
+                    sock->to_lkl_len = (size_t) n;
+                    if (shadow_flush_to_lkl(sock) < 0) {
+                        retire_shadow_socket(sock);
+                        break;
+                    }
+                } else if (n == 0) {
+                    /* Tracee closed write half (shutdown SHUT_WR) or closed FD;
+                     * keep the slot alive until POLLHUP/deregister if
+                     * LKL->tracee direction may still carry responses.
+                     */
+                    sock->sp_eof = 1;
+                    if (shadow_flush_to_lkl(sock) < 0) {
+                        retire_shadow_socket(sock);
+                    }
+                    break;
+                } else {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK &&
+                        errno != EINTR)
+                        retire_shadow_socket(sock);
+                    break;
                 }
-            } else if (n == 0) {
-                sock->active = 0;
-                close(sock->supervisor_fd);
-                continue;
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK &&
-                       errno != EINTR) {
-                sock->active = 0;
-                close(sock->supervisor_fd);
-                continue;
             }
         }
 
         if (!sock->active)
-            continue; /* already closed by EOF above */
+            continue;
 
-        if (ctx->pfds[pidx].revents & (POLLHUP | POLLERR)) {
-            sock->active = 0;
-            close(sock->supervisor_fd);
-            sock->supervisor_fd = -1;
+        if (ctx->pfds[pidx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            retire_shadow_socket(sock);
             continue;
         }
 
-        /* LKL socket -> supervisor_fd.
-         * Probe every loop iteration so TCP/UDP responses are drained even when
-         * the host socketpair itself had no readable event this cycle.
-         *
-         * Flush pending IRQs first: lkl_cpu_get+put triggers IRQ processing in
-         * lkl_cpu_put, which runs softirqs that deliver packets from virtio-net
-         * driver to the socket layer. Without this, recvfrom may return EAGAIN
-         * even though net_rx already delivered a packet to the kernel.
-         */
-        if (sock->to_supervisor_len == 0) {
-            /* Flush pending LKL IRQs so socket data is available. */
-            kbox_lkl_getuid(net_sysnrs);
+        if (!sock->lkl_eof && sock->to_supervisor_len == 0 && net_sysnrs &&
+            npoll < MAX_SHADOW_SOCKETS) {
+            lkl_pfds[npoll].fd = sock->lkl_fd;
+            lkl_pfds[npoll].events = POLLIN;
+            lkl_pfds[npoll].revents = 0;
+            lkl_slots[npoll] = slot;
+            npoll++;
+        }
+    }
 
-            long r = kbox_lkl_recvfrom(net_sysnrs, sock->lkl_fd,
-                                       sock->to_supervisor_buf,
-                                       (long) sizeof(sock->to_supervisor_buf),
-                                       LKL_MSG_DONTWAIT, NULL, NULL);
-            if (r > 0) {
-                sock->to_supervisor_off = 0;
-                sock->to_supervisor_len = (size_t) r;
-            } else if (r < 0 && !shadow_nonfatal_recv_error(sock, r)) {
-                sock->active = 0;
-                close(sock->supervisor_fd);
-                continue;
+    if (npoll > 0 && net_sysnrs) {
+        /* Flush pending LKL IRQs once so socket readiness is up to date. */
+        kbox_lkl_getuid(net_sysnrs);
+
+        struct timespec zero_ts = {0, 0};
+        long pr = kbox_lkl_ppoll(net_sysnrs, lkl_pfds, (unsigned long) npoll,
+                                 &zero_ts, NULL, 0);
+        if (pr > 0) {
+            for (int k = 0; k < npoll; k++) {
+                short rev = lkl_pfds[k].revents;
+                if (rev == 0)
+                    continue;
+                struct shadow_socket *sock = &shadow_sockets[lkl_slots[k]];
+                if (!sock->active)
+                    continue;
+                if (sock->listening) {
+                    if (!sock->listen_notified &&
+                        (rev & (POLLIN | POLLERR | POLLHUP))) {
+                        char wake = 'A';
+                        ssize_t wn = write(sock->supervisor_fd, &wake, 1);
+                        if (wn == 1)
+                            sock->listen_notified = 1;
+                    }
+                    if (getenv("KBOX_NET_TRACE"))
+                        fprintf(stderr,
+                                "kbox: net: listen slot=%d lkl=%d notified=%d "
+                                "pr=%ld revents=%#x\n",
+                                lkl_slots[k], sock->lkl_fd,
+                                sock->listen_notified, pr, (unsigned) rev);
+                } else if (rev & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
+                    pump_shadow_lkl_read(sock);
+                }
             }
-        }
-
-        if (sock->to_supervisor_len > 0 &&
-            shadow_flush_to_supervisor(sock) < 0) {
-            sock->active = 0;
-            close(sock->supervisor_fd);
-            sock->supervisor_fd = -1;
-            continue;
+        } else if (pr < 0) {
+            /* Fallback if one entry in lkl_pfds was invalid. */
+            for (int k = 0; k < npoll; k++) {
+                struct shadow_socket *sock = &shadow_sockets[lkl_slots[k]];
+                if (!sock->active)
+                    continue;
+                if (sock->listening) {
+                    struct pollfd lpfd = {
+                        .fd = sock->lkl_fd,
+                        .events = POLLIN,
+                        .revents = 0,
+                    };
+                    long spr =
+                        kbox_lkl_ppoll(net_sysnrs, &lpfd, 1, &zero_ts, NULL, 0);
+                    if (spr > 0 &&
+                        (lpfd.revents & (POLLIN | POLLERR | POLLHUP))) {
+                        char wake = 'A';
+                        ssize_t wn = write(sock->supervisor_fd, &wake, 1);
+                        if (wn == 1)
+                            sock->listen_notified = 1;
+                    }
+                } else {
+                    pump_shadow_lkl_read(sock);
+                }
+            }
         }
     }
     pthread_mutex_unlock(&shadow_lock);
@@ -874,6 +997,7 @@ static void *slirp_event_loop(void *arg)
 
         /* Add shadow socket supervisor FDs. */
         int shadow_base = ctx.count;
+        int has_data_sockets = 0;
         pthread_mutex_lock(&shadow_lock);
         for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
             if (!shadow_sockets[i].active)
@@ -884,16 +1008,23 @@ static void *slirp_event_loop(void *arg)
             if (si >= MAX_SHADOW_SOCKETS)
                 break;
             ctx.shadow_slots[si] = i;
+            ctx.shadow_gens[si] = shadow_sockets[i].gen;
+            if (!shadow_sockets[i].listening && !shadow_sockets[i].lkl_eof)
+                has_data_sockets = 1;
             ctx.pfds[ctx.count].fd = shadow_sockets[i].supervisor_fd;
             ctx.pfds[ctx.count].events =
-                shadow_sockets[i].listening ? 0 : POLLIN;
+                (shadow_sockets[i].listening || shadow_sockets[i].sp_eof)
+                    ? 0
+                    : POLLIN;
             ctx.pfds[ctx.count].revents = 0;
             ctx.count++;
         }
         pthread_mutex_unlock(&shadow_lock);
 
-        /* Compute timeout: min of SLIRP timeout, timer timeout, 100ms cap. */
-        int timeout_ms = 100;
+        /* Compute timeout: min of SLIRP timeout, timer timeout, 100ms cap
+         * (or 5ms when active data sockets may receive local LKL packets).
+         */
+        int timeout_ms = has_data_sockets ? 5 : 100;
         if (slirp_timeout != UINT32_MAX && (int) slirp_timeout < timeout_ms)
             timeout_ms = (int) slirp_timeout;
         int timer_ms = next_timer_timeout_ms();
@@ -1137,7 +1268,8 @@ static int host_route_ioctl(const struct kbox_sysnrs *sysnrs,
     rt.rt_flags = 0x0005; /* RTF_UP | RTF_HOST */
     rt.rt_dev = devname;
 
-    long ret = lkl_syscall6(LKL_NR_IOCTL, sock, (long) cmd, (long) &rt, 0, 0, 0);
+    long ret =
+        lkl_syscall6(LKL_NR_IOCTL, sock, (long) cmd, (long) &rt, 0, 0, 0);
     kbox_lkl_close(sysnrs, sock);
     return (int) ret;
 }
@@ -1375,10 +1507,18 @@ int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type)
             shadow_sockets[i].sock_type = sock_type;
             shadow_sockets[i].listening = 0;
             shadow_sockets[i].listen_notified = 0;
+            shadow_sockets[i].lkl_eof = 0;
+            shadow_sockets[i].sp_eof = 0;
+            shadow_sockets[i].lkl_wr_shutdown = 0;
+            shadow_sockets[i].sp_wr_shutdown = 0;
             shadow_sockets[i].to_lkl_off = 0;
             shadow_sockets[i].to_lkl_len = 0;
             shadow_sockets[i].to_supervisor_off = 0;
             shadow_sockets[i].to_supervisor_len = 0;
+            shadow_sockets[i].pending_dgram_addr.addrlen = 0;
+            shadow_sockets[i].dgram_head = 0;
+            shadow_sockets[i].dgram_tail = 0;
+            shadow_sockets[i].gen = next_shadow_gen++;
             shadow_sockets[i].active = 1;
             reserved = 1;
             break;
@@ -1397,26 +1537,98 @@ int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type)
     return 0;
 }
 
+static void flush_shadow_socket_to_lkl_locked(struct shadow_socket *sock)
+{
+    if (!sock->active || sock->listening || sock->supervisor_fd < 0 ||
+        !net_sysnrs)
+        return;
+
+    for (int iter = 0; iter < 16; iter++) {
+        if (sock->to_lkl_len == 0) {
+            ssize_t n = read(sock->supervisor_fd, sock->to_lkl_buf,
+                             sizeof(sock->to_lkl_buf));
+            if (n <= 0)
+                break;
+            sock->to_lkl_off = 0;
+            sock->to_lkl_len = (size_t) n;
+        }
+        if (shadow_flush_to_lkl(sock) < 0)
+            break;
+        if (sock->to_lkl_len > 0) {
+            struct pollfd wp = {
+                .fd = sock->lkl_fd,
+                .events = POLLOUT,
+                .revents = 0,
+            };
+            struct timespec wts = {0, 20 * 1000 * 1000};
+            if (kbox_lkl_ppoll(net_sysnrs, &wp, 1, &wts, NULL, 0) <= 0 ||
+                !(wp.revents & POLLOUT))
+                break;
+            if (shadow_flush_to_lkl(sock) < 0 || sock->to_lkl_len > 0)
+                break;
+        }
+    }
+}
+
+void kbox_net_flush_socket(int lkl_fd)
+{
+    pthread_mutex_lock(&shadow_lock);
+    for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
+        if (shadow_sockets[i].active && shadow_sockets[i].lkl_fd == lkl_fd) {
+            flush_shadow_socket_to_lkl_locked(&shadow_sockets[i]);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&shadow_lock);
+}
+
+int kbox_net_pop_dgram_addr(int lkl_fd,
+                            void *addr_out,
+                            unsigned int *addrlen_io,
+                            int peek)
+{
+    int found = 0;
+    pthread_mutex_lock(&shadow_lock);
+    for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
+        struct shadow_socket *s = &shadow_sockets[i];
+        if (!s->active || s->lkl_fd != lkl_fd)
+            continue;
+        if (s->dgram_head != s->dgram_tail) {
+            const struct dgram_addr_entry *e = &s->dgram_q[s->dgram_head];
+            if (addr_out && addrlen_io) {
+                unsigned int cp =
+                    e->addrlen < *addrlen_io ? e->addrlen : *addrlen_io;
+                if (cp > 0)
+                    memcpy(addr_out, e->addr, cp);
+                *addrlen_io = e->addrlen;
+            }
+            if (!peek)
+                s->dgram_head = (s->dgram_head + 1) % DGRAM_ADDR_QUEUE_LEN;
+            found = 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&shadow_lock);
+    return found;
+}
+
 void kbox_net_deregister_socket(int lkl_fd)
 {
-    /* Close supervisor_fd and mark inactive under the lock.
-     * If the event loop has this FD in its current pollfd[] snapshot, poll()
-     * sees POLLNVAL which is handled like POLLHUP (benign). This is safer than
-     * deferring the close, which lets register_socket reuse the slot before the
-     * FD is closed, permanently leaking the old descriptor.
+    /* Drain any queued guest-written data into LKL before closing supervisor_fd
+     * and the LKL socket (otherwise write()+close() drops the reply).
+     * Close supervisor_fd and mark inactive under the lock.
      */
     pthread_mutex_lock(&shadow_lock);
     for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
         if (shadow_sockets[i].active && shadow_sockets[i].lkl_fd == lkl_fd) {
-            close(shadow_sockets[i].supervisor_fd);
-            shadow_sockets[i].supervisor_fd = -1;
-            shadow_sockets[i].active = 0;
+            flush_shadow_socket_to_lkl_locked(&shadow_sockets[i]);
+            retire_shadow_socket(&shadow_sockets[i]);
             break;
         }
     }
     pthread_mutex_unlock(&shadow_lock);
 
-    /* Wake the event loop so it closes the supervisor_fd promptly. */
+    /* Wake the event loop so it drops the closed supervisor_fd promptly. */
     char c = 'D';
     ssize_t n = write(wakeup_pipe[1], &c, 1);
     (void) n;
@@ -1485,6 +1697,23 @@ int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type)
     (void) supervisor_fd;
     (void) sock_type;
     return -1;
+}
+
+int kbox_net_pop_dgram_addr(int lkl_fd,
+                            void *addr_out,
+                            unsigned int *addrlen_io,
+                            int peek)
+{
+    (void) lkl_fd;
+    (void) addr_out;
+    (void) addrlen_io;
+    (void) peek;
+    return 0;
+}
+
+void kbox_net_flush_socket(int lkl_fd)
+{
+    (void) lkl_fd;
 }
 
 void kbox_net_deregister_socket(int lkl_fd)

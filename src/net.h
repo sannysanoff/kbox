@@ -21,6 +21,11 @@ int kbox_net_del_host_route(const struct kbox_sysnrs *sysnrs,
 void kbox_net_cleanup(void);
 int kbox_net_is_active(void);
 int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type);
+int kbox_net_pop_dgram_addr(int lkl_fd,
+                            void *addr_out,
+                            unsigned int *addrlen_io,
+                            int peek);
+void kbox_net_flush_socket(int lkl_fd);
 void kbox_net_deregister_socket(int lkl_fd);
 void kbox_net_set_listening(int lkl_fd);
 void kbox_net_clear_listening_notify(int lkl_fd);

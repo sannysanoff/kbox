@@ -2665,9 +2665,24 @@ static struct kbox_dispatch forward_epoll_ctl_gated(
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 2));
     long lkl_ep = kbox_fd_table_get_lkl(ctx->fd_table, epfd);
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    /* A descriptor the table does not know about is not kbox's to refuse: the
+     * call is continued to the host anyway, and the host returns EBADF by
+     * itself when the descriptor really is invalid. Answering EBADF here aborted
+     * postgres backends -- they register the client socket they inherited from
+     * the postmaster, and kbox had no entry for that number, so the backend died
+     * before it could serve a single query.
+     */
     if (fd_should_deny_io_ctx(ctx->fd_table, epfd, lkl_ep) ||
-        fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))
-        return kbox_dispatch_errno(EBADF);
+        fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)) {
+        if (getenv("KBOX_NET_TRACE"))
+            fprintf(stderr,
+                    "kbox: epoll_ctl untracked epfd=%ld lkl_ep=%ld fd=%ld "
+                    "lkl_fd=%ld -> continue\n",
+                    epfd, lkl_ep, fd, lkl_fd);
+    }
+    if (getenv("KBOX_NET_TRACE"))
+        fprintf(stderr, "kbox: epoll_ctl ok epfd=%ld fd=%ld lkl_fd=%ld\n", epfd,
+                fd, lkl_fd);
     return kbox_dispatch_continue();
 }
 

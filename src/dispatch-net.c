@@ -444,8 +444,13 @@ static struct kbox_dispatch dispatch_accept_common(
     long lkl_fd = resolve_lkl_socket_entry(ctx, fd, &entry);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd))) {
+        if (getenv("KBOX_NET_TRACE"))
+            fprintf(stderr,
+                    "kbox: net: accept continue fd=%ld lkl=%ld shadow_only=%d\n",
+                    fd, lkl_fd, lkl_fd == KBOX_LKL_FD_SHADOW_ONLY);
         return kbox_dispatch_continue();
+    }
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
 

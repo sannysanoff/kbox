@@ -4174,8 +4174,16 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
         int memfd = (src && src->shadow_sp >= 0) ? src->shadow_sp : -1;
         int own_memfd = 0;
         int writeback = src ? src->shadow_writeback : 0;
+        long src_flags = kbox_lkl_fcntl(ctx->sysnrs, lkl_old, F_GETFL, 0);
 
-        if (memfd < 0) {
+        /* Only for read-only sources. A writable redirect has to keep writing
+         * into LKL -- redirecting ">" onto fd 1 through a memfd would swallow
+         * every byte the guest writes and leave the file empty, which is what
+         * made every script written inside a container run as a no-op. */
+        if (src_flags >= 0 && (src_flags & O_ACCMODE) != O_RDONLY)
+            memfd = -2;
+
+        if (memfd != -2 && memfd < 0) {
             memfd = kbox_shadow_create(ctx->sysnrs, lkl_old);
             if (memfd < 0)
                 return kbox_dispatch_errno(-memfd);
@@ -4183,26 +4191,29 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
             own_memfd = 1;
         }
 
-        int injected = request_addfd_at(ctx, req, memfd, (int) newfd, 0);
-        if (injected < 0) {
-            if (own_memfd)
-                close(memfd);
-            return kbox_dispatch_errno(-injected);
-        }
+        if (memfd != -2) {
+            int injected = request_addfd_at(ctx, req, memfd, (int) newfd, 0);
+            if (injected < 0) {
+                if (own_memfd)
+                    close(memfd);
+                return kbox_dispatch_errno(-injected);
+            }
 
-        cleanup_replaced_fd_tracking(ctx, newfd);
-        if (kbox_fd_table_insert_at(ctx->fd_table, newfd, lkl_old, 0) < 0) {
-            if (own_memfd)
-                close(memfd);
-            return kbox_dispatch_errno(EBADF);
+            cleanup_replaced_fd_tracking(ctx, newfd);
+            if (kbox_fd_table_insert_at(ctx->fd_table, newfd, lkl_old, 0) < 0) {
+                if (own_memfd)
+                    close(memfd);
+                return kbox_dispatch_errno(EBADF);
+            }
+            struct kbox_fd_entry *dst =
+                fd_table_entry(ctx->fd_table, newfd);
+            if (dst) {
+                dst->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
+                dst->shadow_sp = own_memfd ? memfd : -1;
+                dst->shadow_writeback = writeback;
+            }
+            return kbox_dispatch_value((int64_t) newfd);
         }
-        struct kbox_fd_entry *dst = fd_table_entry(ctx->fd_table, newfd);
-        if (dst) {
-            dst->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
-            dst->shadow_sp = own_memfd ? memfd : -1;
-            dst->shadow_writeback = writeback;
-        }
-        return kbox_dispatch_value((int64_t) newfd);
     }
 
     struct kbox_fd_entry *orig = fd_table_entry(ctx->fd_table, oldfd);
@@ -4316,8 +4327,16 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
         int memfd = (src && src->shadow_sp >= 0) ? src->shadow_sp : -1;
         int own_memfd = 0;
         int writeback = src ? src->shadow_writeback : 0;
+        long src_flags = kbox_lkl_fcntl(ctx->sysnrs, lkl_old, F_GETFL, 0);
 
-        if (memfd < 0) {
+        /* Only for read-only sources. A writable redirect has to keep writing
+         * into LKL -- redirecting ">" onto fd 1 through a memfd would swallow
+         * every byte the guest writes and leave the file empty, which is what
+         * made every script written inside a container run as a no-op. */
+        if (src_flags >= 0 && (src_flags & O_ACCMODE) != O_RDONLY)
+            memfd = -2;
+
+        if (memfd != -2 && memfd < 0) {
             memfd = kbox_shadow_create(ctx->sysnrs, lkl_old);
             if (memfd < 0)
                 return kbox_dispatch_errno(-memfd);
@@ -4325,26 +4344,29 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
             own_memfd = 1;
         }
 
-        int injected = request_addfd_at(ctx, req, memfd, (int) newfd, 0);
-        if (injected < 0) {
-            if (own_memfd)
-                close(memfd);
-            return kbox_dispatch_errno(-injected);
-        }
+        if (memfd != -2) {
+            int injected = request_addfd_at(ctx, req, memfd, (int) newfd, 0);
+            if (injected < 0) {
+                if (own_memfd)
+                    close(memfd);
+                return kbox_dispatch_errno(-injected);
+            }
 
-        cleanup_replaced_fd_tracking(ctx, newfd);
-        if (kbox_fd_table_insert_at(ctx->fd_table, newfd, lkl_old, 0) < 0) {
-            if (own_memfd)
-                close(memfd);
-            return kbox_dispatch_errno(EBADF);
+            cleanup_replaced_fd_tracking(ctx, newfd);
+            if (kbox_fd_table_insert_at(ctx->fd_table, newfd, lkl_old, 0) < 0) {
+                if (own_memfd)
+                    close(memfd);
+                return kbox_dispatch_errno(EBADF);
+            }
+            struct kbox_fd_entry *dst =
+                fd_table_entry(ctx->fd_table, newfd);
+            if (dst) {
+                dst->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
+                dst->shadow_sp = own_memfd ? memfd : -1;
+                dst->shadow_writeback = writeback;
+            }
+            return kbox_dispatch_value((int64_t) newfd);
         }
-        struct kbox_fd_entry *dst = fd_table_entry(ctx->fd_table, newfd);
-        if (dst) {
-            dst->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
-            dst->shadow_sp = own_memfd ? memfd : -1;
-            dst->shadow_writeback = writeback;
-        }
-        return kbox_dispatch_value((int64_t) newfd);
     }
 
     struct kbox_fd_entry *orig = fd_table_entry(ctx->fd_table, oldfd);

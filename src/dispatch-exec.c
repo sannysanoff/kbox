@@ -62,6 +62,10 @@
  */
 static uint64_t reexec_current_stack_top;
 
+/* See the comment at the vfork snapshot site: a downgraded vfork shares no
+ * memory, so there is nothing to put back. */
+static const int s_kbox_vfork_snapshot = 0;
+
 /* mmap dispatch: if the FD is a virtual FD with no host shadow, create the
  * shadow on demand (lazy shadow) and inject it into the tracee at the same FD
  * number, then CONTINUE so the host kernel mmaps the real fd.
@@ -1139,6 +1143,7 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
     char *buf = malloc(65536);
     if (!buf)
         goto fail;
+    long long copied = 0;
     for (;;) {
         ssize_t n = pread(*exec_memfd, buf, 65536, body);
         if (n < 0) {
@@ -1152,8 +1157,14 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
             goto fail;
         }
         body += n;
+        copied += n;
     }
     free(buf);
+    if (ctx->verbose)
+        fprintf(stderr,
+                "kbox: exec %s: script hdr=%zd body_start=%lld copied=%lld "
+                "shebang=%d\n",
+                pathbuf, hn, (long long) (body - copied), copied, shebang_len);
 
     if (ctx->verbose)
         fprintf(stderr, "kbox: exec %s: shebang %s -> /proc/self/fd/%d\n",
@@ -1496,8 +1507,17 @@ static struct kbox_dispatch forward_execve_impl(
             size_t len = (size_t) (hi + margin - lo);
             if (len > 65536)
                 len = 65536;
-            for (size_t i = 0;
-                 i < sizeof(ctx->vfork_pending) / sizeof(ctx->vfork_pending[0]);
+            /* Snapshotting is off: clone(CLONE_VFORK) is downgraded to a plain
+             * fork in forward_clone3, so the child writes into its own copy of
+             * these pages and the parent was never touched. Restoring a
+             * snapshot anyway rewinds the parent's stack over the bookkeeping
+             * glibc's posix_spawn has just done, and posix_spawn -- which is
+             * what system(), popen and initdb all use -- then dies with
+             * SIGSEGV before it can report anything.
+             */
+            for (size_t i = 0; s_kbox_vfork_snapshot &&
+                                i < sizeof(ctx->vfork_pending) /
+                                        sizeof(ctx->vfork_pending[0]);
                  i++) {
                 struct kbox_vfork_pending *slot = &ctx->vfork_pending[i];
                 if (slot->saved)

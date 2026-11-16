@@ -32,7 +32,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -2657,154 +2656,19 @@ static struct kbox_dispatch forward_fd_gated_continue(
     return kbox_dispatch_continue();
 }
 
-/* Registered guest descriptors whose readiness arrives on a shadow socketpair.
- * epoll_ctl must be given a host descriptor, so the shadow is what actually gets
- * registered; this table keeps the duplicate alive and reuses its number for
- * MOD and DEL, which the kernel matches by descriptor as well as by file.
- */
-struct kbox_epoll_reg {
-    long guest_fd;
-    int dup_fd;
-};
-static struct kbox_epoll_reg g_epoll_regs[64];
-
-/* A zero-filled entry would look like a live registration of fd 0. */
-static void kbox_epoll_regs_init(void) __attribute__((constructor));
-static void kbox_epoll_regs_init(void)
-{
-    for (size_t i = 0; i < sizeof(g_epoll_regs) / sizeof(g_epoll_regs[0]); i++) {
-        g_epoll_regs[i].guest_fd = -1;
-        g_epoll_regs[i].dup_fd = -1;
-    }
-}
-
-struct kbox_epoll_event_raw {
-    uint32_t events;
-    uint64_t data;
-} __attribute__((packed));
-
-static int kbox_epoll_reg_find(long guest_fd)
-{
-    for (size_t i = 0; i < sizeof(g_epoll_regs) / sizeof(g_epoll_regs[0]); i++)
-        if (g_epoll_regs[i].dup_fd >= 0 && g_epoll_regs[i].guest_fd == guest_fd)
-            return (int) i;
-    return -1;
-}
-
-static void kbox_epoll_reg_put(long guest_fd, int dup_fd)
-{
-    for (size_t i = 0; i < sizeof(g_epoll_regs) / sizeof(g_epoll_regs[0]); i++) {
-        if (g_epoll_regs[i].dup_fd < 0) {
-            g_epoll_regs[i].guest_fd = guest_fd;
-            g_epoll_regs[i].dup_fd = dup_fd;
-            return;
-        }
-    }
-    close(dup_fd);
-}
-
-static void kbox_epoll_reg_drop(long guest_fd)
-{
-    int i = kbox_epoll_reg_find(guest_fd);
-    if (i >= 0) {
-        close(g_epoll_regs[i].dup_fd);
-        g_epoll_regs[i].dup_fd = -1;
-        g_epoll_regs[i].guest_fd = -1;
-    }
-}
-
-/* Gate epoll_ctl: two FD args (epfd=arg0, fd=arg2).
- *
- * A guest socket's number means nothing to the host, so refusing the call with
- * EBADF kills the caller (postgres took its backends down with
- * "epoll_ctl() failed: Bad file descriptor") and answering success would leave
- * the wait asleep forever. Perform the registration here against the shadow
- * that carries that socket's readiness instead.
- */
+/* Gate epoll_ctl: two FD args (epfd=arg0, fd=arg2). */
 static struct kbox_dispatch forward_epoll_ctl_gated(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx)
 {
     long epfd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
-    long op = to_c_long_arg(kbox_syscall_request_arg(req, 1));
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 2));
     long lkl_ep = kbox_fd_table_get_lkl(ctx->fd_table, epfd);
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
-
-    if (!fd_should_deny_io_ctx(ctx->fd_table, epfd, lkl_ep) &&
-        !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))
-        return kbox_dispatch_continue();
-
-    struct kbox_fd_entry *he = fd_table_entry(ctx->fd_table, fd);
-    int target = -1;
-    if (he) {
-        if (he->shadow_sp >= 0)
-            target = (int) he->shadow_sp;
-        else if (he->host_fd >= 0)
-            target = (int) he->host_fd;
-    }
-    if (target < 0)
+    if (fd_should_deny_io_ctx(ctx->fd_table, epfd, lkl_ep) ||
+        fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))
         return kbox_dispatch_errno(EBADF);
-
-    pid_t pid = kbox_syscall_request_pid(req);
-
-    int my_ep = dup_tracee_fd(pid, (int) epfd);
-    if (my_ep < 0)
-        return kbox_dispatch_errno(-my_ep);
-
-    int my_target;
-    int reg_index = kbox_epoll_reg_find(fd);
-    if (op == EPOLL_CTL_DEL || op == EPOLL_CTL_MOD) {
-        my_target = reg_index >= 0 ? g_epoll_regs[reg_index].dup_fd : -1;
-        if (my_target < 0) {
-            close(my_ep);
-            return kbox_dispatch_errno(ENOENT);
-        }
-    } else {
-        my_target = dup_tracee_fd(pid, target);
-        if (my_target < 0) {
-            close(my_ep);
-            return kbox_dispatch_errno(-my_target);
-        }
-    }
-
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof(ev));
-    if (op != EPOLL_CTL_DEL) {
-        uint64_t ev_ptr = kbox_syscall_request_arg(req, 3);
-        struct kbox_epoll_event_raw raw;
-        if (ev_ptr == 0) {
-            close(my_ep);
-            if (op == EPOLL_CTL_ADD && my_target >= 0)
-                kbox_epoll_reg_put(fd, my_target);
-            return kbox_dispatch_errno(EFAULT);
-        }
-        int rc = guest_mem_read(ctx, pid, ev_ptr, &raw, sizeof(raw));
-        if (rc < 0) {
-            close(my_ep);
-            if (op == EPOLL_CTL_ADD && my_target >= 0)
-                kbox_epoll_reg_put(fd, my_target);
-            return kbox_dispatch_errno(-rc);
-        }
-        ev.events = raw.events;
-        ev.data.u64 = raw.data;
-    }
-
-    int r = epoll_ctl(my_ep, (int) op, my_target,
-                      op == EPOLL_CTL_DEL ? NULL : &ev);
-    int saved = errno;
-    close(my_ep);
-
-    if (op == EPOLL_CTL_ADD && r == 0)
-        kbox_epoll_reg_put(fd, my_target);
-    else if (op == EPOLL_CTL_ADD)
-        close(my_target);
-    else if (op == EPOLL_CTL_DEL)
-        kbox_epoll_reg_drop(fd);
-
-    if (r < 0)
-        return kbox_dispatch_errno(saved);
-    return kbox_dispatch_value(0);
+    return kbox_dispatch_continue();
 }
 
 /* Translate /proc/self and /proc/thread-self references to the tracee's

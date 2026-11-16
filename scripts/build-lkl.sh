@@ -136,10 +136,6 @@ if [ ! -f "${LKL_SRC}/.config" ]; then
         CONFIG_DEBUG_FS \
         CONFIG_FILE_LOCKING \
         CONFIG_SIGNALFD \
-        CONFIG_SYSVIPC \
-        CONFIG_SYSVIPC_SYSCTL \
-        CONFIG_SHMEM \
-        CONFIG_TMPFS_POSIX_ACL \
         CONFIG_TIMERFD \
         CONFIG_EVENTFD \
         CONFIG_FS_POSIX_ACL \

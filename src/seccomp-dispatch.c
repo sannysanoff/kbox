@@ -3466,6 +3466,15 @@ static struct kbox_dispatch forward_sendfile(
     }
 
 done:
+    /* The write landed, but the name it landed under is cached: a reader that
+     * opens the same path next gets the pre-write shadow and sees an empty
+     * file. forward_write drops that cache after every write, and this path
+     * has to do the same -- otherwise cp reports success, the destination
+     * holds the bytes, and everything that reads it back finds nothing.
+     */
+    if (total > 0)
+        invalidate_path_shadow_cache(ctx);
+
     /* Update offset in tracee memory if provided.  Best-effort: data has
      * already been transferred, so return the byte count even if the
      * offset writeback fails (avoids data duplication on retry).

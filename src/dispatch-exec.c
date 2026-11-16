@@ -1014,6 +1014,53 @@ static int relocate_overlapping_exec_vecs(const struct kbox_supervisor_ctx *ctx,
  *
  * Returns 0, or -errno.
  */
+/* Escape a path for POSIX sh, in single quotes. */
+static void shell_quote_into(char *out, size_t size, const char *s)
+{
+    size_t n = 0;
+    if (n + 1 < size)
+        out[n++] = '\'';
+    for (; *s && n + 5 < size; s++) {
+        if (*s == '\'') {
+            memcpy(out + n, "'\\''", 4);
+            n += 4;
+        } else {
+            out[n++] = *s;
+        }
+    }
+    if (n + 1 < size)
+        out[n++] = '\'';
+    out[n] = '\0';
+}
+
+/* Does this shebang run a POSIX shell? Either the interpreter itself is one, or
+ * it is an exec wrapper (env, busybox) whose first argument names one. */
+static int shebang_runs_a_shell(const char *interp_name, const char *arg,
+                                size_t arg_len)
+{
+    static const char *const shells[] = {"sh",  "bash", "dash", "ash",
+                                         "ksh", "zsh",  "mksh", NULL};
+    const char *names[2] = {interp_name, NULL};
+    char argbuf[64];
+
+    if (arg && arg_len > 0 && arg_len < sizeof(argbuf)) {
+        memcpy(argbuf, arg, arg_len);
+        argbuf[arg_len] = '\0';
+        names[1] = argbuf;
+    }
+    for (size_t i = 0; i < 2; i++) {
+        if (!names[i])
+            continue;
+        const char *slash = strrchr(names[i], '/');
+        const char *base = (slash && slash[1]) ? slash + 1 : names[i];
+        for (size_t k = 0; shells[k]; k++) {
+            if (strcmp(base, shells[k]) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
                                   const struct kbox_syscall_request *req,
                                   int *exec_memfd, const char *pathbuf)
@@ -1228,6 +1275,41 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
     if (write(script_memfd, shebang, (size_t) shebang_len) !=
         (ssize_t) shebang_len)
         goto fail;
+
+    /* A script's $0 is the path the kernel was given, and here that is the
+     * descriptor carrying this copy, not the script's own name. Shell launchers
+     * derive their install layout from it -- base_dir=$(dirname $0)/.. is in
+     * kafka-run-class.sh and in every other Apache launcher -- and end up with
+     * an empty classpath. So the copy starts by re-execing the interpreter on
+     * the real path. The guest file still carries its original shebang, so the
+     * second pass runs the script exactly as written: no loop.
+     */
+    if (shebang_runs_a_shell(interp_name, hdr + arg_start, arg_len)) {
+        char qinterp[600];
+        char qscript[KBOX_MAX_PATH + 8];
+        char qarg[200];
+        char prologue[1400];
+        int prologue_len;
+
+        shell_quote_into(qinterp, sizeof(qinterp), interp);
+        shell_quote_into(qscript, sizeof(qscript), pathbuf);
+        if (arg_len > 0 && arg_len < 128) {
+            char argbuf[128];
+            memcpy(argbuf, hdr + arg_start, arg_len);
+            argbuf[arg_len] = '\0';
+            shell_quote_into(qarg, sizeof(qarg), argbuf);
+            prologue_len = snprintf(prologue, sizeof(prologue),
+                                    "exec %s %s %s \"$@\"\n", qinterp, qarg,
+                                    qscript);
+        } else {
+            prologue_len = snprintf(prologue, sizeof(prologue),
+                                    "exec %s %s \"$@\"\n", qinterp, qscript);
+        }
+        if (prologue_len > 0 && (size_t) prologue_len < sizeof(prologue) &&
+            write(script_memfd, prologue, (size_t) prologue_len) !=
+                (ssize_t) prologue_len)
+            goto fail;
+    }
 
     char *buf = malloc(65536);
     if (!buf)

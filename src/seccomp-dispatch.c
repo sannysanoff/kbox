@@ -3757,6 +3757,20 @@ static struct kbox_dispatch forward_fcntl(
             return kbox_dispatch_continue();
     }
 
+    /* LKL's fcntl_setlk dereferences lock state it does not have for files this
+     * sandbox backs on the host, and the resulting SIGSEGV takes the daemon --
+     * and every container running in it -- down. Hit by Kafka's log-directory
+     * lock. A single-writer sandbox has nobody to contend with, so report the
+     * lock as taken rather than asking LKL to track it. F_GETLK has to fill a
+     * struct flock the dispatcher cannot see through, so leave it to the guest
+     * to treat as unsupported.
+     */
+    if (cmd == F_SETLK || cmd == F_SETLKW)
+        return kbox_dispatch_value(0);
+    if (cmd == F_GETLK || cmd == F_OFD_GETLK || cmd == F_OFD_SETLK ||
+        cmd == F_OFD_SETLKW)
+        return kbox_dispatch_errno(ENOSYS);
+
     /* F_SETFL: translate host open flags to LKL before forwarding. */
     if (cmd == F_SETFL)
         arg = host_to_lkl_open_flags(arg);

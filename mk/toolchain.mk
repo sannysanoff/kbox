@@ -27,7 +27,7 @@ endif
 CFLAGS  += -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -Wshadow
 CFLAGS  += -Wno-unused-parameter
 CFLAGS  += -Iinclude -Isrc
-LDFLAGS += -Wl,-z,noexecstack -Wl,-z,separate-code
+LDFLAGS += -Wl,-z,noexecstack -Wl,-z,separate-code -rdynamic
 
 # Disable link relaxation of riscv64 architecture to prevent long link time
 ifeq ($(ARCH),riscv64)

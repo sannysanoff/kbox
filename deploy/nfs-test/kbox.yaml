@@ -71,10 +71,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kboxd
-          image: kbox-nfs-test/kbox:v53
+          image: kbox-nfs-test/kbox:v68
           imagePullPolicy: IfNotPresent
           args:
-            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml -v
+            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false
@@ -112,7 +112,7 @@ spec:
             periodSeconds: 2
             failureThreshold: 150
         - name: shim
-          image: kbox-nfs-test/kbox:v53
+          image: kbox-nfs-test/kbox:v68
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

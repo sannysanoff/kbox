@@ -143,8 +143,9 @@ static int synthesize_proc_magic_link(const struct kbox_syscall_request *req,
 
     const char *target = NULL;
     if (strcmp(tail, "exe") == 0) {
-        if (ctx->guest_exe[0])
-            target = ctx->guest_exe;
+        const char *exe = kbox_guest_exe_for(ctx, pid);
+        if (exe[0])
+            target = exe;
     } else if (strcmp(tail, "cwd") == 0) {
         target = ctx->host_cwd;
     } else if (strcmp(tail, "root") == 0) {

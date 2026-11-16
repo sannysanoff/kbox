@@ -62,6 +62,42 @@
  */
 static uint64_t reexec_current_stack_top;
 
+/* /proc/self/exe for a given process: the path it last exec'd, else the one the
+ * container was started with. */
+const char *kbox_guest_exe_for(struct kbox_supervisor_ctx *ctx, pid_t pid)
+{
+    for (size_t i = 0; i < sizeof(ctx->exe_map) / sizeof(ctx->exe_map[0]); i++) {
+        if (ctx->exe_map[i].pid == pid && ctx->exe_map[i].path[0])
+            return ctx->exe_map[i].path;
+    }
+    return ctx->guest_exe;
+}
+
+void kbox_guest_exe_set(struct kbox_supervisor_ctx *ctx, pid_t pid,
+                        const char *path)
+{
+    size_t n = sizeof(ctx->exe_map) / sizeof(ctx->exe_map[0]);
+    size_t free_slot = n;
+
+    if (!path || !path[0])
+        return;
+
+    for (size_t i = 0; i < n; i++) {
+        if (ctx->exe_map[i].pid == pid) {
+            snprintf(ctx->exe_map[i].path, sizeof(ctx->exe_map[i].path), "%s",
+                     path);
+            return;
+        }
+        if (free_slot == n && ctx->exe_map[i].pid == 0)
+            free_slot = i;
+    }
+    if (free_slot < n) {
+        ctx->exe_map[free_slot].pid = pid;
+        snprintf(ctx->exe_map[free_slot].path,
+                 sizeof(ctx->exe_map[free_slot].path), "%s", path);
+    }
+}
+
 /* See the comment at the vfork snapshot site: a downgraded vfork shares no
  * memory, so there is nothing to put back. */
 static const int s_kbox_vfork_snapshot = 0;
@@ -1105,10 +1141,63 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
         snprintf(interp_name, sizeof(interp_name), "%s",
                  (slash && slash[1]) ? slash + 1 : interp);
     }
-    const char *interp_ref = NULL;
+    /* Give the interpreter a path whose basename is its own name. The kernel
+     * sets the interpreter's argv[0] to the path in the shebang, and multi-call
+     * binaries dispatch on it: busybox answers "10: applet not found" for
+     * /proc/self/fd/10, and uutils coreutils refuses the exec outright. The
+     * link target stays the injected descriptor, so the bytes still come from
+     * the guest's own interpreter.
+     *
+     * The directory has to sit on a mount the tracee shares with this process:
+     * /dev/shm is a tmpfs of the pod, /tmp is tried second because some
+     * containers get their own tmpfs there.
+     */
+    static char interp_link[320];
+    int have_link_ref = 0;
+    interp_link[0] = '\0';
+    {
+        static const char *const link_bases[] = {"/dev/shm/kbox-exec-links",
+                                                 "/tmp/kbox-exec-links"};
+        static unsigned exec_link_seq;
+        char link_path[320] = {0};
+
+        for (size_t b = 0;
+             b < sizeof(link_bases) / sizeof(link_bases[0]) && !link_path[0];
+             b++) {
+            (void) mkdir(link_bases[b], 0777);
+            for (unsigned attempt = 0; attempt < 8; attempt++) {
+                unsigned seq =
+                    __atomic_add_fetch(&exec_link_seq, 1, __ATOMIC_RELAXED);
+                char link_dir[256];
+                snprintf(link_dir, sizeof(link_dir), "%s/%d-%u", link_bases[b],
+                         (int) getpid(), seq);
+                if (mkdir(link_dir, 0777) == 0) {
+                    char candidate[320];
+                    snprintf(candidate, sizeof(candidate), "%s/%s", link_dir,
+                             interp_name);
+                    char target[64];
+                    snprintf(target, sizeof(target), "/proc/self/fd/%d",
+                             tracee_interp_fd);
+                    if (symlink(target, candidate) == 0)
+                        snprintf(link_path, sizeof(link_path), "%s", candidate);
+                    else
+                        (void) rmdir(link_dir);
+                    if (link_path[0])
+                        break;
+                }
+            }
+        }
+
+        if (link_path[0])
+            have_link_ref = 1;
+        if (link_path[0])
+            memcpy(interp_link, link_path, sizeof(interp_link));
+    }
+
 
     char shebang[512];
     int shebang_len;
+    const char *interp_ref = have_link_ref ? interp_link : NULL;
     if (!interp_ref) {
         /* Fall back to the memfd path: fine for interpreters that do not
          * dispatch on argv[0], broken for busybox. */
@@ -1559,6 +1648,8 @@ static struct kbox_dispatch forward_execve_impl(
                     pathbuf, strerror(-rc));
         return kbox_dispatch_errno(ENOEXEC);
     }
+
+    kbox_guest_exe_set(ctx, pid, pathbuf);
 
     if (ctx->verbose)
         fprintf(stderr, "kbox: exec %s -> /proc/self/fd/%d\n", pathbuf,

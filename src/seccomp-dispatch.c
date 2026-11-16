@@ -4492,9 +4492,12 @@ static struct kbox_dispatch forward_newfstatat(
      * (gosu, su-exec, tini) stat it before re-exec. Follow it to the guest
      * path the container was started with instead. lstat stays on the real
      * link, which is what `ls -l` wants. */
-    if (!(flags & AT_SYMLINK_NOFOLLOW) && ctx->guest_exe[0] &&
-        strcmp(translated, "/proc/self/exe") == 0)
-        snprintf(translated, sizeof(translated), "%s", ctx->guest_exe);
+    if (!(flags & AT_SYMLINK_NOFOLLOW) &&
+        strcmp(translated, "/proc/self/exe") == 0) {
+        const char *exe = kbox_guest_exe_for(ctx, kbox_syscall_request_pid(req));
+        if (exe[0])
+            snprintf(translated, sizeof(translated), "%s", exe);
+    }
 
     /* Host dirfd or virtual path: call host fstatat with a local path copy
      * to eliminate the TOCTOU window where a sibling thread could swap the

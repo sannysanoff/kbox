@@ -198,6 +198,15 @@ struct kbox_supervisor_ctx {
      * /proc/self/exe: /proc is the host's procfs, so the magic links of the
      * guest's own process would otherwise describe kboxd. */
     char guest_exe[KBOX_MAX_PATH];
+    /* Per-process guest executable paths. guest_exe above is what the
+     * container was started with, but /proc/self/exe has to name the binary
+     * the *calling* process is running: the dynamic loader derives $ORIGIN
+     * from it, so a container-wide answer breaks every binary that finds its
+     * libraries relative to itself (libjli.so was the first casualty). */
+    struct {
+        pid_t pid;
+        char path[KBOX_MAX_PATH];
+    } exe_map[64];
     /* /proc is the container's own procfs in LKL, not the host's. */
     int private_proc;
     /* Pids that issued clone(CLONE_VM|CLONE_VFORK). Their child shares the

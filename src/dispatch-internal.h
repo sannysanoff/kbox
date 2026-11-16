@@ -475,6 +475,10 @@ struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
                                       struct kbox_supervisor_ctx *ctx);
+const char *kbox_guest_exe_for(struct kbox_supervisor_ctx *ctx, pid_t pid);
+void kbox_guest_exe_set(struct kbox_supervisor_ctx *ctx, pid_t pid,
+                        const char *path);
+
 struct kbox_dispatch forward_pwritev(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx);

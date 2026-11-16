@@ -83,6 +83,10 @@ struct daemon_proc_env {
     int cmd_count;
     char *const *env;
     int env_count;
+    /* The address this container is known by on the pod network. A connect
+     * aimed at it must not leave the container, or it comes back in through
+     * the host forwarder and deadlocks against itself. */
+    const char *own_ip;
 };
 
 struct daemon_container {
@@ -1436,6 +1440,8 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     ctx.verbose = g_verbose;
     ctx.root_identity = 1;
     ctx.private_proc = pe->private_proc;
+    snprintf(ctx.own_ip, sizeof(ctx.own_ip), "%s",
+             (pe->own_ip && pe->own_ip[0]) ? pe->own_ip : "");
     ctx.override_uid = (uid_t) -1;
     ctx.override_gid = (gid_t) -1;
     ctx.normalize = 1;
@@ -1781,6 +1787,7 @@ static void *container_worker_thread(void *arg)
         .cmd_count = c->cmd_count,
         .env = c->env,
         .env_count = c->env_count,
+        .own_ip = c->ip,
     };
     struct supervised_proc_hooks hooks = {
         .opaque = c,

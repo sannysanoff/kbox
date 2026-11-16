@@ -2,8 +2,16 @@
 
 /* Network syscall handlers for the seccomp dispatch engine. */
 
+/* The single address the LKL guest owns on its slirp interface. Kept in step
+ * with GUEST_IP_STR in net-slirp.c: a connect aimed at the container's own pod
+ * address is retargeted here, because that is where its listeners really live.
+ */
+#define KBOX_NET_GUEST_IP "10.0.2.15"
+
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
@@ -516,6 +524,28 @@ struct kbox_dispatch forward_connect(const struct kbox_syscall_request *req,
     int rrc = guest_mem_read(ctx, pid, addr_ptr, buf, len);
     if (rrc < 0)
         return kbox_dispatch_errno(-rrc);
+
+    /* A process connecting to its own container address must be served by its
+     * own listener. Left alone, the packet leaves the container, reaches the
+     * pod network, and comes back in through the daemon's port forwarder --
+     * which then needs the very process that is waiting for the answer to
+     * accept it. That is how a service calling its own internal endpoints
+     * hangs forever. Point the connect at the LKL guest address instead, where
+     * the listener actually lives.
+     */
+    if (ctx->own_ip[0] && len >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *sin = (struct sockaddr_in *) buf;
+        struct in_addr own;
+        if (sin->sin_family == AF_INET &&
+            inet_pton(AF_INET, ctx->own_ip, &own) == 1 &&
+            sin->sin_addr.s_addr == own.s_addr) {
+            inet_pton(AF_INET, KBOX_NET_GUEST_IP, &sin->sin_addr);
+            if (ctx->verbose)
+                fprintf(stderr,
+                        "kbox: net: connect to own address %s served locally\n",
+                        ctx->own_ip);
+        }
+    }
 
     long ret = kbox_lkl_connect(ctx->sysnrs, lkl_fd, buf, (long) len);
 

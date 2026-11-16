@@ -149,6 +149,7 @@ struct kbox_supervisor_ctx {
     uid_t override_uid;
     gid_t override_gid;
     int normalize;
+    char own_ip[32];
     const struct kbox_guest_mem_ops *guest_mem_ops;
     struct kbox_guest_mem active_guest_mem;
     const struct kbox_fd_inject_ops *fd_inject_ops;

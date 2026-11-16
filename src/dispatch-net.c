@@ -321,6 +321,11 @@ static struct kbox_dispatch defer_pending_accept(
 {
     for (size_t i = 0; i < KBOX_PENDING_ACCEPTS_MAX; i++) {
         if (!ctx->pending_accepts[i].active) {
+            if (getenv("KBOX_NET_TRACE"))
+                fprintf(stderr,
+                        "kbox: net: accept deferred slot=%zu listen=%ld "
+                        "count=%d\n",
+                        i, listen_fd, ctx->pending_accept_count + 1);
             ctx->pending_accepts[i].active = 1;
             ctx->pending_accepts[i].req = *req;
             ctx->pending_accepts[i].listen_fd = listen_fd;
@@ -374,6 +379,10 @@ void kbox_dispatch_poll_pending(struct kbox_supervisor_ctx *ctx)
             continue;
         }
 
+        if (getenv("KBOX_NET_TRACE"))
+            fprintf(stderr,
+                    "kbox: net: accept retry slot=%zu listen=%ld count=%d\n", i,
+                    pa->listen_fd, ctx->pending_accept_count);
         struct kbox_syscall_request saved_req = pa->req;
         kbox_dispatch_prepare_request_ctx(ctx, &saved_req);
 

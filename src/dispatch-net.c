@@ -264,8 +264,11 @@ static struct kbox_dispatch complete_accept_result(
                     listen_lkl_fd);
     }
 
-    if (client_lkl < 0)
+    if (client_lkl < 0) {
+        if (getenv("KBOX_NET_TRACE"))
+            fprintf(stderr, "kbox: net: accept incomplete rc=%ld\n", client_lkl);
         return kbox_dispatch_from_lkl(client_lkl);
+    }
 
     pid_t pid = kbox_syscall_request_pid(req);
     if (addr_ptr != 0) {
@@ -307,6 +310,9 @@ static struct kbox_dispatch complete_accept_result(
         lkl_close_and_invalidate(ctx, client_lkl);
         return kbox_dispatch_errno(-rc);
     }
+    if (getenv("KBOX_NET_TRACE"))
+        fprintf(stderr, "kbox: net: accepted lkl=%ld vfd=%lld\n", client_lkl,
+                (long long) out_fd);
     return kbox_dispatch_value(out_fd);
 }
 
@@ -459,6 +465,9 @@ static struct kbox_dispatch dispatch_accept_common(
     int nonblock = 0;
     long client_lkl = -EAGAIN;
 
+    if (getenv("KBOX_NET_TRACE"))
+        fprintf(stderr, "kbox: net: accept enter lkl=%ld listener_fd=%d src=%d\n",
+                lkl_fd, ctx->listener_fd, (int) req->source);
     for (;;) {
         out_len = addr_ptr != 0 ? in_len : 0;
         if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP &&
@@ -560,6 +569,32 @@ struct kbox_dispatch forward_connect(const struct kbox_syscall_request *req,
      * path is proven on every image we run.
      */
     long ret = kbox_lkl_connect(ctx->sysnrs, lkl_fd, buf, (long) len);
+
+    /* A loopback connect often comes back EINPROGRESS even though both ends are
+     * inside this kernel. The tracee then waits for POLLOUT on the socketpair,
+     * which is a host fd and does not know about LKL's handshake, so the guest's
+     * poll+SO_ERROR loop can miss it and the connect looks hung. For a blocking
+     * socket, finish the handshake here instead of handing it back.
+     */
+    if (ret == -EINPROGRESS) {
+        long fl = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, F_GETFL, 0);
+        int blocking = !(fl >= 0 && (fl & O_NONBLOCK));
+        if (blocking) {
+            struct pollfd wp = {
+                .fd = (int) lkl_fd,
+                .events = POLLOUT,
+                .revents = 0,
+            };
+            struct timespec wts = {5, 0};
+            long pr = kbox_lkl_ppoll(ctx->sysnrs, &wp, 1, &wts, NULL, 0);
+            if (pr > 0 && (wp.revents & POLLOUT) &&
+                !(wp.revents & (POLLERR | POLLHUP)))
+                ret = 0;
+        }
+    }
+    if (getenv("KBOX_NET_TRACE"))
+        fprintf(stderr, "kbox: net: connect ret lkl_fd=%ld -> %ld\n", lkl_fd,
+                ret);
 
     /* Propagate -EINPROGRESS directly for nonblocking sockets. The tracee's
      * poll(POLLOUT) on the AF_UNIX socketpair returns immediately (spurious

@@ -494,9 +494,15 @@ int kbox_supervisor_prepare_child_security(void)
 {
     struct rlimit rl = {65536, 65536};
     struct rlimit rtlim = {0, 0};
+    struct rlimit rclim = {0, 0};
 
     setrlimit(RLIMIT_NOFILE, &rl);
     setrlimit(RLIMIT_RTPRIO, &rtlim);
+    /* A crashed guest would otherwise dump a core into the supervisor's
+     * working directory (the host project tree); ClickHouse dumps are tens
+     * of gigabytes because of its thread count and address space.
+     */
+    setrlimit(RLIMIT_CORE, &rclim);
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
         fprintf(stderr, "prctl(PR_SET_NO_NEW_PRIVS): %s\n", strerror(errno));

@@ -7,6 +7,7 @@ Docker Compose v5.x) over TCP (--host 0.0.0.0:2375) and/or Unix socket.
 """
 
 import argparse
+import faulthandler
 import gzip
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +20,7 @@ import queue
 import re
 import secrets
 import shutil
+import signal
 import socket
 import struct
 import sys
@@ -1041,12 +1043,17 @@ class DockerEngineState:
         self.events.emit("container", "create", cid, {**labels, "name": cname, "image": image_ref})
         return rec
 
-    def _watch_exit(self, c):
+    def _watch_exit(self, c, gen=None):
         try:
             w = self.rpc.call({"op": "container_wait", "id": c["id"]})
             ec = w.get("exit_code", 0)
         except Exception:
             ec = 137
+        # A watcher started by an older run must not overwrite the state of a
+        # container that has been restarted since (compose restarts containers
+        # in place, and the previous wait returns at that point).
+        if gen is not None and c.get("gen") != gen:
+            return
         c["status"] = "exited"
         c["exit_code"] = ec
         c["finished_at"] = int(time.time())
@@ -1172,19 +1179,45 @@ class DockerEngineState:
             if stop_ev.wait(timeout=wait_s):
                 break
 
+    def _ensure_mount_sources(self, c):
+        """Recreate volume directories that disappeared while the container
+        existed. Docker keeps named volumes across container restarts, so a
+        missing directory must not turn into a broken mount (the guest then
+        dies with "mkdir: cannot create directory ...: No such file or
+        directory" and exit 127).
+        """
+        for m in c.get("mounts_json") or []:
+            src = m.get("Source")
+            if not src or not os.path.isabs(src):
+                continue
+            try:
+                owned = os.path.commonpath(
+                    [os.path.abspath(src), self.vol_root]
+                ) == self.vol_root
+            except ValueError:
+                owned = False
+            if owned:
+                os.makedirs(src, exist_ok=True)
+
     def start_container(self, c):
+        self._ensure_mount_sources(c)
         resp = self.rpc.call({"op": "container_start", "id": c["id"]})
         c["status"] = "running"
         c["pid"] = resp.get("pid", 0)
         c["ip"] = resp.get("ip", c.get("ip", ""))
         c["started_at"] = int(time.time())
+        # A restart must not report the previous run's exit status.
+        c["exit_code"] = 0
+        c["finished_at"] = 0
+        c["gen"] = c.get("gen", 0) + 1
+        gen = c["gen"]
         if c.get("healthcheck"):
             c["health"] = {"Status": "starting", "FailingStreak": 0, "Log": []}
             c["health_stop"].clear()
             ht = threading.Thread(target=self._watch_health, args=(c,), daemon=True)
             ht.start()
         self.events.emit("container", "start", c["id"], {**c["labels"], "name": c["name"]})
-        t = threading.Thread(target=self._watch_exit, args=(c,), daemon=True)
+        t = threading.Thread(target=self._watch_exit, args=(c, gen), daemon=True)
         t.start()
 
     def create_exec(self, c, body):
@@ -1637,6 +1670,9 @@ class DockerHandler(BaseHTTPRequestHandler):
             if not c:
                 self.send_json(404, {"message": "No such container"})
                 return
+            # Report live state: compose polls inspect while waiting for a
+            # container to exit, and a cached "running" hides the exit.
+            eng.refresh_container(c)
             self.send_json(200, eng.container_inspect_json(c))
             return
 
@@ -2203,6 +2239,9 @@ def main():
     srv.verbose = args.verbose
     sys.stderr.write(f"kbox-dockerd listening on http://{host}:{port_str} -> {args.kbox_sock}\n")
     sys.stderr.flush()
+    # SIGUSR1 dumps every thread's Python stack into the log; the only way to
+    # see where a wedged request is stuck without a debugger in the image.
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

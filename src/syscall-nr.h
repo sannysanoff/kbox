@@ -125,6 +125,7 @@
     X(rt_sigprocmask)          \
     X(rt_sigreturn)            \
     X(rt_sigpending)           \
+    X(rt_sigtimedwait)         \
     X(rt_sigsuspend)           \
     X(rt_sigaltstack)          \
     X(kill)                    \

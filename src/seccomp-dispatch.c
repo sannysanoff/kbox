@@ -2743,6 +2743,24 @@ static struct kbox_dispatch forward_epoll_ctl_gated(
         else if (he->host_fd >= 0)
             target = (int) he->host_fd;
     }
+    if (target < 0 && he && lkl_fd >= 0) {
+        /* The socket exists only inside LKL and never got a shadow, so there is
+         * no host descriptor to watch. Give it one now: the net layer signals
+         * readiness on one end of a socketpair, and the other end is what the
+         * guest's epoll set registers.
+         */
+        int sp[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp) == 0) {
+            fcntl(sp[0], F_SETFL, O_NONBLOCK);
+            if (kbox_net_register_socket((int) lkl_fd, sp[0], SOCK_STREAM) == 0) {
+                he->shadow_sp = sp[1];
+                target = sp[1];
+            } else {
+                close(sp[0]);
+                close(sp[1]);
+            }
+        }
+    }
     if (target < 0)
         return kbox_dispatch_errno(EBADF);
 

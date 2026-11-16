@@ -71,10 +71,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kboxd
-          image: kbox-nfs-test/kbox:v96
+          image: kbox-nfs-test/kbox:v130
           imagePullPolicy: IfNotPresent
           args:
-            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml
+            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=10240M loglevel=4" -v
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false
@@ -102,7 +102,7 @@ spec:
               cpu: 250m
               memory: 512Mi
             limits:
-              memory: 12Gi
+              memory: 22Gi
           # kboxd only opens its control socket once every declared NFS export
           # is mounted, and it retries until then, so a slow ganesha start does
           # not need an initContainer.
@@ -112,7 +112,7 @@ spec:
             periodSeconds: 2
             failureThreshold: 150
         - name: shim
-          image: kbox-nfs-test/kbox:v96
+          image: kbox-nfs-test/kbox:v130
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -131,7 +131,7 @@ spec:
             - --listen
             - 0.0.0.0:2376
             - --state-dir
-            - /dev/shm/kbox-dockerd
+            - /data/kbox-dockerd
             - -v
           volumeMounts:
             - name: config
@@ -141,6 +141,26 @@ spec:
               mountPath: /dev/shm
             - name: run
               mountPath: /run/kbox
+            - name: data
+              mountPath: /data
+        # Pod-local image registry. kbox cannot `docker build` or `docker load`,
+        # so images built on the host are pushed here (through kubectl
+        # port-forward) and pulled by kboxd from localhost:5000 over plain HTTP.
+        - name: registry
+          image: registry:2
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+              value: /data/registry
+            - name: REGISTRY_HTTP_ADDR
+              value: 127.0.0.1:5000
+          volumeMounts:
+            - name: data
+              mountPath: /data
       volumes:
         - name: config
           configMap:
@@ -148,7 +168,7 @@ spec:
         - name: state
           emptyDir:
             medium: Memory
-            sizeLimit: 4Gi
+            sizeLimit: 8Gi
         - name: data
           persistentVolumeClaim:
             claimName: kbox-data

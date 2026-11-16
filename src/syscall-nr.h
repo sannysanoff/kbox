@@ -30,6 +30,7 @@
     X(renameat2)               \
     X(fchmodat)                \
     X(fchownat)                \
+    X(fchown)                  \
     X(close)                   \
     X(sendmsg)                 \
     X(socket)                  \
@@ -187,6 +188,8 @@
     X(timerfd_gettime)         \
     X(eventfd)                 \
     X(eventfd2)                \
+    X(memfd_create)            \
+    X(setpriority)             \
     X(statfs)                  \
     X(fstatfs)                 \
     X(sysinfo)                 \

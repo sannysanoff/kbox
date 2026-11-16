@@ -88,7 +88,7 @@ int kbox_supervisor_send_fd(int sock, int fd)
     {
         ssize_t sret;
         do {
-            sret = sendmsg(sock, &msg, 0);
+            sret = sendmsg(sock, &msg, (int) KBOX_SENDMSG_HANDSHAKE_FLAG);
         } while (sret < 0 && errno == EINTR);
         if (sret < 0) {
             fprintf(stderr, "sendmsg(SCM_RIGHTS): %s\n", strerror(errno));

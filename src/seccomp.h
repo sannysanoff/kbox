@@ -117,6 +117,11 @@ struct kbox_proc_fd_entry {
     int owned;
     struct kbox_fd_table *table;
     char host_cwd[KBOX_MAX_PATH];
+    /* Working directory of the process inside LKL. LKL has one cwd for the
+     * whole container, so each process keeps its own here and the dispatcher
+     * switches LKL to it before serving that process (a `mkdir -p` child that
+     * chdir()s must not move its parent's cwd). Empty = not yet known. */
+    char lkl_cwd[KBOX_MAX_PATH];
 };
 
 #define KBOX_PENDING_FORKS_MAX 64
@@ -125,6 +130,7 @@ struct kbox_pending_fork {
     pid_t parent_tgid;
     struct kbox_fd_table *table;
     char host_cwd[KBOX_MAX_PATH];
+    char lkl_cwd[KBOX_MAX_PATH];
 };
 
 struct kbox_pid_tgid_entry {
@@ -205,6 +211,8 @@ struct kbox_supervisor_ctx {
     const struct kbox_host_bind *host_binds;
     size_t host_bind_count;
     char host_cwd[KBOX_MAX_PATH];
+    /* What LKL's cwd currently is (see kbox_proc_fd_entry.lkl_cwd). */
+    char lkl_cwd_cur[KBOX_MAX_PATH];
     /* Absolute guest path of the executable, used to synthesize
      * /proc/self/exe: /proc is the host's procfs, so the magic links of the
      * guest's own process would otherwise describe kboxd. */

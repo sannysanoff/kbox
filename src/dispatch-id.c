@@ -11,6 +11,7 @@
 #include <sys/types.h>
 
 #include "dispatch-internal.h"
+#include "vcred.h"
 
 /* Shared getresuid/getresgid implementation. The three getters retrieve the
  * real, effective, and saved IDs respectively. LKL has no separate saved ID,
@@ -309,4 +310,69 @@ struct kbox_dispatch forward_umask(const struct kbox_syscall_request *req,
     long mask = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long ret = kbox_lkl_umask(ctx->sysnrs, mask);
     return kbox_dispatch_from_lkl(ret);
+}
+
+/* Virtual credentials (root_identity containers). Returns 1 and fills *out
+ * when nr is an identity syscall handled here. See vcred.h for why. */
+int dispatch_vcred_identity(const struct kbox_syscall_request *req,
+                            struct kbox_supervisor_ctx *ctx,
+                            struct kbox_dispatch *out)
+{
+    const struct kbox_host_nrs *h = ctx->host_nrs;
+    int nr = req->nr;
+    pid_t pid = kbox_syscall_request_pid(req);
+    struct kbox_vcred c;
+    int64_t a0 = (int32_t) kbox_syscall_request_arg(req, 0);
+    int64_t a1 = (int32_t) kbox_syscall_request_arg(req, 1);
+    int64_t a2 = (int32_t) kbox_syscall_request_arg(req, 2);
+
+    kbox_vcred_get(pid, &c);
+    if (nr == h->getuid) {
+        *out = kbox_dispatch_value(c.ruid);
+    } else if (nr == h->geteuid) {
+        *out = kbox_dispatch_value(c.euid);
+    } else if (nr == h->getgid) {
+        *out = kbox_dispatch_value(c.rgid);
+    } else if (nr == h->getegid) {
+        *out = kbox_dispatch_value(c.egid);
+    } else if (nr == h->getresuid || nr == h->getresgid) {
+        uint32_t v[3];
+        int uid = nr == h->getresuid;
+        v[0] = uid ? c.ruid : c.rgid;
+        v[1] = uid ? c.euid : c.egid;
+        v[2] = uid ? c.suid : c.sgid;
+        *out = kbox_dispatch_value(0);
+        for (int i = 0; i < 3; i++) {
+            uint64_t ptr = kbox_syscall_request_arg(req, i);
+            if (ptr != 0 &&
+                guest_mem_write(ctx, pid, ptr, &v[i], sizeof(v[i])) < 0)
+                *out = kbox_dispatch_errno(EFAULT);
+        }
+    } else if (nr == h->setuid) {
+        int rc = kbox_vcred_setuid(pid, (uint32_t) a0);
+        *out = rc ? kbox_dispatch_errno(-rc) : kbox_dispatch_value(0);
+    } else if (nr == h->setgid) {
+        int rc = kbox_vcred_setgid(pid, (uint32_t) a0);
+        *out = rc ? kbox_dispatch_errno(-rc) : kbox_dispatch_value(0);
+    } else if (nr == h->setreuid) {
+        int rc = kbox_vcred_setreuid(pid, a0, a1);
+        *out = rc ? kbox_dispatch_errno(-rc) : kbox_dispatch_value(0);
+    } else if (nr == h->setregid) {
+        int rc = kbox_vcred_setregid(pid, a0, a1);
+        *out = rc ? kbox_dispatch_errno(-rc) : kbox_dispatch_value(0);
+    } else if (nr == h->setresuid) {
+        int rc = kbox_vcred_setresuid(pid, a0, a1, a2);
+        *out = rc ? kbox_dispatch_errno(-rc) : kbox_dispatch_value(0);
+    } else if (nr == h->setresgid) {
+        int rc = kbox_vcred_setresgid(pid, a0, a1, a2);
+        *out = rc ? kbox_dispatch_errno(-rc) : kbox_dispatch_value(0);
+    } else if (nr == h->setgroups) {
+        *out = kbox_vcred_may_setgid(pid) ? kbox_dispatch_value(0)
+                                          : kbox_dispatch_errno(EPERM);
+    } else if (nr == h->getgroups) {
+        *out = forward_getgroups_override(req, ctx, c.egid);
+    } else {
+        return 0;
+    }
+    return 1;
 }

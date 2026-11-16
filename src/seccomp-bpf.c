@@ -432,22 +432,25 @@ static int install_seccomp_filter(
             KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);    \
     } while (0)
 
-    /* sendmsg MUST stay allow-listed: the child's pre-exec FD transfer uses
-     * sendmsg(SCM_RIGHTS) before the supervisor loop starts. Removing it
-     * deadlocks the child/parent handshake.
-     *
-     * Consequence: guest sendmsg() on shadow sockets bypasses the supervisor
-     * and operates on the AF_UNIX socketpair, losing msg_name addressing.
-     * Callers that need addressed datagrams must use sendto() (intercepted via
-     * forward_sendto). recvmsg() IS intercepted and returns correct source
-     * addresses.
-     *
-     * To fix: restructure supervisor startup to pass the listener FD via
-     * pidfd_getfd or /proc/<pid>/fd instead of SCM_RIGHTS.
+    /* The child's pre-exec FD transfer uses sendmsg(SCM_RIGHTS) before the
+     * supervisor loop starts, so that one call (flags ==
+     * KBOX_SENDMSG_HANDSHAKE_FLAG) must bypass the supervisor or the
+     * handshake deadlocks. All other sendmsg calls are notified.
      */
-    EMIT_ALLOW(h->sendmsg);
+    /* sendmsg bypasses the supervisor only for the handshake call. */
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
+        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, (h->sendmsg), 0, 4);
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
+        KBOX_SECCOMP_DATA_ARG2_LO_OFFSET);
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
+        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, KBOX_SENDMSG_HANDSHAKE_FLAG,
+        0, 1);
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS, KBOX_SECCOMP_DATA_NR_OFFSET);
     EMIT_ALLOW(h->exit);
-    EMIT_ALLOW(h->exit_group);
     EMIT_ALLOW(h->rt_sigreturn);
 #undef EMIT_ALLOW
 
@@ -645,9 +648,20 @@ install_seccomp_trap_ranges_ex(
             KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);    \
     } while (0)
 
-    EMIT_ALLOW(h->sendmsg);
+    /* sendmsg bypasses the supervisor only for the handshake call. */
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
+        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, (h->sendmsg), 0, 4);
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
+        KBOX_SECCOMP_DATA_ARG2_LO_OFFSET);
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
+        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, KBOX_SENDMSG_HANDSHAKE_FLAG,
+        0, 1);
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
+    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS, KBOX_SECCOMP_DATA_NR_OFFSET);
     EMIT_ALLOW(h->exit);
-    EMIT_ALLOW(h->exit_group);
     EMIT_ALLOW(h->rt_sigreturn);
 #undef EMIT_ALLOW
 

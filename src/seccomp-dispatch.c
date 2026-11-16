@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -91,6 +92,7 @@
 #include "syscall-nr.h"
 #include "syscall-trap-signal.h"
 #include "syscall-trap.h"
+#include "vcred.h"
 
 /* Per-thread scratch buffer for I/O dispatch. Each supervisor thread is
  * non-reentrant: only one syscall is dispatched per thread at a time. Using TLS
@@ -678,13 +680,19 @@ void kbox_dispatch_snapshot_fork(struct kbox_supervisor_ctx *ctx,
     pf->parent_tgid = parent_tgid;
     pf->table = snap_tab;
     snprintf(pf->host_cwd, sizeof(pf->host_cwd), "%s", cwd ? cwd : "/");
+    snprintf(pf->lkl_cwd, sizeof(pf->lkl_cwd), "%s",
+             (ctx->active_proc && ctx->active_proc->lkl_cwd[0])
+                 ? ctx->active_proc->lkl_cwd
+                 : ctx->lkl_cwd_cur);
 }
 
 static int take_pending_fork_table(struct kbox_supervisor_ctx *ctx,
                                    pid_t parent_tgid,
                                    struct kbox_fd_table **out_tab,
                                    char *out_cwd,
-                                   size_t cwd_len)
+                                   size_t cwd_len,
+                                   char *out_lkl_cwd,
+                                   size_t lkl_cwd_len)
 {
     if (!ctx || !ctx->pending_forks || parent_tgid <= 0)
         return 0;
@@ -694,6 +702,7 @@ static int take_pending_fork_table(struct kbox_supervisor_ctx *ctx,
             continue;
         *out_tab = ctx->pending_forks[i].table;
         snprintf(out_cwd, cwd_len, "%s", ctx->pending_forks[i].host_cwd);
+        snprintf(out_lkl_cwd, lkl_cwd_len, "%s", ctx->pending_forks[i].lkl_cwd);
         for (size_t j = i; j + 1 < ctx->pending_fork_count; j++)
             ctx->pending_forks[j] = ctx->pending_forks[j + 1];
         ctx->pending_fork_count--;
@@ -704,7 +713,8 @@ static int take_pending_fork_table(struct kbox_supervisor_ctx *ctx,
     return 0;
 }
 
-static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
+static void select_proc_fd_table_impl(struct kbox_supervisor_ctx *ctx,
+                                      pid_t pid)
 {
     if (!ctx || !ctx->fd_table || ctx->child_pid <= 0 || pid <= 0)
         return;
@@ -719,6 +729,12 @@ static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
         ctx->proc_fds[0].table = ctx->root_fd_table;
         snprintf(ctx->proc_fds[0].host_cwd, sizeof(ctx->proc_fds[0].host_cwd),
                  "%s", ctx->host_cwd);
+        if (ctx->lkl_cwd_cur[0] == '\0' &&
+            kbox_lkl_getcwd(ctx->sysnrs, ctx->lkl_cwd_cur,
+                            (long) sizeof(ctx->lkl_cwd_cur)) < 0)
+            ctx->lkl_cwd_cur[0] = '\0';
+        snprintf(ctx->proc_fds[0].lkl_cwd, sizeof(ctx->proc_fds[0].lkl_cwd),
+                 "%s", ctx->lkl_cwd_cur);
         ctx->proc_fd_count = 1;
         ctx->active_proc = &ctx->proc_fds[0];
     }
@@ -760,7 +776,9 @@ static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
     struct kbox_proc_fd_entry *parent_entry = NULL;
     struct kbox_fd_table *child_tab = NULL;
     char child_cwd[KBOX_MAX_PATH];
+    char child_lkl_cwd[KBOX_MAX_PATH];
     child_cwd[0] = '\0';
+    child_lkl_cwd[0] = '\0';
 
     pid_t walk = ppid;
     for (int hop = 0; hop < 4 && walk > 1 && !parent_entry; hop++) {
@@ -769,7 +787,8 @@ static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
         if (read_proc_tgid_ppid(walk, &w_tgid, &w_ppid, NULL) < 0)
             break;
         if (take_pending_fork_table(ctx, w_tgid, &child_tab, child_cwd,
-                                    sizeof(child_cwd)))
+                                    sizeof(child_cwd), child_lkl_cwd,
+                                    sizeof(child_lkl_cwd)))
             break;
         parent_entry = find_proc_fd_entry(ctx, w_tgid);
         walk = w_ppid;
@@ -790,6 +809,8 @@ static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
         memcpy(child_tab, parent_tab, sizeof(*child_tab));
         dup_table_supervisor_fds(child_tab);
         snprintf(child_cwd, sizeof(child_cwd), "%s", parent_entry->host_cwd);
+        snprintf(child_lkl_cwd, sizeof(child_lkl_cwd), "%s",
+                 parent_entry->lkl_cwd);
     }
 
     struct kbox_proc_fd_entry *ce = &ctx->proc_fds[ctx->proc_fd_count];
@@ -797,9 +818,43 @@ static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
     ce->owned = 1;
     ce->table = child_tab;
     snprintf(ce->host_cwd, sizeof(ce->host_cwd), "%s", child_cwd);
+    snprintf(ce->lkl_cwd, sizeof(ce->lkl_cwd), "%s", child_lkl_cwd);
     ctx->proc_fd_count++;
     ctx->fd_table = child_tab;
     sync_ctx_host_cwd(ctx, ce);
+}
+
+/* Point LKL's (single, container-wide) cwd at the calling process's own. */
+static void sync_lkl_cwd(struct kbox_supervisor_ctx *ctx)
+{
+    struct kbox_proc_fd_entry *e = ctx->active_proc;
+
+    if (!e || e->lkl_cwd[0] == '\0' ||
+        strcmp(e->lkl_cwd, ctx->lkl_cwd_cur) == 0)
+        return;
+    if (kbox_lkl_chdir(ctx->sysnrs, e->lkl_cwd) >= 0) {
+        snprintf(ctx->lkl_cwd_cur, sizeof(ctx->lkl_cwd_cur), "%s", e->lkl_cwd);
+        invalidate_translated_path_cache(ctx);
+    }
+}
+
+static void select_proc_fd_table(struct kbox_supervisor_ctx *ctx, pid_t pid)
+{
+    select_proc_fd_table_impl(ctx, pid);
+    sync_lkl_cwd(ctx);
+}
+
+/* After a successful LKL chdir/fchdir: remember the new cwd for the caller. */
+static void record_lkl_cwd(struct kbox_supervisor_ctx *ctx)
+{
+    char cwd[KBOX_MAX_PATH];
+
+    if (kbox_lkl_getcwd(ctx->sysnrs, cwd, (long) sizeof(cwd)) < 0)
+        return;
+    snprintf(ctx->lkl_cwd_cur, sizeof(ctx->lkl_cwd_cur), "%s", cwd);
+    if (ctx->active_proc)
+        snprintf(ctx->active_proc->lkl_cwd, sizeof(ctx->active_proc->lkl_cwd),
+                 "%s", cwd);
 }
 
 void kbox_dispatch_cleanup_proc_fds(struct kbox_supervisor_ctx *ctx)
@@ -2349,9 +2404,12 @@ static struct kbox_dispatch forward_local_shadow_lseek(
 }
 
 /* statx struct field offsets (standard on x86_64 and aarch64). */
-#define STATX_MODE_OFFSET 0x20
-#define STATX_UID_OFFSET 0x48
-#define STATX_GID_OFFSET 0x4c
+#define STATX_UID_OFFSET 0x14
+#define STATX_GID_OFFSET 0x18
+#define STATX_MODE_OFFSET 0x1c
+#define STATX_INO_OFFSET 0x20
+#define STATX_DEV_MAJOR_OFFSET 0x88
+#define STATX_DEV_MINOR_OFFSET 0x8c
 #define STATX_BUF_SIZE 0x100
 
 static struct kbox_dispatch finish_open_dispatch(
@@ -2386,6 +2444,40 @@ static struct kbox_dispatch finish_open_dispatch(
     return kbox_dispatch_value((int64_t) vfd);
 }
 
+/* Make a host stat result reflect the guest's virtual identity (see vcred.h):
+ * chown overlay first, otherwise "owned by the supervisor" becomes "owned by
+ * the calling process". Only for root_identity containers. */
+static void apply_virtual_owner(struct kbox_supervisor_ctx *ctx,
+                                pid_t pid,
+                                struct stat *host_stat)
+{
+    if (ctx->root_identity)
+        kbox_owner_apply(pid, host_stat);
+}
+
+static void apply_virtual_owner_statx(struct kbox_supervisor_ctx *ctx,
+                                      pid_t pid,
+                                      uint8_t *statx_buf)
+{
+    struct stat st;
+    uint32_t major, minor;
+    uint64_t ino;
+
+    if (!(ctx->root_identity))
+        return;
+    memset(&st, 0, sizeof(st));
+    memcpy(&ino, &statx_buf[STATX_INO_OFFSET], 8);
+    memcpy(&major, &statx_buf[STATX_DEV_MAJOR_OFFSET], 4);
+    memcpy(&minor, &statx_buf[STATX_DEV_MINOR_OFFSET], 4);
+    memcpy(&st.st_uid, &statx_buf[STATX_UID_OFFSET], 4);
+    memcpy(&st.st_gid, &statx_buf[STATX_GID_OFFSET], 4);
+    st.st_ino = (ino_t) ino;
+    st.st_dev = makedev(major, minor);
+    kbox_owner_apply(pid, &st);
+    memcpy(&statx_buf[STATX_UID_OFFSET], &st.st_uid, 4);
+    memcpy(&statx_buf[STATX_GID_OFFSET], &st.st_gid, 4);
+}
+
 void normalize_host_stat_if_needed(struct kbox_supervisor_ctx *ctx,
                                    const char *path,
                                    struct stat *host_stat)
@@ -2413,7 +2505,11 @@ void normalize_statx_if_needed(struct kbox_supervisor_ctx *ctx,
     if (!kbox_normalized_permissions(path, &n_mode, &n_uid, &n_gid))
         return;
 
-    uint16_t mode_le = (uint16_t) n_mode;
+    /* Keep the file-type bits: statx reports them in the same field, and
+     * glibc's ls/stat and the JDK (Files.isDirectory) read the type from it. */
+    uint16_t old_mode;
+    memcpy(&old_mode, &statx_buf[STATX_MODE_OFFSET], 2);
+    uint16_t mode_le = (uint16_t) ((old_mode & S_IFMT) | (n_mode & ~S_IFMT));
     memcpy(&statx_buf[STATX_MODE_OFFSET], &mode_le, 2);
     memcpy(&statx_buf[STATX_UID_OFFSET], &n_uid, 4);
     memcpy(&statx_buf[STATX_GID_OFFSET], &n_gid, 4);
@@ -2717,6 +2813,25 @@ int try_writeback_shadow_open(struct kbox_supervisor_ctx *ctx,
      * sealed.
      */
 
+    /* The tracee's descriptor is this memfd, so O_APPEND has to live on it:
+     * without the flag every write lands at the memfd's own offset (0 for a
+     * fresh open) and `echo line >> file` overwrites the start of the file. */
+    if (flags & O_APPEND) {
+        int fl = fcntl(memfd, F_GETFL);
+        if (fl >= 0)
+            (void) fcntl(memfd, F_SETFL, fl | O_APPEND);
+    }
+    /* The sync back to LKL is ftruncate + pwrite64 at explicit offsets, and
+     * pwrite on an O_APPEND descriptor appends regardless of the offset, so
+     * the LKL side must not carry the flag: with it a 2-byte append came back
+     * as "\0\0" + data. */
+    if (flags & O_APPEND) {
+        long lfl = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, F_GETFL, 0);
+        if (lfl >= 0)
+            (void) kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, F_SETFL,
+                                  lfl & ~(long) O_APPEND);
+    }
+
     target_fd = allocate_writable_shadow_fd(ctx);
     if (target_fd < 0) {
         close(memfd);
@@ -2825,6 +2940,7 @@ static struct kbox_dispatch forward_getdents_common(
 }
 
 int dup_tracee_fd(pid_t pid, int tracee_fd);
+static int dup_tracee_fd_shared(pid_t pid, int tracee_fd);
 
 /* Gate a CONTINUE syscall that takes an FD in arg0.  Deny if the FD is
  * untracked and in a blocked range; otherwise let the host kernel handle it.
@@ -2914,6 +3030,46 @@ void translate_proc_self(const char *path,
         snprintf(sv_path, sv_path_len, "%s", path);
 }
 
+/* Like translate_proc_self, for a path relative to a host dirfd. When the
+ * dirfd is /proc itself, "self" and "thread-self" would resolve in the
+ * supervisor's process (kboxd, dozens of threads), not the tracee's.
+ * Chromium's zygote does fstatat(procfd, "self/task") and requires st_nlink
+ * == 3 (single thread); seeing kboxd's task dir made it abort with SIGTRAP. */
+static void translate_proc_self_at(int sv_dirfd,
+                                   const char *path,
+                                   pid_t pid,
+                                   char *sv_path,
+                                   size_t sv_path_len)
+{
+    if (sv_dirfd != AT_FDCWD && path[0] != '/') {
+        int self_len = 0;
+        const char *rest = NULL;
+        if (!strncmp(path, "thread-self", 11) &&
+            (path[11] == '\0' || path[11] == '/')) {
+            self_len = 11;
+            rest = path + 11;
+        } else if (!strncmp(path, "self", 4) &&
+                   (path[4] == '\0' || path[4] == '/')) {
+            self_len = 4;
+            rest = path + 4;
+        }
+        if (self_len) {
+            char link[64], target[64];
+            snprintf(link, sizeof(link), "/proc/self/fd/%d", sv_dirfd);
+            ssize_t n = readlink(link, target, sizeof(target) - 1);
+            if (n == 5 && !memcmp(target, "/proc", 5)) {
+                if (self_len == 11)
+                    snprintf(sv_path, sv_path_len, "%d/task/%d%s", (int) pid,
+                             (int) pid, rest);
+                else
+                    snprintf(sv_path, sv_path_len, "%d%s", (int) pid, rest);
+                return;
+            }
+        }
+    }
+    translate_proc_self(path, pid, sv_path, sv_path_len);
+}
+
 /* Emulate an open that would otherwise CONTINUE to the host kernel, tracking
  * the resulting FD as host-passthrough.  The supervisor opens the file in its
  * own namespace, injects the FD into the tracee via ADDFD, and records it in
@@ -2933,7 +3089,8 @@ static struct kbox_dispatch emulate_host_open_tracked(
 {
     char sv_path[KBOX_MAX_PATH];
     pid_t pid = kbox_syscall_request_pid(req);
-    translate_proc_self(path, pid, sv_path, sizeof(sv_path));
+    translate_proc_self_at(supervisor_dirfd, path, pid, sv_path,
+                           sizeof(sv_path));
 
     int host_fd =
         openat(supervisor_dirfd, sv_path, host_flags & ~O_CLOEXEC, mode);
@@ -3783,7 +3940,8 @@ static struct kbox_dispatch forward_fcntl(
             if (target_fd < 0)
                 return kbox_dispatch_errno(-target_fd);
 
-            int copy = dup_tracee_fd(kbox_syscall_request_pid(req), (int) fd);
+            int copy =
+                dup_tracee_fd_shared(kbox_syscall_request_pid(req), (int) fd);
             if (copy < 0) {
                 if (copy == -EPERM || copy == -ENOSYS || copy == -ENXIO) {
                     track_host_passthrough_fd(ctx->fd_table, target_fd);
@@ -4129,6 +4287,34 @@ int dup_tracee_fd(pid_t pid, int tracee_fd)
     return open_tracee_proc_fd(pid, tracee_fd);
 }
 
+/* Like dup_tracee_fd, but only ever returns a copy that shares the tracee's
+ * open file description. When pidfd_getfd is unavailable it fails with -EPERM
+ * instead of falling back to open(/proc/<pid>/fd/N): that fallback makes a NEW
+ * description (position 0, access mode and O_APPEND of its own), which is wrong
+ * for dup, dup2, dup3 and F_DUPFD -- a shell's `cmd >> file` dup2'd a copy that
+ * wrote over the start of the file. Callers handle -EPERM by letting the host
+ * kernel perform the dup itself. */
+static int dup_tracee_fd_shared(pid_t pid, int tracee_fd)
+{
+    int pidfd = open_tracee_pidfd(pid);
+    if (pidfd >= 0) {
+        int copy = (int) syscall(__NR_pidfd_getfd, pidfd,
+                                 (unsigned int) tracee_fd, (unsigned int) 0);
+        int saved_errno = errno;
+        close(pidfd);
+        if (copy >= 0)
+            return copy;
+        if (saved_errno != EPERM && saved_errno != ENOSYS &&
+            saved_errno != EACCES)
+            return -saved_errno;
+        return -EPERM;
+    }
+    if (pidfd != -EPERM && pidfd != -ENOSYS && pidfd != -EACCES &&
+        pidfd != -EINVAL)
+        return pidfd;
+    return -EPERM;
+}
+
 static int find_available_tracee_fd(const struct kbox_supervisor_ctx *ctx,
                                     pid_t pid,
                                     int minfd)
@@ -4274,7 +4460,12 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
          * by obtaining a supervisor copy via pidfd_getfd, injecting it into
          * the tracee via ADDFD, and tracking the result.
          */
-        int copy = dup_tracee_fd(kbox_syscall_request_pid(req), (int) fd);
+        int copy =
+            dup_tracee_fd_shared(kbox_syscall_request_pid(req), (int) fd);
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: dup host fd=%ld shared copy=%d\n", fd, copy);
+        if (copy == -EPERM || copy == -ENOSYS || copy == -ENXIO)
+            return kbox_dispatch_continue(); /* kernel dup shares the file */
         if (copy < 0)
             return kbox_dispatch_errno(-copy);
         int tracee_fd = request_addfd(ctx, req, copy, 0);
@@ -4422,7 +4613,8 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
          */
         if (oldfd == newfd)
             return kbox_dispatch_value((int64_t) newfd);
-        int copy = dup_tracee_fd(kbox_syscall_request_pid(req), (int) oldfd);
+        int copy =
+            dup_tracee_fd_shared(kbox_syscall_request_pid(req), (int) oldfd);
         if (copy < 0) {
             if (copy == -EPERM || copy == -ENOSYS || copy == -ENXIO) {
                 cleanup_replaced_fd_tracking(ctx, newfd);
@@ -4566,7 +4758,8 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
         if (oldfd == newfd)
             return kbox_dispatch_errno(EINVAL);
         uint32_t af = (flags & O_CLOEXEC) ? O_CLOEXEC : 0;
-        int copy = dup_tracee_fd(kbox_syscall_request_pid(req), (int) oldfd);
+        int copy =
+            dup_tracee_fd_shared(kbox_syscall_request_pid(req), (int) oldfd);
         if (copy < 0) {
             if (copy == -EPERM || copy == -ENOSYS || copy == -ENXIO) {
                 cleanup_replaced_fd_tracking(ctx, newfd);
@@ -4836,6 +5029,8 @@ static struct kbox_dispatch forward_newfstatat(
                                                    &sv_dirfd, &close_sv);
             if (drc < 0)
                 return kbox_dispatch_errno(-drc);
+            translate_proc_self_at(sv_dirfd, translated, pid, sv_path,
+                                   sizeof(sv_path));
         }
         struct stat host_stat;
         int host_rc = fstatat(sv_dirfd, sv_path, &host_stat, (int) flags);
@@ -4844,6 +5039,7 @@ static struct kbox_dispatch forward_newfstatat(
             close(sv_dirfd);
         if (host_rc < 0)
             return kbox_dispatch_errno(saved);
+        apply_virtual_owner(ctx, pid, &host_stat);
         normalize_host_stat_if_needed(ctx, translated, &host_stat);
         int wrc = guest_mem_write_small_metadata(ctx, pid, remote_stat,
                                                  &host_stat, sizeof(host_stat));
@@ -4966,6 +5162,23 @@ static struct kbox_dispatch dispatch_lkl_statfs_result(
 {
     if (ret < 0)
         return kbox_dispatch_from_lkl(ret);
+    /* The LKL overlay root reports 0 blocks. Java/Spring disk-space checks
+     * then see 0 bytes free and mark the service DOWN. Borrow capacity from
+     * the host RAM-backed dir that holds the rootfs, keep LKL's type/fsid. */
+    struct statfs fixed = *sfs;
+    if (fixed.f_blocks == 0) {
+        struct statfs host;
+        if (statfs("/dev/shm", &host) == 0 && host.f_blocks > 0) {
+            fixed.f_bsize = host.f_bsize;
+            fixed.f_frsize = host.f_frsize;
+            fixed.f_blocks = host.f_blocks;
+            fixed.f_bfree = host.f_bfree;
+            fixed.f_bavail = host.f_bavail;
+            fixed.f_files = host.f_files ? host.f_files : 1000000;
+            fixed.f_ffree = host.f_ffree ? host.f_ffree : 1000000;
+        }
+    }
+    sfs = &fixed;
     int wrc = guest_mem_write(ctx, pid, remote_buf, sfs, sizeof(*sfs));
     if (wrc < 0)
         return kbox_dispatch_errno(-wrc);
@@ -5075,6 +5288,7 @@ static struct kbox_dispatch forward_statx(
             close(sv_dirfd);
         if (host_rc < 0)
             return kbox_dispatch_errno(saved);
+        apply_virtual_owner_statx(ctx, pid, statx_buf);
         normalize_statx_if_needed(ctx, translated, statx_buf);
         int wrc = guest_mem_write(ctx, pid, remote_statx, statx_buf,
                                   sizeof(statx_buf));
@@ -5229,6 +5443,7 @@ static struct kbox_dispatch forward_chdir(
     if (ret < 0)
         return kbox_dispatch_errno((int) (-ret));
 
+    record_lkl_cwd(ctx);
     set_active_host_cwd(ctx, "");
     invalidate_translated_path_cache(ctx);
     return kbox_dispatch_value(0);
@@ -5260,6 +5475,7 @@ static struct kbox_dispatch forward_fchdir(
 
     long ret = kbox_lkl_fchdir(ctx->sysnrs, lkl_fd);
     if (ret >= 0) {
+        record_lkl_cwd(ctx);
         set_active_host_cwd(ctx, "");
         invalidate_translated_path_cache(ctx);
     }
@@ -5334,6 +5550,21 @@ static struct kbox_dispatch forward_at_path_call(
                                        sizeof(translated), &lkl_dirfd);
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
+
+    /* Absolute virtual path (/dev/shm/x and friends): open and stat already
+     * serve these from the host kernel, so unlink/mkdir/chmod must as well,
+     * otherwise a file created in /dev/shm cannot be removed (Chromium's
+     * shm_open + unlink pattern). The path is absolute, so AT_FDCWD is exact.
+     */
+    if (!should_continue_for_dirfd(lkl_dirfd) && host_invoke &&
+        should_continue_virtual_path(ctx, req, 1, translated)) {
+        long vret = host_invoke(req, ctx, (long) AT_FDCWD, translated);
+        if (invalidate_on_success && vret >= 0)
+            invalidate_path_shadow_cache(ctx);
+        if (vret < 0)
+            return kbox_dispatch_errno((int) (-vret));
+        return kbox_dispatch_value(vret);
+    }
 
     /* Host dirfd: call the host syscall with a supervisor-owned copy of the
      * tracee's dirfd to avoid the TOCTOU re-read.
@@ -5548,6 +5779,39 @@ static long invoke_fchownat(const struct kbox_syscall_request *req,
                              flags);
 }
 
+/* chown on a host path. The host kernel refuses ownership changes (kbox runs
+ * unprivileged), so a virtual-root guest's request is recorded in the ownership
+ * overlay and reported back by stat, which is what the image entrypoints that
+ * chown a data directory and then drop privileges check. */
+static long host_chown_virtual(struct kbox_supervisor_ctx *ctx,
+                               pid_t pid,
+                               int dirfd,
+                               const char *path,
+                               long owner,
+                               long group,
+                               int flags)
+{
+    int err;
+
+    if (fchownat(dirfd, path, (uid_t) owner, (gid_t) group, flags) == 0)
+        return 0;
+    err = errno;
+    if (err == EPERM && ctx->root_identity) {
+        struct kbox_vcred c;
+        struct stat st;
+        kbox_vcred_get(pid, &c);
+        if (c.euid != 0)
+            return -EPERM;
+        if (fstatat(dirfd, path, &st, flags & AT_SYMLINK_NOFOLLOW) == 0) {
+            kbox_owner_set(st.st_dev, st.st_ino, (int32_t) owner,
+                           (int32_t) group);
+            return 0;
+        }
+        err = errno;
+    }
+    return -err;
+}
+
 static long host_invoke_fchownat(const struct kbox_syscall_request *req,
                                  struct kbox_supervisor_ctx *ctx,
                                  long sv_dirfd,
@@ -5557,10 +5821,8 @@ static long host_invoke_fchownat(const struct kbox_syscall_request *req,
     long owner = to_c_long_arg(kbox_syscall_request_arg(req, 2));
     long group = to_c_long_arg(kbox_syscall_request_arg(req, 3));
     long flags = to_c_long_arg(kbox_syscall_request_arg(req, 4));
-    if (fchownat((int) sv_dirfd, path, (uid_t) owner, (gid_t) group,
-                 (int) flags) < 0)
-        return -errno;
-    return 0;
+    return host_chown_virtual(ctx, kbox_syscall_request_pid(req),
+                              (int) sv_dirfd, path, owner, group, (int) flags);
 }
 
 static struct kbox_dispatch forward_fchownat(
@@ -5699,6 +5961,7 @@ static struct kbox_dispatch forward_stat_legacy(
         struct stat host_stat;
         if (fstatat(AT_FDCWD, sv_path, &host_stat, stat_flags) < 0)
             return kbox_dispatch_errno(errno);
+        apply_virtual_owner(ctx, pid, &host_stat);
         normalize_host_stat_if_needed(ctx, translated, &host_stat);
         int wrc = guest_mem_write_small_metadata(ctx, pid, remote_stat,
                                                  &host_stat, sizeof(host_stat));
@@ -5948,12 +6211,10 @@ static long host_invoke_chown_legacy(const struct kbox_syscall_request *req,
                                      struct kbox_supervisor_ctx *ctx,
                                      const char *path)
 {
-    (void) ctx;
     long owner = to_c_long_arg(kbox_syscall_request_arg(req, 1));
     long group = to_c_long_arg(kbox_syscall_request_arg(req, 2));
-    if (chown(path, (uid_t) owner, (gid_t) group) < 0)
-        return -errno;
-    return 0;
+    return host_chown_virtual(ctx, kbox_syscall_request_pid(req), AT_FDCWD,
+                              path, owner, group, 0);
 }
 
 static struct kbox_dispatch forward_chown_legacy(
@@ -6028,6 +6289,7 @@ static struct kbox_dispatch forward_chown_legacy(
     _(sendmmsg, forward_sendmmsg)                                             \
     _(recvfrom, forward_recvfrom)                                             \
     _(recvmsg, forward_recvmsg)                                               \
+    _(sendmsg, forward_sendmsg)                                               \
     _(getsockopt, forward_getsockopt)                                         \
     _(setsockopt, forward_setsockopt)                                         \
     _(getsockname, forward_getsockname)                                       \
@@ -6045,6 +6307,7 @@ static struct kbox_dispatch forward_chown_legacy(
     _(fallocate, forward_fallocate)                                           \
     _(flock, forward_flock)                                                   \
     _(fchmod, forward_fchmod)                                                 \
+    _(fchown, forward_fchown)                                                 \
     _(fadvise64, forward_fadvise64)                                           \
     _(fsync, forward_fsync)                                                   \
     _(fdatasync, forward_fdatasync)                                           \
@@ -6080,6 +6343,7 @@ static struct kbox_dispatch forward_chown_legacy(
     _(clone3, forward_clone3)                                                 \
     /* FD-creating syscalls tracked as host-passthrough. */                   \
     _(eventfd2, forward_eventfd)                                              \
+    _(memfd_create, forward_memfd_create)                                     \
     _(timerfd_create, forward_timerfd_create)                                 \
     _(signalfd4, forward_signalfd4)                                           \
     _(epoll_create1, forward_epoll_create1)                                   \
@@ -6151,20 +6415,80 @@ static int is_guest_process_pid(struct kbox_supervisor_ctx *ctx,
     return 0;
 }
 
-struct kbox_dispatch kbox_dispatch_request(
+/* Verbose-only: remember every pid that issued a syscall and, at most every
+ * 100 ms, report the exit status of those that became zombies. A tracee that
+ * dies by signal never reaches exit_group, so this is the only way to see it.
+ */
+#define VMON_MAX 512
+static void verbose_monitor_pids(pid_t seen)
+{
+    static pid_t pids[VMON_MAX];
+    static unsigned char done[VMON_MAX];
+    static int npids;
+    static struct timespec last;
+    struct timespec now;
+    int i;
+
+    for (i = 0; i < npids; i++)
+        if (pids[i] == seen)
+            break;
+    if (i == npids && npids < VMON_MAX)
+        pids[npids++] = seen;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if ((now.tv_sec - last.tv_sec) * 1000 +
+            (now.tv_nsec - last.tv_nsec) / 1000000 <
+        100)
+        return;
+    last = now;
+    for (i = 0; i < npids; i++) {
+        char path[48], buf[1024];
+        FILE *f;
+        if (done[i])
+            continue;
+        snprintf(path, sizeof(path), "/proc/%d/stat", (int) pids[i]);
+        f = fopen(path, "r");
+        if (!f) {
+            done[i] = 1;
+            continue;
+        }
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        char *rp = strrchr(buf, ')');
+        if (rp && rp[1] == ' ' && rp[2] == 'Z') {
+            /* field 52 of stat is exit_code (wait status). */
+            char *t = rp + 2;
+            int field = 3;
+            while (field < 52 && (t = strchr(t, ' ')) != NULL) {
+                t++;
+                field++;
+            }
+            fprintf(stderr, "kbox: pid=%d zombie, wait status=%s\n",
+                    (int) pids[i], t ? t : "?");
+            done[i] = 1;
+        }
+    }
+}
+
+static struct kbox_dispatch dispatch_request_impl(
     struct kbox_supervisor_ctx *ctx,
     const struct kbox_syscall_request *req)
 {
-    const struct kbox_host_nrs *h = ctx->host_nrs;
+    const struct kbox_host_nrs *h;
     int nr;
 
     if (!ctx || !req)
         return kbox_dispatch_errno(EINVAL);
+    h = ctx->host_nrs;
 
     /* A vfork parent is suspended until its child execs, so its first syscall
      * afterwards is the moment the exec rewrite can be undone. Doing it here,
      * rather than from a watcher thread guessing when the exec landed, means
      * the bytes are never restored while the kernel has yet to read them. */
+    /* The guest-memory writers act on the active guest, which is the process
+     * making this request, so the context must be set before any restore. */
+    kbox_dispatch_prepare_request_ctx(ctx, req);
     for (size_t i = 0;
          i < sizeof(ctx->vfork_pending) / sizeof(ctx->vfork_pending[0]); i++) {
         struct kbox_vfork_pending *slot = &ctx->vfork_pending[i];
@@ -6172,10 +6496,17 @@ struct kbox_dispatch kbox_dispatch_request(
             continue;
         if (slot->parent != (pid_t) kbox_syscall_request_pid(req))
             continue;
-        struct iovec local = {.iov_base = slot->saved, .iov_len = slot->len};
-        struct iovec remote = {.iov_base = (void *) (uintptr_t) slot->addr,
-                               .iov_len = slot->len};
-        (void) process_vm_writev(slot->parent, &local, 1, &remote, 1, 0);
+        /* The rewritten bytes are often a string literal in a read-only page
+         * (static binaries keep the "/bin/sh" given to posix_spawn in
+         * .rodata), so fall back to the forced write the rewrite itself used.
+         */
+        if (guest_mem_write(ctx, slot->parent, slot->addr, slot->saved,
+                            slot->len) < 0 &&
+            guest_mem_write_force(ctx, slot->parent, slot->addr, slot->saved,
+                                  slot->len) < 0 &&
+            ctx->verbose)
+            fprintf(stderr, "kbox: exec: vfork parent %d restore failed\n",
+                    (int) slot->parent);
         if (ctx->verbose)
             fprintf(stderr,
                     "kbox: exec: vfork parent %d restored on syscall nr=%d\n",
@@ -6184,15 +6515,28 @@ struct kbox_dispatch kbox_dispatch_request(
         slot->saved = NULL;
     }
 
-    kbox_dispatch_prepare_request_ctx(ctx, req);
     nr = req->nr;
+    if (ctx->verbose)
+        verbose_monitor_pids((pid_t) kbox_syscall_request_pid(req));
 
     if (ctx->verbose) {
         const char *name = syscall_name_from_nr(h, nr);
-        fprintf(stderr, "%s syscall: pid=%u nr=%d (%s)\n",
+        fprintf(stderr,
+                "%s syscall: pid=%u nr=%d (%s) a0=%lld a1=%lld a2=%lld\n",
                 req->source == KBOX_SYSCALL_SOURCE_SECCOMP ? "seccomp notify"
                                                            : "in-process",
-                kbox_syscall_request_pid(req), nr, name ? name : "unknown");
+                kbox_syscall_request_pid(req), nr, name ? name : "unknown",
+                (long long) kbox_syscall_request_arg(req, 0),
+                (long long) kbox_syscall_request_arg(req, 1),
+                (long long) kbox_syscall_request_arg(req, 2));
+        if (nr == h->openat || nr == h->newfstatat || nr == h->faccessat ||
+            nr == h->readlinkat) {
+            char vp[256];
+            if (guest_mem_read_string(ctx, kbox_syscall_request_pid(req),
+                                      kbox_syscall_request_arg(req, 1), vp,
+                                      sizeof(vp)) >= 0)
+                fprintf(stderr, "kbox:   path=%s\n", vp);
+        }
     }
 
     /* Table-driven dispatch: forward to handler. */
@@ -6268,6 +6612,22 @@ struct kbox_dispatch kbox_dispatch_request(
         nr == h->msgsnd || nr == h->msgrcv || nr == h->msgctl)
         return kbox_dispatch_continue();
 
+    /* setpriority only touches the tracee's own scheduler state; left to the
+     * default it was refused with ENOSYS and Chromium logged it per thread.
+     */
+    if (nr == h->setpriority)
+        return kbox_dispatch_continue();
+
+    /* exit_group is notified (not BPF-allowed) so verbose mode can show how a
+     * process ended; the host kernel still performs the exit. */
+    if (nr == h->exit_group) {
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: exit_group pid=%u code=%lld\n",
+                    kbox_syscall_request_pid(req),
+                    (long long) kbox_syscall_request_arg(req, 0));
+        return kbox_dispatch_continue();
+    }
+
     if (nr == h->getpid) {
         if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP)
             return kbox_dispatch_continue();
@@ -6283,6 +6643,13 @@ struct kbox_dispatch kbox_dispatch_request(
         if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP)
             return kbox_dispatch_continue();
         return kbox_dispatch_value(1);
+    }
+
+    /* root_identity containers get per-process virtual credentials. */
+    if (ctx->root_identity) {
+        struct kbox_dispatch vd;
+        if (dispatch_vcred_identity(req, ctx, &vd))
+            return vd;
     }
 
     /* Identity: UID. */
@@ -6695,6 +7062,33 @@ struct kbox_dispatch kbox_dispatch_request(
         fprintf(stderr, "kbox: DENY unknown syscall nr=%d (pid=%u)\n", nr,
                 kbox_syscall_request_pid(req));
     return kbox_dispatch_errno(ENOSYS);
+}
+
+struct kbox_dispatch kbox_dispatch_request(
+    struct kbox_supervisor_ctx *ctx,
+    const struct kbox_syscall_request *req)
+{
+    struct kbox_dispatch d = dispatch_request_impl(ctx, req);
+
+    /* Verbose mode shows entries only; without results a refused syscall is
+     * invisible when diagnosing why an unmodified image misbehaves. */
+    if (ctx && req && ctx->verbose && d.kind == KBOX_DISPATCH_RETURN &&
+        d.error != 0) {
+        const char *name = syscall_name_from_nr(ctx->host_nrs, req->nr);
+        fprintf(stderr, "kbox: result pid=%u nr=%d (%s) -> errno %d\n",
+                kbox_syscall_request_pid(req), (int) req->nr,
+                name ? name : "unknown", d.error);
+    }
+    if (ctx && req && ctx->verbose && d.kind == KBOX_DISPATCH_RETURN &&
+        d.error == 0) {
+        const char *name = syscall_name_from_nr(ctx->host_nrs, req->nr);
+        if (name &&
+            (strncmp(name, "recv", 4) == 0 || strncmp(name, "send", 4) == 0))
+            fprintf(stderr, "kbox: result pid=%u nr=%d (%s) -> %lld\n",
+                    kbox_syscall_request_pid(req), (int) req->nr, name,
+                    (long long) d.val);
+    }
+    return d;
 }
 
 struct kbox_dispatch kbox_dispatch_syscall(struct kbox_supervisor_ctx *ctx,

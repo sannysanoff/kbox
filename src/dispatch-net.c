@@ -14,14 +14,22 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <stdlib.h>
 #include "dispatch-internal.h"
 #include "net.h"
+
+#define KBOX_UNIX_TYPE_MAX 8192
+/* Per tracee fd: socket type (low 7 bits) and a nonblocking flag (0x80) of
+ * AF_UNIX sockets created through forward_socket; 0 = not one of ours. */
+static uint8_t g_unix_type[KBOX_UNIX_TYPE_MAX];
 
 /* Shadow socket design:
  *   1. Create an LKL network socket inside LKL's network stack
@@ -115,6 +123,27 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
 
     int base_type = (int) type_raw & 0xFF;
 
+    /* AF_UNIX: LKL has no UNIX sockets; the socket is a host passthrough fd. */
+    if (domain == AF_UNIX) {
+        int hfd =
+            socket(AF_UNIX, (int) type_raw | SOCK_CLOEXEC, (int) protocol);
+        if (hfd < 0)
+            return kbox_dispatch_errno(errno);
+        uint32_t af = (type_raw & SOCK_CLOEXEC) ? O_CLOEXEC : 0;
+        int tfd = request_addfd(ctx, req, hfd, af);
+        close(hfd);
+        if (tfd < 0)
+            return kbox_dispatch_errno(-tfd);
+        track_host_passthrough_fd(ctx->fd_table, tfd);
+        if (tfd >= 0 && tfd < KBOX_UNIX_TYPE_MAX)
+            g_unix_type[tfd] =
+                (uint8_t) ((base_type & 0x7f) |
+                           ((type_raw & SOCK_NONBLOCK) ? 0x80 : 0));
+        if (type_raw & SOCK_CLOEXEC)
+            kbox_fd_table_set_cloexec(ctx->fd_table, tfd, 1);
+        return kbox_dispatch_value(tfd);
+    }
+
     long ret = kbox_lkl_socket(ctx->sysnrs, domain, type_raw, protocol);
     if (ret < 0)
         return kbox_dispatch_errno((int) (-ret));
@@ -150,6 +179,146 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
     return kbox_dispatch_value(out_fd);
 }
 
+/* AF_UNIX sockets.
+ *
+ * LKL is built without UNIX sockets, so a path-named AF_UNIX socket lives in
+ * the host kernel as a passthrough fd. The guest's path is inside its LKL
+ * rootfs, which the host cannot see, so bind and connect map it to a private
+ * host path (one directory per container, one hashed name per guest path).
+ * bind also leaves an empty placeholder at the guest path in LKL so stat,
+ * chmod and unlink of the socket file (postgres does all three) behave.
+ * Abstract names (leading NUL) need no mapping and go to the host as they are.
+ */
+static int unix_host_path(const struct kbox_supervisor_ctx *ctx,
+                          const char *guest_path,
+                          char *out,
+                          size_t out_size)
+{
+    uint64_t h = 1469598103934665603ULL; /* FNV-1a */
+    char dir[96];
+
+    for (const char *p = guest_path; *p; p++) {
+        h ^= (unsigned char) *p;
+        h *= 1099511628211ULL;
+    }
+    mkdir("/dev/shm/kbox-unix", 0777);
+    /* A container's sockets are shared with its exec sessions (pg_isready
+     * after docker exec), which are separate supervisors with their own
+     * child pids. The container's IP is the one thing all of them agree on. */
+    if (ctx->own_ip[0])
+        snprintf(dir, sizeof(dir), "/dev/shm/kbox-unix/ip-%s", ctx->own_ip);
+    else
+        snprintf(dir, sizeof(dir), "/dev/shm/kbox-unix/%d",
+                 (int) ctx->child_pid);
+    mkdir(dir, 0777);
+    if (snprintf(out, out_size, "%s/%016llx", dir, (unsigned long long) h) >=
+        (int) out_size)
+        return -ENAMETOOLONG;
+    return 0;
+}
+
+/* Handle bind/connect of a passthrough socket to an AF_UNIX path. Returns 1
+ * and fills *out when handled; 0 means "not an AF_UNIX path address". */
+static int unix_path_call(const struct kbox_syscall_request *req,
+                          struct kbox_supervisor_ctx *ctx,
+                          int is_bind,
+                          struct kbox_dispatch *out)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    uint64_t addr_ptr = kbox_syscall_request_arg(req, 1);
+    int64_t len_raw = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    uint8_t buf[sizeof(struct sockaddr_un) + 8];
+    struct sockaddr_un host;
+    char gpath[sizeof(host.sun_path) + 1];
+    char hpath[sizeof(host.sun_path)];
+    size_t plen;
+
+    if (addr_ptr == 0 || len_raw < 3 || len_raw > (int64_t) sizeof(buf))
+        return 0;
+    if (guest_mem_read(ctx, pid, addr_ptr, buf, (size_t) len_raw) < 0)
+        return 0;
+    if (buf[0] != AF_UNIX || buf[1] != 0 || buf[2] != '/')
+        return 0; /* not AF_UNIX, abstract, or relative */
+
+    plen = (size_t) len_raw - 2;
+    if (plen > sizeof(host.sun_path))
+        plen = sizeof(host.sun_path);
+    memcpy(gpath, buf + 2, plen);
+    gpath[plen] = '\0'; /* sun_path need not be NUL-terminated */
+
+    int rc = unix_host_path(ctx, gpath, hpath, sizeof(hpath));
+    if (rc < 0) {
+        *out = kbox_dispatch_errno(-rc);
+        return 1;
+    }
+    memset(&host, 0, sizeof(host));
+    host.sun_family = AF_UNIX;
+    memcpy(host.sun_path, hpath, strlen(hpath));
+
+    /* The supervisor cannot reach the tracee's socket (pidfd_getfd is blocked
+     * and /proc/<pid>/fd refuses sockets), so it makes a fresh socket of the
+     * same type, binds or connects that one on the host path, and swaps it in
+     * at the same fd number with ADDFD_AT. */
+    int utype = SOCK_STREAM;
+    int unb = 0;
+    if (fd >= 0 && fd < KBOX_UNIX_TYPE_MAX && g_unix_type[fd]) {
+        utype = g_unix_type[fd] & 0x7f;
+        unb = g_unix_type[fd] & 0x80;
+    }
+    int nsock =
+        socket(AF_UNIX, utype | SOCK_CLOEXEC | (unb ? SOCK_NONBLOCK : 0), 0);
+    if (nsock < 0) {
+        *out = kbox_dispatch_errno(errno);
+        return 1;
+    }
+
+    if (is_bind) {
+        struct kbox_lkl_stat kst;
+        memset(&kst, 0, sizeof(kst));
+        if (kbox_lkl_newfstatat(ctx->sysnrs, AT_FDCWD_LINUX, gpath, &kst, 0) >=
+            0) {
+            close(nsock);
+            *out = kbox_dispatch_errno(EADDRINUSE); /* guest file exists */
+            return 1;
+        }
+        unlink(hpath); /* stale socket of an earlier run */
+        if (bind(nsock, (struct sockaddr *) &host, sizeof(host)) < 0) {
+            int e = errno;
+            close(nsock);
+            *out = kbox_dispatch_errno(e);
+            return 1;
+        }
+    } else if (connect(nsock, (struct sockaddr *) &host, sizeof(host)) < 0) {
+        int e = errno;
+        close(nsock);
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: unix: connect %s -> %s: %s\n", gpath, hpath,
+                    strerror(e));
+        *out = kbox_dispatch_errno(e);
+        return 1;
+    }
+
+    uint32_t af = kbox_fd_table_get_cloexec(ctx->fd_table, fd) ? O_CLOEXEC : 0;
+    int swapped = request_addfd_at(ctx, req, nsock, (int) fd, af);
+    close(nsock);
+    if (swapped < 0) {
+        *out = kbox_dispatch_errno(-swapped);
+        return 1;
+    }
+    if (is_bind) {
+        long ph = kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX, gpath,
+                                  O_CREAT | O_EXCL | O_WRONLY, 0666);
+        if (ph >= 0)
+            lkl_close_and_invalidate(ctx, ph);
+    }
+    if (ctx->verbose)
+        fprintf(stderr, "kbox: unix: %s %s -> %s\n",
+                is_bind ? "bind" : "connect", gpath, hpath);
+    *out = kbox_dispatch_value(0);
+    return 1;
+}
+
 static long resolve_lkl_socket(struct kbox_supervisor_ctx *ctx, long fd);
 
 struct kbox_dispatch forward_bind(const struct kbox_syscall_request *req,
@@ -159,8 +328,12 @@ struct kbox_dispatch forward_bind(const struct kbox_syscall_request *req,
     long lkl_fd = resolve_lkl_socket(ctx, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd))) {
+        struct kbox_dispatch ud;
+        if (unix_path_call(req, ctx, 1, &ud))
+            return ud;
         return kbox_dispatch_continue();
+    }
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
 
@@ -587,8 +760,12 @@ struct kbox_dispatch forward_connect(const struct kbox_syscall_request *req,
     long lkl_fd = resolve_lkl_socket(ctx, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd))) {
+        struct kbox_dispatch ud;
+        if (unix_path_call(req, ctx, 0, &ud))
+            return ud;
         return kbox_dispatch_continue();
+    }
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
 
@@ -1163,6 +1340,58 @@ struct kbox_dispatch forward_recvfrom(const struct kbox_syscall_request *req,
     }
 
     return kbox_dispatch_value(ret);
+}
+
+/* sendmsg: the guest sees uid/gid from LKL (root), while the process the host
+ * kernel sees runs as an unprivileged user. An SCM_CREDENTIALS ucred built from
+ * getuid()/getgid() is therefore refused with EPERM, which broke Chromium's
+ * zygote hello and so every Chromium child process. Rewrite uid/gid to the
+ * real ones in place and let the host kernel send. Only the process's own
+ * credentials are written, so nothing can be forged through this.
+ *
+ * sendmsg(fd, msg, flags)
+ *   args[0]=fd, args[1]=msg_ptr, args[2]=flags
+ */
+struct kbox_dispatch forward_sendmsg(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+    uint64_t msg_addr = kbox_syscall_request_arg(req, 1);
+    struct msghdr mh;
+    char ctl[512];
+
+    if (guest_mem_read(ctx, pid, msg_addr, &mh, sizeof(mh)) != 0)
+        return kbox_dispatch_continue();
+    if (!mh.msg_control || mh.msg_controllen < sizeof(struct cmsghdr) ||
+        mh.msg_controllen > sizeof(ctl))
+        return kbox_dispatch_continue();
+    if (guest_mem_read(ctx, pid, (uint64_t) (uintptr_t) mh.msg_control, ctl,
+                       mh.msg_controllen) != 0)
+        return kbox_dispatch_continue();
+
+    /* Walk the control buffer as a copy: CMSG_NXTHDR on the guest's pointers
+     * would dereference tracee memory. */
+    size_t off = 0;
+    while (off + sizeof(struct cmsghdr) <= mh.msg_controllen) {
+        struct cmsghdr *c = (struct cmsghdr *) (ctl + off);
+        if (c->cmsg_len < sizeof(struct cmsghdr) ||
+            off + c->cmsg_len > mh.msg_controllen)
+            break;
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS &&
+            c->cmsg_len >= CMSG_LEN(sizeof(struct ucred))) {
+            struct ucred cred;
+            memcpy(&cred, CMSG_DATA(c), sizeof(cred));
+            cred.uid = geteuid();
+            cred.gid = getegid();
+            uint64_t dst = (uint64_t) (uintptr_t) mh.msg_control + off +
+                           (uint64_t) ((char *) CMSG_DATA(c) - (char *) c);
+            if (guest_mem_write(ctx, pid, dst, &cred, sizeof(cred)) != 0 &&
+                ctx->verbose)
+                fprintf(stderr, "kbox: sendmsg: ucred rewrite failed\n");
+        }
+        off += CMSG_ALIGN(c->cmsg_len);
+    }
+    return kbox_dispatch_continue();
 }
 
 /* Intercept for shadow sockets so that msg_name (source

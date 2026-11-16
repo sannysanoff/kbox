@@ -378,5 +378,15 @@ class TestDockerEngine(unittest.TestCase):
         self.assertEqual(insp["Name"], "/new-name")
 
 
+    def test_image_tag_adds_reference(self):
+        norm = self.engine.images.tag("alpine:latest", "tardis", "v1")
+        self.assertEqual(norm, "tardis:v1")
+        self.assertEqual(self.engine.images.resolve("tardis:v1"), self.img_id)
+        # A registry-qualified source resolves too, and untagged repo => latest.
+        self.engine.images.tag("alpine", "localhost:5000/x")
+        self.assertEqual(self.engine.images.resolve("localhost:5000/x"), self.img_id)
+        self.assertIsNone(self.engine.images.tag("nosuch:1", "y"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

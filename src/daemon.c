@@ -72,6 +72,11 @@ struct port_binding_spec {
     int container_port;
 };
 
+int kbox_guest_exe_realpath(const struct kbox_supervisor_ctx *ctx,
+                            const char *in,
+                            char *out,
+                            size_t out_size);
+
 struct daemon_proc_env {
     const struct kbox_host_bind *binds;
     /* Container has its own procfs mounted in its rootfs, so /proc must be
@@ -1450,7 +1455,9 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     ctx.host_bind_count = pe->bind_count;
     snprintf(ctx.host_cwd, sizeof(ctx.host_cwd), "%s",
              (pe->workdir && pe->workdir[0]) ? pe->workdir : "/");
-    snprintf(ctx.guest_exe, sizeof(ctx.guest_exe), "%s", resolved_cmd);
+    if (kbox_guest_exe_realpath(&ctx, resolved_cmd, ctx.guest_exe,
+                                sizeof(ctx.guest_exe)) != 0)
+        snprintf(ctx.guest_exe, sizeof(ctx.guest_exe), "%s", resolved_cmd);
     ctx.exit_notify_fd = *hooks->exit_efd;
     ctx.exit_status_ptr = hooks->exit_status;
 
@@ -1631,8 +1638,7 @@ static void *container_worker_thread(void *arg)
         lkl_mkdir_p(sysnrs, proc_dir, 0555);
         long pr = kbox_lkl_mount(sysnrs, "proc", proc_dir, "proc", 0, NULL);
         if (pr < 0 && g_verbose)
-            fprintf(stderr, "kboxd: container procfs mount failed (%ld)\n",
-                    pr);
+            fprintf(stderr, "kboxd: container procfs mount failed (%ld)\n", pr);
     }
 
     /* kbox reports /tmp as world-writable sticky in stat(2) but the image's
@@ -1810,9 +1816,10 @@ static void *container_worker_thread(void *arg)
 
     /* Release NFS subtree bind mounts before the namespace goes away. */
     if (g_config.nfs_count > 0 && c->bind_count > 0) {
-        char rootfs[160];
-        snprintf(rootfs, sizeof(rootfs), "/containers/%s/rootfs", c->id);
-        kbox_daemon_nfs_unbind_container(sysnrs, rootfs, c->binds,
+        char unbind_root[160];
+        snprintf(unbind_root, sizeof(unbind_root), "/containers/%s/rootfs",
+                 c->id);
+        kbox_daemon_nfs_unbind_container(sysnrs, unbind_root, c->binds,
                                          c->bind_count);
     }
     close_container_ns_fds(c, sysnrs);
@@ -1913,6 +1920,7 @@ static void *exec_worker_thread(void *arg)
         .cmd_count = e->cmd_count,
         .env = e->env,
         .env_count = e->env_count,
+        .own_ip = c->ip,
     };
     struct supervised_proc_hooks hooks = {
         .opaque = e,
@@ -2185,6 +2193,7 @@ static void handle_rpc_line(int client_fd, const char *req)
         slot->exit_efd = -1;
         slot->child_exit_status = -1;
         pthread_mutex_init(&slot->lock, NULL);
+        /* cppcheck-suppress nullPointer */
         pthread_cond_init(&slot->cv, NULL);
 
         snprintf(slot->id, sizeof(slot->id), "%s", cid);
@@ -2306,6 +2315,7 @@ static void handle_rpc_line(int client_fd, const char *req)
         eslot->child_exit_status = -1;
         eslot->cont = tc;
         pthread_mutex_init(&eslot->lock, NULL);
+        /* cppcheck-suppress nullPointer */
         pthread_cond_init(&eslot->cv, NULL);
         snprintf(eslot->id, sizeof(eslot->id), "%s", eid);
         snprintf(eslot->container_id, sizeof(eslot->container_id), "%s",

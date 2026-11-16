@@ -29,6 +29,14 @@
 #define KBOX_SECCOMP_DATA_IP_LO_OFFSET 8
 #define KBOX_SECCOMP_DATA_IP_HI_OFFSET 12
 #define KBOX_SECCOMP_DATA_ARG0_LO_OFFSET 16
+#define KBOX_SECCOMP_DATA_ARG2_LO_OFFSET 32
+
+/* flags value of the one sendmsg that bypasses the supervisor: the child's
+ * listener-fd handoff, sent before the supervisor loop exists. It is
+ * MSG_CMSG_CLOEXEC, which the kernel ignores on send and a guest never passes
+ * to sendmsg. Every other sendmsg is notified so SCM_CREDENTIALS can be fixed
+ * up (see forward_sendmsg). */
+#define KBOX_SENDMSG_HANDSHAKE_FLAG 0x40000000U
 
 #if defined(__x86_64__)
 #define KBOX_AUDIT_ARCH_CURRENT 0xc000003eU

@@ -282,6 +282,17 @@ class ImageStore:
                     return iid
         return None
 
+    def tag(self, src, repo, tag=None):
+        """Point repo:tag at the image src resolves to (docker tag)."""
+        iid = self.resolve(src)
+        if not iid:
+            return None
+        norm, _, _ = self.normalize_ref(repo, tag)
+        with self.lock:
+            self.tags[norm] = iid
+            self._save_tags()
+        return norm
+
     def get_meta(self, img_id):
         meta_path = os.path.join(self.img_dir, img_id.removeprefix("sha256:"), "meta.json")
         if not os.path.exists(meta_path):
@@ -1671,6 +1682,20 @@ class DockerHandler(BaseHTTPRequestHandler):
                 traceback.print_exc()
                 self._write_chunk(json.dumps({"error": str(e), "errorDetail": {"message": str(e)}}) + "\n")
             self._end_chunked()
+            return
+
+        m = re.match(r"^/images/(.+)/tag$", path)
+        if m:
+            src = urllib.parse.unquote(m.group(1))
+            repo = (qs.get("repo") or [""])[0]
+            tag = (qs.get("tag") or [None])[0]
+            if not repo:
+                self.send_json(400, {"message": "repo required"})
+                return
+            if eng.images.tag(src, repo, tag) is None:
+                self.send_json(404, {"message": f"No such image: {src}"})
+                return
+            self.send_empty(201)
             return
 
         if path == "/networks/create":

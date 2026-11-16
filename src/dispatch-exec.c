@@ -146,6 +146,78 @@ const char *kbox_guest_exe_for(struct kbox_supervisor_ctx *ctx, pid_t pid)
     return ctx->guest_exe;
 }
 
+/* Resolve every symlink in an absolute guest path through LKL, like the
+ * kernel does for /proc/<pid>/exe. A loader that expands $ORIGIN from that link
+ * (glibc and musl both do) must see the real directory: /usr/bin/java is a
+ * symlink into /usr/lib/jvm/..., and java finds libjli.so relative to the real
+ * binary. Returns 0 and fills out, or -1 (caller keeps the unresolved path). */
+int kbox_guest_exe_realpath(const struct kbox_supervisor_ctx *ctx,
+                            const char *in,
+                            char *out,
+                            size_t out_size)
+{
+    char rest[KBOX_MAX_PATH];
+    char cur[KBOX_MAX_PATH];
+    int hops = 0;
+
+    if (in[0] != '/' || strlen(in) >= sizeof(rest))
+        return -1;
+    snprintf(rest, sizeof(rest), "%s", in);
+    cur[0] = '\0';
+
+    while (rest[0]) {
+        char *comp = rest;
+        while (*comp == '/')
+            comp++;
+        if (!*comp)
+            break;
+        char *end = comp;
+        while (*end && *end != '/')
+            end++;
+        char saved = *end;
+        *end = '\0';
+
+        if (strcmp(comp, ".") == 0) {
+            /* nothing */
+        } else if (strcmp(comp, "..") == 0) {
+            char *slash = strrchr(cur, '/');
+            if (slash)
+                *slash = '\0';
+        } else {
+            size_t cl = strlen(cur);
+            if (cl + 1 + strlen(comp) >= sizeof(cur))
+                return -1;
+            cur[cl] = '/';
+            snprintf(cur + cl + 1, sizeof(cur) - cl - 1, "%s", comp);
+
+            char target[KBOX_MAX_PATH];
+            long n = kbox_lkl_readlinkat(ctx->sysnrs, AT_FDCWD_LINUX, cur,
+                                         target, sizeof(target) - 1);
+            if (n > 0) {
+                if (++hops > 40)
+                    return -1;
+                target[n] = '\0';
+                char tail[KBOX_MAX_PATH];
+                *end = saved;
+                snprintf(tail, sizeof(tail), "%s", end);
+                if (target[0] == '/')
+                    cur[0] = '\0';
+                else
+                    *strrchr(cur, '/') = '\0';
+                if (snprintf(rest, sizeof(rest), "%s%s", target, tail) >=
+                    (int) sizeof(rest))
+                    return -1;
+                continue;
+            }
+        }
+        *end = saved;
+        memmove(rest, end, strlen(end) + 1);
+    }
+    if (snprintf(out, out_size, "%s", cur[0] ? cur : "/") >= (int) out_size)
+        return -1;
+    return 0;
+}
+
 void kbox_guest_exe_set(struct kbox_supervisor_ctx *ctx,
                         pid_t pid,
                         const char *path)
@@ -165,16 +237,32 @@ void kbox_guest_exe_set(struct kbox_supervisor_ctx *ctx,
         if (free_slot == n && ctx->exe_map[i].pid == 0)
             free_slot = i;
     }
+    /* Slots are never released when a process exits, so a long-running
+     * container (a shell script forking sed/grep/dirname in a loop) fills all
+     * of them. A full table silently dropped the new entry and /proc/self/exe
+     * then named an ancestor -- the JVM launcher computed $ORIGIN from
+     * /bin/bash and could not find libjli.so. Reuse the slot of a dead
+     * process; if every one is alive, replace the oldest-numbered pid. */
+    if (free_slot == n) {
+        for (size_t i = 0; i < n; i++) {
+            if (kill(ctx->exe_map[i].pid, 0) < 0 && errno == ESRCH) {
+                free_slot = i;
+                break;
+            }
+        }
+    }
+    if (free_slot == n) {
+        free_slot = 0;
+        for (size_t i = 1; i < n; i++)
+            if (ctx->exe_map[i].pid < ctx->exe_map[free_slot].pid)
+                free_slot = i;
+    }
     if (free_slot < n) {
         ctx->exe_map[free_slot].pid = pid;
         snprintf(ctx->exe_map[free_slot].path,
                  sizeof(ctx->exe_map[free_slot].path), "%s", path);
     }
 }
-
-/* See the comment at the vfork snapshot site: a downgraded vfork shares no
- * memory, so there is nothing to put back. */
-static const int s_kbox_vfork_snapshot = 0;
 
 /* mmap dispatch: if the FD is a virtual FD with no host shadow, create the
  * shadow on demand (lazy shadow) and inject it into the tracee at the same FD
@@ -1449,6 +1537,31 @@ static struct kbox_dispatch forward_execve_impl(
  * "/proc/self/fd/N" where its own path used to be and every later fork in it
  * execs a descriptor that belongs to the child.
  */
+/* Do two tracees run on one address space (CLONE_VM)? */
+static int tracee_shares_vm(pid_t a, pid_t b)
+{
+    long r = syscall(SYS_kcmp, (long) a, (long) b, 1 /* KCMP_VM */, 0L, 0L);
+
+    if (r >= 0)
+        return r == 0;
+
+    /* kcmp needs CAP_SYS_PTRACE and is often filtered in containers. A vfork
+     * parent sleeps uninterruptibly ('D') until its child execs; a plain-fork
+     * parent never does. */
+    char path[64], line[512];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int) a);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    ssize_t n = read(fd, line, sizeof(line) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    line[n] = '\0';
+    char *rp = strrchr(line, ')');
+    return rp && rp[1] == ' ' && rp[2] == 'D';
+}
+
 /* Record that vfork parent is waiting for exec. */
 static int vfork_parent_recorded(const struct kbox_supervisor_ctx *ctx,
                                  pid_t pp)
@@ -1745,24 +1858,23 @@ static struct kbox_dispatch forward_execve_impl(
      * fork in it execs a descriptor that belongs to this child. */
     {
         pid_t pp = tracee_parent_of(pid);
-        if (pp > 0 && vfork_parent_recorded(ctx, pp)) {
-            uint64_t lo = path_addr < argv_addr ? path_addr : argv_addr;
-            uint64_t hi = path_addr > argv_addr ? path_addr : argv_addr;
-            const uint64_t margin = 32768;
-            lo = lo > margin ? lo - margin : 0;
-            size_t len = (size_t) (hi + margin - lo);
-            if (len > 65536)
-                len = 65536;
-            /* Snapshotting is off: clone(CLONE_VFORK) is downgraded to a plain
-             * fork in forward_clone3, so the child writes into its own copy of
-             * these pages and the parent was never touched. Restoring a
-             * snapshot anyway rewinds the parent's stack over the bookkeeping
-             * glibc's posix_spawn has just done, and posix_spawn -- which is
-             * what system(), popen and initdb all use -- then dies with
-             * SIGSEGV before it can report anything.
-             */
+        /* vfork_parents remembers every process that ever vforked, so a later
+         * plain fork() of the same parent also lands here. Its child has a
+         * private copy of the memory; "restoring" the saved bytes into the live
+         * parent would write stale data over whatever it has done since (dash's
+         * heap -- "malloc(): unaligned tcache chunk detected"). Only snapshot
+         * when the two really share one address space. */
+        if (pp > 0 && vfork_parent_recorded(ctx, pp) &&
+            tracee_shares_vm(pp, pid)) {
+            /* Save exactly the bytes about to be overwritten: the pathname.
+             * (An earlier version saved +-32 KiB around it; restoring that
+             * rewound the parent's stack over posix_spawn's own bookkeeping
+             * and crashed it.) The pathname is usually a string literal in a
+             * read-only page, restored with guest_mem_write on the parent's
+             * next syscall. Strings that relocation moves go below the stack
+             * pointer, which nothing reads again. */
+            size_t len = total_write;
             for (size_t i = 0;
-                 s_kbox_vfork_snapshot &&
                  i < sizeof(ctx->vfork_pending) / sizeof(ctx->vfork_pending[0]);
                  i++) {
                 struct kbox_vfork_pending *slot = &ctx->vfork_pending[i];
@@ -1771,19 +1883,19 @@ static struct kbox_dispatch forward_execve_impl(
                 unsigned char *buf = malloc(len);
                 if (!buf)
                     break;
-                if (guest_mem_read(ctx, pid, lo, buf, len) != 0) {
+                if (guest_mem_read(ctx, pid, path_addr, buf, len) != 0) {
                     free(buf);
                     break;
                 }
                 slot->parent = pp;
-                slot->addr = lo;
+                slot->addr = path_addr;
                 slot->len = len;
                 slot->saved = buf;
                 if (ctx->verbose)
                     fprintf(stderr,
                             "kbox: exec: vfork parent %d snapshotted "
                             "0x%llx+%zu\n",
-                            (int) pp, (unsigned long long) lo, len);
+                            (int) pp, (unsigned long long) path_addr, len);
                 break;
             }
         }
@@ -1806,7 +1918,14 @@ static struct kbox_dispatch forward_execve_impl(
         return kbox_dispatch_errno(ENOEXEC);
     }
 
-    kbox_guest_exe_set(ctx, pid, pathbuf);
+    {
+        char real_exe[KBOX_MAX_PATH];
+        kbox_guest_exe_set(ctx, pid,
+                           kbox_guest_exe_realpath(ctx, pathbuf, real_exe,
+                                                   sizeof(real_exe)) == 0
+                               ? real_exe
+                               : pathbuf);
+    }
 
     if (ctx->verbose)
         fprintf(stderr, "kbox: exec %s -> /proc/self/fd/%d\n", pathbuf,

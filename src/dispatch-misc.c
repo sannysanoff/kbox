@@ -26,6 +26,7 @@
 
 #include "dispatch-internal.h"
 #include "kbox/path.h"
+#include "vcred.h"
 
 struct kbox_dispatch forward_clock_gettime(
     const struct kbox_syscall_request *req,
@@ -124,7 +125,8 @@ struct kbox_dispatch forward_gettimeofday(
  * ours. */
 static int synthesize_proc_magic_link(const struct kbox_syscall_request *req,
                                       struct kbox_supervisor_ctx *ctx,
-                                      char *out, size_t out_size)
+                                      char *out,
+                                      size_t out_size)
 {
     pid_t pid = kbox_syscall_request_pid(req);
     char path[KBOX_MAX_PATH];
@@ -850,11 +852,10 @@ static struct kbox_dispatch dispatch_iov_transfer(
                                : kbox_lkl_pread64(ctx->sysnrs, lkl_fd, scratch,
                                                   (long) chunk, (long) at);
             else
-                ret = is_write
-                          ? kbox_lkl_write(ctx->sysnrs, lkl_fd, scratch,
-                                           (long) chunk)
-                          : kbox_lkl_read(ctx->sysnrs, lkl_fd, scratch,
-                                          (long) chunk);
+                ret = is_write ? kbox_lkl_write(ctx->sysnrs, lkl_fd, scratch,
+                                                (long) chunk)
+                               : kbox_lkl_read(ctx->sysnrs, lkl_fd, scratch,
+                                               (long) chunk);
             if (ret < 0) {
                 err = (int) (-ret);
                 goto done;
@@ -1039,6 +1040,44 @@ struct kbox_dispatch forward_fchmod(const struct kbox_syscall_request *req,
         invalidate_stat_cache_fd(ctx, lkl_fd);
     }
     return kbox_dispatch_from_lkl(ret);
+}
+
+/* fchown: LKL files go to LKL; host descriptors cannot be chowned by an
+ * unprivileged supervisor, so a virtual-root guest's request lands in the
+ * ownership overlay (see vcred.h). */
+struct kbox_dispatch forward_fchown(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx)
+{
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    long owner = (int32_t) kbox_syscall_request_arg(req, 1);
+    long group = (int32_t) kbox_syscall_request_arg(req, 2);
+    long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+
+    if (lkl_fd >= 0) {
+        long ret = kbox_lkl_fchownat(ctx->sysnrs, lkl_fd, "", owner, group,
+                                     0x1000 /* AT_EMPTY_PATH */);
+        if (ret >= 0) {
+            invalidate_path_shadow_cache(ctx);
+            invalidate_stat_cache_fd(ctx, lkl_fd);
+        }
+        return kbox_dispatch_from_lkl(ret);
+    }
+    if (!(ctx->root_identity))
+        return kbox_dispatch_continue();
+
+    pid_t pid = kbox_syscall_request_pid(req);
+    struct kbox_vcred c;
+    struct stat st;
+    char link[64];
+
+    kbox_vcred_get(pid, &c);
+    if (c.euid != 0)
+        return kbox_dispatch_errno(EPERM);
+    snprintf(link, sizeof(link), "/proc/%d/fd/%ld", (int) pid, fd);
+    if (stat(link, &st) < 0)
+        return kbox_dispatch_errno(errno);
+    kbox_owner_set(st.st_dev, st.st_ino, owner, group);
+    return kbox_dispatch_value(0);
 }
 
 struct kbox_dispatch forward_fadvise64(const struct kbox_syscall_request *req,
@@ -1379,17 +1418,69 @@ struct kbox_dispatch forward_eventfd(const struct kbox_syscall_request *req,
     int flags = (int) to_c_long_arg(kbox_syscall_request_arg(req, 1));
 
     int host_fd = eventfd(initval, flags & ~EFD_CLOEXEC);
-    if (host_fd < 0)
+    if (host_fd < 0) {
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: eventfd2(%u, 0x%x): host errno %d\n",
+                    initval, (unsigned) flags, errno);
         return kbox_dispatch_errno(errno);
+    }
 
     uint32_t addfd_flags = (flags & EFD_CLOEXEC) ? O_CLOEXEC : 0;
     int tracee_fd = request_addfd(ctx, req, host_fd, addfd_flags);
     close(host_fd);
-    if (tracee_fd < 0)
+    if (tracee_fd < 0) {
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: eventfd2: addfd failed: %d\n", tracee_fd);
         return kbox_dispatch_errno(-tracee_fd);
+    }
 
     track_host_passthrough_fd(ctx->fd_table, tracee_fd);
     if (flags & EFD_CLOEXEC)
+        kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
+
+    return kbox_dispatch_value(tracee_fd);
+}
+
+/* memfd_create: an anonymous host file with no path. Chromium makes its
+ * shared-memory regions with it. The fd has to be injected and tracked like
+ * eventfd, because a plain CONTINUE leaves it unknown to the fd table and the
+ * very next ftruncate/mmap/fstat on it then fails with EBADF. */
+struct kbox_dispatch forward_memfd_create(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    char name[256];
+    unsigned int flags =
+        (unsigned int) to_c_long_arg(kbox_syscall_request_arg(req, 1));
+    pid_t pid = kbox_syscall_request_pid(req);
+    int rc = guest_mem_read_string(ctx, pid, kbox_syscall_request_arg(req, 0),
+                                   name, sizeof(name));
+    if (rc < 0) {
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: memfd_create: name read failed: %d\n", rc);
+        return kbox_dispatch_errno(-rc);
+    }
+
+    int host_fd = (int) syscall(SYS_memfd_create, name, flags & ~1U);
+    if (host_fd < 0) {
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: memfd_create(\"%s\", 0x%x): host errno %d\n",
+                    name, flags, errno);
+        return kbox_dispatch_errno(errno);
+    }
+
+    uint32_t addfd_flags = (flags & 1U) ? O_CLOEXEC : 0;
+    int tracee_fd = request_addfd(ctx, req, host_fd, addfd_flags);
+    close(host_fd);
+    if (tracee_fd < 0) {
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: memfd_create(\"%s\"): addfd failed: %d\n",
+                    name, tracee_fd);
+        return kbox_dispatch_errno(-tracee_fd);
+    }
+
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+    if (flags & 1U)
         kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
 
     return kbox_dispatch_value(tracee_fd);
@@ -1404,8 +1495,7 @@ struct kbox_dispatch forward_signalfd4(const struct kbox_syscall_request *req,
 {
     int ufd = (int) to_c_long_arg(kbox_syscall_request_arg(req, 0));
     uint64_t mask_addr = kbox_syscall_request_arg(req, 1);
-    size_t sizemask =
-        (size_t) to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    size_t sizemask = (size_t) to_c_long_arg(kbox_syscall_request_arg(req, 2));
     int flags = (int) to_c_long_arg(kbox_syscall_request_arg(req, 3));
     pid_t pid = kbox_syscall_request_pid(req);
 

@@ -9,6 +9,7 @@ TEST_SRCS  = $(TEST_DIR)/test-runner.c \
              $(TEST_DIR)/test-mount.c \
              $(TEST_DIR)/test-cli.c \
              $(TEST_DIR)/test-identity.c \
+             $(TEST_DIR)/test-vcred.c \
              $(TEST_DIR)/test-syscall-nr.c \
              $(TEST_DIR)/test-elf.c \
              $(TEST_DIR)/test-x86-decode.c
@@ -35,6 +36,7 @@ TEST_SUPPORT_SRCS = $(SRC_DIR)/fd-table.c \
                     $(TEST_DIR)/test-mount-stubs.c \
                     $(SRC_DIR)/cli.c \
                     $(SRC_DIR)/identity.c \
+                    $(SRC_DIR)/vcred.c \
                     $(SRC_DIR)/syscall-nr.c \
                     $(SRC_DIR)/elf.c \
                     $(SRC_DIR)/x86-decode.c

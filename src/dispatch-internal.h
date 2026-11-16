@@ -485,6 +485,10 @@ struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
 struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
                                       struct kbox_supervisor_ctx *ctx);
 const char *kbox_guest_exe_for(struct kbox_supervisor_ctx *ctx, pid_t pid);
+int kbox_guest_exe_realpath(const struct kbox_supervisor_ctx *ctx,
+                            const char *in,
+                            char *out,
+                            size_t out_size);
 void kbox_guest_exe_set(struct kbox_supervisor_ctx *ctx,
                         pid_t pid,
                         const char *path);
@@ -507,6 +511,8 @@ struct kbox_dispatch forward_fallocate(const struct kbox_syscall_request *req,
                                        struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_flock(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_fchown(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_fchmod(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_fadvise64(const struct kbox_syscall_request *req,
@@ -527,8 +533,16 @@ struct kbox_dispatch forward_readlinkat(const struct kbox_syscall_request *req,
                                         struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
                                   struct kbox_supervisor_ctx *ctx);
+int dispatch_vcred_identity(const struct kbox_syscall_request *req,
+                            struct kbox_supervisor_ctx *ctx,
+                            struct kbox_dispatch *out);
+struct kbox_dispatch forward_sendmsg(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_eventfd(const struct kbox_syscall_request *req,
                                      struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_memfd_create(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_signalfd4(const struct kbox_syscall_request *req,
                                        struct kbox_supervisor_ctx *ctx);
 

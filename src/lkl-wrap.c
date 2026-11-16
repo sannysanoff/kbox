@@ -426,6 +426,12 @@ long kbox_lkl_fsync(const struct kbox_sysnrs *s, long fd)
     return lkl_syscall6(s->fsync, fd, 0, 0, 0, 0, 0);
 }
 
+long kbox_lkl_msync(const struct kbox_sysnrs *s, long addr, long length,
+                    long flags)
+{
+    return lkl_syscall6(s->msync, addr, length, flags, 0, 0, 0);
+}
+
 long kbox_lkl_fdatasync(const struct kbox_sysnrs *s, long fd)
 {
     return lkl_syscall6(s->fdatasync, fd, 0, 0, 0, 0, 0);

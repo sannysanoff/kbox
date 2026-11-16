@@ -104,6 +104,7 @@
     X(fallocate)               \
     X(flock)                   \
     X(fsync)                   \
+    X(msync)                   \
     X(fdatasync)               \
     X(sync)                    \
     X(symlinkat)               \
@@ -235,7 +236,7 @@ struct kbox_sysnrs {
     long mmap, munmap;
     long ftruncate, fallocate, flock;
     long statfs, fstatfs;
-    long fsync, fdatasync, sync;
+    long fsync, fdatasync, sync, msync;
     long pipe2;
     long sendfile, copy_file_range;
     long umask;

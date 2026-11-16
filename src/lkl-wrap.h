@@ -231,6 +231,8 @@ long kbox_lkl_flock(const struct kbox_sysnrs *s, long fd, long operation);
 long kbox_lkl_fsync(const struct kbox_sysnrs *s, long fd);
 long kbox_lkl_fdatasync(const struct kbox_sysnrs *s, long fd);
 long kbox_lkl_sync(const struct kbox_sysnrs *s);
+long kbox_lkl_msync(const struct kbox_sysnrs *s, long addr, long length,
+                    long flags);
 long kbox_lkl_symlinkat(const struct kbox_sysnrs *s,
                         const char *target,
                         long newdirfd,

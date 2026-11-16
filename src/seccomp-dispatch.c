@@ -3325,6 +3325,15 @@ static struct kbox_dispatch forward_sendfile(
     if (out_lkl < 0 && fd_should_deny_io_ctx(ctx->fd_table, out_fd, out_lkl))
         return kbox_dispatch_errno(EBADF);
 
+    /* Both descriptors live in LKL, and the emulation below moves the bytes
+     * somewhere the caller cannot read back: cp reports the whole file copied
+     * and leaves an empty destination, which is how every configure script in
+     * an official image fails. Answer ENOSYS instead and let the caller fall
+     * back to read/write, which land correctly.
+     */
+    if (in_lkl >= 0 && out_lkl >= 0)
+        return kbox_dispatch_errno(ENOSYS);
+
     if (count_raw <= 0)
         return kbox_dispatch_value(0);
     size_t count = (size_t) count_raw;
@@ -5970,6 +5979,24 @@ struct kbox_dispatch kbox_dispatch_request(
         return forward_renameat(req, ctx);
     if (nr == h->copy_file_range)
         return kbox_dispatch_errno(ENOSYS);
+    /* msync had no dispatch entry at all, so the deny-unknown tail answered
+     * ENOSYS. Kafka's KRaft log -- and anything else that fsyncs a mapping --
+     * then failed with "Function not implemented (msync with parameter MS_SYNC
+     * failed)" and shut the broker down. The mapping belongs to LKL, so LKL has
+     * to be the one to write it back.
+     */
+    if (ctx->verbose && (nr == 26 || nr == 227))
+        fprintf(stderr, "kbox: msync seen nr=%d table_msync=%d\n", nr,
+                h->msync);
+
+    if (nr == h->msync ||
+        ((h->msync <= 0) && (nr == 26 || nr == 227))) {
+        /* The mapping lives in the tracee's own address space: file mappings
+         * are served from host shadows, so the kernel that has to write the
+         * pages back is the host one. Asking LKL about that address answers
+         * EINVAL/ENOSYS because it never mapped it. */
+        return kbox_dispatch_continue();
+    }
     if (nr == h->execve || nr == h->execveat) {
         if (ctx->proc_fd_count > 1)
             reap_dead_proc_fds(ctx);

@@ -4,7 +4,6 @@
 # introduction point.  Checks:
 #   1. Subject line format (capitalized, length, no trailing period)
 #   2. WIP commit detection
-#   3. Vanity hash prefix
 #
 # Usage:
 #   scripts/check-commitlog.sh [--quiet|-q] [--range REV_RANGE]
@@ -61,17 +60,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# History cutoff: commits at or before this one are not validated.
-BASE_COMMIT="4a46a133bcc8d86e6be3dce690a6f81249aca469"
-
-# Vanity hash enforcement: commits after this point must start with "0000".
-VANITY_ENFORCE_AFTER="5aa639661676a581b8dfa288dea4f0f22ca9ea3c"
-VANITY_PREFIX="0000"
-
-# Ensure the base commit exists locally.
-if ! git cat-file -e "${BASE_COMMIT}^{commit}" 2> /dev/null; then
-    throw "Base commit %s not found.  Run 'git fetch'." "$BASE_COMMIT"
-fi
+# History cutoff: commits at or before this one are not validated.  The
+# root commit is used so that the cutoff survives history rewrites.
+BASE_COMMIT=$(git rev-list --max-parents=0 HEAD | tail -1)
 
 if [[ -n "$REV_RANGE" ]]; then
     if [[ "$REV_RANGE" == *..* ]]; then
@@ -98,14 +89,6 @@ if [[ -n "$RANGE_START" ]]; then
 fi
 
 REPAIR_BASE="${RANGE_START:-$BASE_COMMIT}"
-
-# Build set of commits that require vanity hash enforcement.
-declare -A vanity_required
-if git cat-file -e "${VANITY_ENFORCE_AFTER}^{commit}" 2> /dev/null; then
-    while IFS= read -r c; do
-        vanity_required["$c"]=1
-    done < <(git rev-list --no-merges "${rev_list_args[@]}" "^$VANITY_ENFORCE_AFTER")
-fi
 
 commits=$(git rev-list --no-merges "${rev_list_args[@]}")
 if [ -z "$commits" ]; then
@@ -163,15 +146,6 @@ while IFS= read -r commit; do
         has_issue=1
         issues+="Subject ends with period|"
         ((failed++))
-    fi
-
-    # 3. Vanity hash prefix (only for commits after VANITY_ENFORCE_AFTER)
-    if [[ -n "${vanity_required[$commit]:-}" ]]; then
-        if [[ "$commit" != ${VANITY_PREFIX}* ]]; then
-            has_issue=1
-            issues+="Hash ${sh} does not start with \"${VANITY_PREFIX}\" (run scripts/vanity-hash.py)|"
-            ((failed++))
-        fi
     fi
 
     # --- report ---

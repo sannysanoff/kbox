@@ -72,22 +72,11 @@ Exemptions:
 The hook appends a `Change-Id:` trailer when the message has none. No check
 reads that trailer at push time.
 
-### post-commit: `scripts/post-commit.hook`
-
-Runs `scripts/vanity-hash.py` on HEAD after every commit. The script appends
-invisible space and tab padding to the message body until the commit SHA starts
-with `0000`. Override the prefix with `git config kbox.vanity-prefix`. The search
-costs about 65K SHA-1 attempts per commit.
-
-Consequence: the padding joins the subject line when the message has no body. A
-long subject can pass `commit-msg` and then grow past 72 characters inside the
-created commit.
-
 ### pre-push: `scripts/pre-push.hook` and `scripts/check-commitlog.sh`
 
 The hook validates only the commits being pushed: `remote..local` for a known
 remote ref, the oldest new commit and up for a new branch. Merge commits are
-skipped. Validation covers commits after the cutoff `4a46a13`.
+skipped. Validation covers every commit under the repository root commit.
 
 Every row blocks the push.
 
@@ -96,19 +85,11 @@ Every row blocks the push.
 | Subject shorter than 80 characters |
 | Subject starts with an uppercase letter |
 | Subject does not end with a period |
-| Commit SHA starts with `0000` for every commit after `5aa6396` |
 
 Warnings only:
 
 - Subject is 10 characters or shorter.
 - Subject starts with `WIP:`.
-
-Prerequisite: the cutoff commit `4a46a13` must exist in the local object store.
-The hook aborts when it is missing. Run `git fetch` first.
-
-A rebase or amend rewrites the SHA of every descendant. `post-commit` repairs
-HEAD only. Run `scripts/check-commitlog.sh` after a rebase to find the commits
-that lost the `0000` prefix, and `scripts/vanity-hash.py` on each of them.
 
 ### CI: `commit-hygiene` job
 

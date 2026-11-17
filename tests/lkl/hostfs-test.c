@@ -196,6 +196,26 @@ int main(int argc, char **argv)
            (long) "user.overlay.whiteout", (long) "y", 1, 0, 0);
     check("setxattr user.overlay.* on upper (overlay metadata)", rc, 0);
 
+    /* ---- 5b. chown to another uid: the host process cannot do it, so
+     * hostfs keeps the owner in an xattr and reports it from stat. */
+    {
+        /* asm-generic struct stat: st_uid at 24, st_gid at 28 */
+        unsigned char sb[256];
+        unsigned uid, gid;
+
+        rc = g(__lkl__NR_fchownat, G_AT_FDCWD, (long) "/merged/newfile.txt",
+               999, 998, 0, 0);
+        check("chown to uid 999 gid 998 through overlay", rc, 0);
+        memset(sb, 0, sizeof(sb));
+        rc = g(__lkl__NR_newfstatat, G_AT_FDCWD, (long) "/merged/newfile.txt",
+               (long) sb, 0, 0, 0);
+        memcpy(&uid, sb + 24, sizeof(uid));
+        memcpy(&gid, sb + 28, sizeof(gid));
+        printf("      stat after chown -> uid=%u gid=%u\n", uid, gid);
+        check("stat reports the virtual owner",
+              rc == 0 && uid == 999 && gid == 998, 1);
+    }
+
     /* ---- 6. fallocate / copy_file_range ------------------------------ */
     fd = g_open("/merged/falloc.bin", G_O_WRONLY | G_O_CREAT | G_O_TRUNC);
     check("open for fallocate", fd >= 0, 1);

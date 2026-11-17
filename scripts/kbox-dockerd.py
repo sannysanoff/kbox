@@ -499,6 +499,23 @@ class ImageStore:
             pass
 
     @staticmethod
+    def _set_owner(path, member):
+        """Record the tar owner as the user.kbox.owner xattr that hostfs reads.
+
+        The daemon is not root and cannot chown, so a file owned by uid 999 in
+        the image is stored as its own uid with this marker instead.
+        """
+        setxattr = getattr(os, "setxattr", None)
+        if setxattr is None or (member.uid == 0 and member.gid == 0):
+            return
+        try:
+            setxattr(path, "user.kbox.owner",
+                     ("%d:%d" % (member.uid, member.gid)).encode(),
+                     follow_symlinks=False)
+        except OSError:
+            pass
+
+    @staticmethod
     def _is_whiteout(path):
         getxattr = getattr(os, "getxattr", None)
         if getxattr is None:
@@ -518,6 +535,10 @@ class ImageStore:
         .wh..wh..opq marks the directory with user.overlay.opaque. overlayfs
         understands both when the mount uses the userxattr option.
         """
+        # Directory modes are applied last: a read-only directory (0555, as in
+        # ca-certificates) must stay writable while its entries are created,
+        # and the daemon is not root.
+        dir_modes = []
         with tarfile.open(tar_path, mode="r:*") as tf:
             for m in tf:
                 # Only a real "./" prefix is cosmetic; lstrip("./") would also
@@ -556,10 +577,8 @@ class ImageStore:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 if m.isdir():
                     os.makedirs(dest, exist_ok=True)
-                    try:
-                        os.chmod(dest, m.mode & 0o7777)
-                    except OSError:
-                        pass
+                    dir_modes.append((dest, m.mode & 0o7777))
+                    self._set_owner(dest, m)
                 elif m.issym():
                     if os.path.lexists(dest):
                         os.unlink(dest)
@@ -582,6 +601,12 @@ class ImageStore:
                         with open(dest, "wb") as out_f:
                             shutil.copyfileobj(src_f, out_f, 1 << 20)
                         os.chmod(dest, m.mode & 0o7777)
+                        self._set_owner(dest, m)
+        for path, mode in reversed(dir_modes):
+            try:
+                os.chmod(path, mode)
+            except OSError:
+                pass
 
     def ensure_layer(self, digest, url, token_cache, progress_cb=None):
         """Make sure layers/<digest>/ exists; download and unpack if not.

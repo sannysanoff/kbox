@@ -344,8 +344,21 @@ static int image_lowerdir(const char *id, char *out, size_t cap)
     }
     if (rec) {
         for (l = 0; l < rec->layer_count; l++) {
-            int n = snprintf(out + used, cap - used, "%s%s", used ? ":" : "",
-                             rec->layers[l].guest);
+            int n, j, seen = 0;
+
+            /* An image may list one digest twice (identical empty layers).
+             * overlayfs refuses the same directory twice in lowerdir with
+             * ELOOP, and the upper copy already supplies the same files. */
+            for (j = 0; j < l; j++) {
+                if (strcmp(rec->layers[j].guest, rec->layers[l].guest) == 0) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (seen)
+                continue;
+            n = snprintf(out + used, cap - used, "%s%s", used ? ":" : "",
+                         rec->layers[l].guest);
 
             if (n < 0 || (size_t) n >= cap - used)
                 break;

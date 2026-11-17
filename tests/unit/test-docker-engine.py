@@ -627,6 +627,62 @@ class TestLayerCache(unittest.TestCase):
         self.assertFalse(os.path.exists(store.layer_path(wrong)))
         self.assertTrue(all(".part" not in n for n in self._entries(store.blobs_dir)))
 
+    def test_extract_fills_read_only_directory(self):
+        # ca-certificates style layer: a 0555 directory that still receives
+        # symlinks and files after its own entry. Extraction runs unprivileged.
+        store = self._store()
+        path = os.path.join(self.tmpdir.name, "ro.tar")
+        with tarfile.open(path, "w") as tf:
+            info = tarfile.TarInfo("etc/certs")
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o555
+            tf.addfile(info)
+            link = tarfile.TarInfo("etc/certs/hash.0")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "root.pem"
+            tf.addfile(link)
+            data = tarfile.TarInfo("etc/certs/root.pem")
+            data.size = 2
+            data.mode = 0o444
+            tf.addfile(data, io.BytesIO(b"ok"))
+        with open(path, "rb") as f:
+            digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+
+        layer_dir, _ = store.ensure_layer(digest, "file://" + path, {})
+
+        certs = os.path.join(layer_dir, "etc", "certs")
+        self.assertTrue(os.path.islink(os.path.join(certs, "hash.0")))
+        self.assertEqual(os.stat(certs).st_mode & 0o777, 0o555)
+        os.chmod(certs, 0o755)  # let the test cleanup remove it
+
+    def test_extract_records_non_root_owner_as_xattr(self):
+        if not hasattr(os, "setxattr"):
+            self.skipTest("python without os.setxattr")
+        store = self._store()
+        path = os.path.join(self.tmpdir.name, "own.tar")
+        with tarfile.open(path, "w") as tf:
+            data = tarfile.TarInfo("var/db/data")
+            data.size = 1
+            data.uid = 999
+            data.gid = 998
+            tf.addfile(data, io.BytesIO(b"x"))
+            root = tarfile.TarInfo("var/db/rootfile")
+            root.size = 1
+            tf.addfile(root, io.BytesIO(b"y"))
+        with open(path, "rb") as f:
+            digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+
+        layer_dir, _ = store.ensure_layer(digest, "file://" + path, {})
+
+        owned = os.path.join(layer_dir, "var", "db", "data")
+        try:
+            self.assertEqual(os.getxattr(owned, "user.kbox.owner"), b"999:998")
+        except OSError:
+            self.skipTest("filesystem without user xattr")
+        with self.assertRaises(OSError):
+            os.getxattr(os.path.join(layer_dir, "var", "db", "rootfile"),
+                        "user.kbox.owner")
+
     def test_extract_keeps_whiteouts_as_overlay_markers(self):
         if not hasattr(os, "setxattr"):
             self.skipTest("python without os.setxattr")

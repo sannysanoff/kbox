@@ -3697,8 +3697,15 @@ static struct kbox_dispatch forward_sendfile(
      * an official image fails. Answer ENOSYS instead and let the caller fall
      * back to read/write, which land correctly.
      */
-    if (in_lkl >= 0 && out_lkl >= 0)
-        return kbox_dispatch_errno(ENOSYS);
+    if (in_lkl >= 0 && out_lkl >= 0) {
+        /* A socket destination is different: nginx (sendfile on) has no
+         * read/write fallback and drops the connection on ENOSYS. The bytes
+         * go out through LKL exactly as a write() would send them. */
+        struct kbox_lkl_stat out_st;
+        if (kbox_lkl_fstat(ctx->sysnrs, out_lkl, &out_st) < 0 ||
+            (out_st.st_mode & S_IFMT) != S_IFSOCK)
+            return kbox_dispatch_errno(ENOSYS);
+    }
 
     if (count_raw <= 0)
         return kbox_dispatch_value(0);

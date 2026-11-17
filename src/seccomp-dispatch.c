@@ -3150,6 +3150,52 @@ static void translate_proc_self_at(int sv_dirfd,
  * supervisor_dirfd: AT_FDCWD for absolute paths, or a supervisor-owned copy
  *                   of the tracee's dirfd (caller must close after return).
  */
+/* A container reads its memory limit from the cgroup files, and the JVM, the
+ * JIT and ClickHouse size their heaps and caches from it. The files show the
+ * limit of the whole pod, so every container believed it owned all of it, and a
+ * stack of JVMs grew past the pod's limit. Give a container that has a limit of
+ * its own (compose mem_limit, a Kubernetes resources limit) that value, as a
+ * real per-container cgroup would. */
+static int try_cgroup_limit_open(struct kbox_supervisor_ctx *ctx,
+                                 const struct kbox_syscall_request *req,
+                                 const char *path,
+                                 int host_flags,
+                                 struct kbox_dispatch *out)
+{
+    char text[32];
+    int len, memfd, tracee_fd;
+
+    if (!ctx || ctx->mem_limit <= 0 || !path ||
+        (host_flags & O_ACCMODE) != O_RDONLY)
+        return 0;
+    if (strcmp(path, "/sys/fs/cgroup/memory.max") != 0 &&
+        strcmp(path, "/sys/fs/cgroup/memory/memory.limit_in_bytes") != 0)
+        return 0;
+
+    len = snprintf(text, sizeof(text), "%ld\n", ctx->mem_limit);
+    memfd = memfd_create("kbox-cgroup-limit", MFD_CLOEXEC);
+    if (memfd < 0)
+        return 0;
+    if (write(memfd, text, (size_t) len) != len) {
+        close(memfd);
+        return 0;
+    }
+    if (lseek(memfd, 0, SEEK_SET) < 0) {
+        close(memfd);
+        return 0;
+    }
+    tracee_fd = request_addfd(ctx, req, memfd,
+                              (host_flags & O_CLOEXEC) ? O_CLOEXEC : 0);
+    close(memfd);
+    if (tracee_fd < 0)
+        return 0;
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+    if (host_flags & O_CLOEXEC)
+        kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
+    *out = kbox_dispatch_value(tracee_fd);
+    return 1;
+}
+
 static struct kbox_dispatch emulate_host_open_tracked(
     struct kbox_supervisor_ctx *ctx,
     const struct kbox_syscall_request *req,
@@ -3158,6 +3204,10 @@ static struct kbox_dispatch emulate_host_open_tracked(
     int host_flags,
     mode_t mode)
 {
+    struct kbox_dispatch limit_dispatch;
+    if (try_cgroup_limit_open(ctx, req, path, host_flags, &limit_dispatch))
+        return limit_dispatch;
+
     char sv_path[KBOX_MAX_PATH];
     pid_t pid = kbox_syscall_request_pid(req);
     translate_proc_self_at(supervisor_dirfd, path, pid, sv_path,

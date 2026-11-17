@@ -998,6 +998,7 @@ class DockerEngineState:
             "aliases": aliases,
             "ports": ports,
             "host_net": host_cfg.get("NetworkMode") == "host",
+            "mem_limit": int(host_cfg.get("Memory") or 0),
         })
 
         hc = body.get("Healthcheck")

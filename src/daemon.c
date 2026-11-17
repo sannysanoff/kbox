@@ -93,6 +93,7 @@ struct daemon_proc_env {
      * the host forwarder and deadlocks against itself. */
     const char *own_ip;
     int host_net;
+    long mem_limit; /* bytes, 0 = none */
 };
 
 struct daemon_container {
@@ -105,6 +106,7 @@ struct daemon_container {
     char workdir[PATH_MAX];
     char ip[32];
     int host_net;
+    long mem_limit; /* bytes, 0 = none */
     char host_if[16];
     char log_path[160];
 
@@ -1485,6 +1487,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     ctx.root_identity = 1;
     ctx.private_proc = pe->private_proc;
     ctx.host_net = pe->host_net;
+    ctx.mem_limit = pe->mem_limit;
     snprintf(ctx.own_ip, sizeof(ctx.own_ip), "%s",
              (pe->own_ip && pe->own_ip[0]) ? pe->own_ip : "");
     ctx.override_uid = (uid_t) -1;
@@ -1856,6 +1859,7 @@ static void *container_worker_thread(void *arg)
         .env_count = c->env_count,
         .own_ip = c->ip,
         .host_net = c->host_net,
+        .mem_limit = c->mem_limit,
     };
     struct supervised_proc_hooks hooks = {
         .opaque = c,
@@ -1985,6 +1989,7 @@ static void *exec_worker_thread(void *arg)
         .env_count = e->env_count,
         .own_ip = c->ip,
         .host_net = c->host_net,
+        .mem_limit = c->mem_limit,
     };
     struct supervised_proc_hooks hooks = {
         .opaque = e,
@@ -2310,6 +2315,11 @@ static void handle_rpc_line(int client_fd, const char *req)
         kbox_daemon_dns_register(short_id, slot->ip);
 
         slot->host_net = json_get_bool(req, "host_net", 0);
+        {
+            long ml = 0;
+            if (json_get_int(req, "mem_limit", &ml) == 0 && ml > 0)
+                slot->mem_limit = ml;
+        }
         char *port_strs[16];
         memset(port_strs, 0, sizeof(port_strs));
         int np = json_get_str_array(req, "ports", port_strs, 16);

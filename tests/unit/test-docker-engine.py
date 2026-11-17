@@ -130,6 +130,27 @@ class TestDockerEngine(unittest.TestCase):
         self.assertIn("web-alias", create_rpc["aliases"])
         self.assertIn("0.0.0.0:18080:8080", create_rpc["ports"])
 
+    def test_create_container_passes_memory_limit(self):
+        # compose mem_limit / a Kubernetes resources limit arrives as HostConfig
+        # Memory. The daemon shows it to the guest as the cgroup memory limit,
+        # which is what a JVM or ClickHouse sizes its heap and caches from.
+        self.engine.create_container(
+            "limited-1",
+            {
+                "Image": "alpine:latest",
+                "Cmd": ["true"],
+                "HostConfig": {"Memory": 1073741824},
+            },
+        )
+        rpc = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]
+        self.assertEqual(rpc["mem_limit"], 1073741824)
+
+        self.engine.create_container(
+            "unlimited-1", {"Image": "alpine:latest", "Cmd": ["true"]}
+        )
+        rpc = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]
+        self.assertEqual(rpc["mem_limit"], 0)
+
     def test_exec_lifecycle_and_http_endpoints(self):
         rec = self.engine.create_container("svc", {"Image": "alpine:latest"})
         self.engine.start_container(rec)

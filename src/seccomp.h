@@ -166,6 +166,7 @@ struct kbox_supervisor_ctx {
     char own_ip[32];
     /* network_mode: host. INET sockets are real pod sockets, not LKL ones. */
     int host_net;
+    long mem_limit; /* container memory limit in bytes, 0 = none */
     const struct kbox_guest_mem_ops *guest_mem_ops;
     struct kbox_guest_mem active_guest_mem;
     const struct kbox_fd_inject_ops *fd_inject_ops;

@@ -58,7 +58,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kboxd
-          image: kbox-layers/kbox:v32
+          image: kbox-layers/kbox:v33
           imagePullPolicy: IfNotPresent
           args:
             - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=6144M loglevel=4" -v
@@ -98,7 +98,7 @@ spec:
             periodSeconds: 2
             failureThreshold: 150
         - name: shim
-          image: kbox-layers/kbox:v32
+          image: kbox-layers/kbox:v33
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

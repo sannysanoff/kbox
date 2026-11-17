@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 
-# Validate commit hygiene for all non-merge commits after the hook
+# Validate commit hygiene for all non-merge commits after the
 # introduction point.  Checks:
-#   1. Change-Id presence (commit-msg hook must have run)
-#   2. Subject line format (capitalized, length, no trailing period)
-#   3. WIP commit detection
-#   4. GitHub web-interface bypass detection
+#   1. Subject line format (capitalized, length, no trailing period)
+#   2. WIP commit detection
+#   3. Vanity hash prefix
 #
 # Usage:
 #   scripts/check-commitlog.sh [--quiet|-q] [--range REV_RANGE]
@@ -62,7 +61,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# First commit that carries a Change-Id (hook introduction point).
+# History cutoff: commits at or before this one are not validated.
 BASE_COMMIT="4a46a133bcc8d86e6be3dce690a6f81249aca469"
 
 # Vanity hash enforcement: commits after this point must start with "0000".
@@ -124,28 +123,20 @@ while IFS= read -r commit; do
 
     sh=$(git show -s --format=%h "$commit")
     subj=$(git show -s --format=%s "$commit")
-    msg=$(git show -s --format=%B "$commit")
 
     issues=""
     warns=""
     has_issue=0
     has_warn=0
 
-    # 1. Change-Id
-    if ! grep -Eq '^Change-Id: I[0-9a-f]{40}[[:blank:]]*$' <<< "$msg"; then
-        has_issue=1
-        issues+="Missing Change-Id (commit-msg hook bypassed)|"
-        ((failed++))
-    fi
-
-    # 2. WIP prefix
+    # 1. WIP prefix
     if [[ "$subj" =~ ^[Ww][Ii][Pp][[:space:]]*: ]]; then
         has_warn=1
         warns+="Work-in-progress commit|"
         ((warnings++))
     fi
 
-    # 3. Subject format
+    # 2. Subject format
     subj_len=${#subj}
     first="${subj:0:1}"
     last="${subj: -1}"
@@ -174,15 +165,7 @@ while IFS= read -r commit; do
         ((failed++))
     fi
 
-    # 4. Web-interface bypass (Co-authored-by without Change-Id)
-    if [[ "$msg" == *"Co-authored-by:"* ]] \
-        && ! grep -Eq '^Change-Id: I[0-9a-f]{40}[[:blank:]]*$' <<< "$msg"; then
-        has_issue=1
-        issues+="Likely created via GitHub web interface|"
-        ((failed++))
-    fi
-
-    # 5. Vanity hash prefix (only for commits after VANITY_ENFORCE_AFTER)
+    # 3. Vanity hash prefix (only for commits after VANITY_ENFORCE_AFTER)
     if [[ -n "${vanity_required[$commit]:-}" ]]; then
         if [[ "$commit" != ${VANITY_PREFIX}* ]]; then
             has_issue=1

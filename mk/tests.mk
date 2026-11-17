@@ -161,7 +161,7 @@ else
 endif
 endif
 
-# ---- Commit-log validation (Change-Id, subject format) ----
+# ---- Commit-log validation (subject format) ----
 check-commitlog:
 	@echo "  RUN     check-commitlog"
 	$(Q)scripts/check-commitlog.sh

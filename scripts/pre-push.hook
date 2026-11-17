@@ -3,8 +3,7 @@
 # pre-push hook for kbox: validate commit hygiene before pushing.
 #
 # Runs check-commitlog.sh to ensure every non-merge commit after the
-# hook introduction point carries a valid Change-Id and meets subject
-# line formatting requirements.
+# cutoff point meets subject line formatting requirements.
 #
 # Skipped in CI environments (GitHub Actions).
 

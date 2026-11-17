@@ -3150,12 +3150,61 @@ static void translate_proc_self_at(int sv_dirfd,
  * supervisor_dirfd: AT_FDCWD for absolute paths, or a supervisor-owned copy
  *                   of the tracee's dirfd (caller must close after return).
  */
-/* A container reads its memory limit from the cgroup files, and the JVM, the
- * JIT and ClickHouse size their heaps and caches from it. The files show the
- * limit of the whole pod, so every container believed it owned all of it, and a
- * stack of JVMs grew past the pod's limit. Give a container that has a limit of
- * its own (compose mem_limit, a Kubernetes resources limit) that value, as a
- * real per-container cgroup would. */
+/* Resident memory of one process, from /proc/<pid>/statm (2nd field, pages). */
+static long long process_rss_bytes(pid_t pid)
+{
+    char path[48], buf[128];
+    ssize_t n;
+    int fd;
+    char *p, *end;
+    unsigned long long pages;
+
+    snprintf(path, sizeof(path), "/proc/%d/statm", (int) pid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    p = strchr(buf, ' ');
+    if (!p)
+        return 0;
+    pages = strtoull(p + 1, &end, 10);
+    if (end == p + 1)
+        return 0;
+    return (long long) (pages * (unsigned long long) sysconf(_SC_PAGESIZE));
+}
+
+/* What a per-container cgroup would report as its memory usage: the resident
+ * memory of the processes this supervisor serves. */
+static long long container_rss_bytes(const struct kbox_supervisor_ctx *ctx)
+{
+    long long total = 0;
+    int root_seen = 0;
+
+    for (size_t i = 0; i < ctx->proc_fd_count; i++) {
+        pid_t tgid = ctx->proc_fds[i].tgid;
+        if (tgid <= 0)
+            continue;
+        if (tgid == ctx->child_pid)
+            root_seen = 1;
+        total += process_rss_bytes(tgid);
+    }
+    if (!root_seen && ctx->child_pid > 0)
+        total += process_rss_bytes(ctx->child_pid);
+    return total;
+}
+
+/* A container reads its memory limit and usage from the cgroup files, and the
+ * JVM, the JIT and ClickHouse size their heaps and caches from them. The files
+ * show the whole pod, so every container believed it owned all of it (a stack
+ * of JVMs grew past the pod's limit) and ClickHouse, comparing the pod's usage
+ * with its own limit, refused every query. Give a container that has a limit of
+ * its own (compose mem_limit, a Kubernetes resources limit) its own limit and
+ * its own usage, as a real per-container cgroup would. The value is a snapshot
+ * taken when the file is opened. */
 static int try_cgroup_limit_open(struct kbox_supervisor_ctx *ctx,
                                  const struct kbox_syscall_request *req,
                                  const char *path,
@@ -3163,17 +3212,23 @@ static int try_cgroup_limit_open(struct kbox_supervisor_ctx *ctx,
                                  struct kbox_dispatch *out)
 {
     char text[32];
+    long long value;
     int len, memfd, tracee_fd;
 
     if (!ctx || ctx->mem_limit <= 0 || !path ||
         (host_flags & O_ACCMODE) != O_RDONLY)
         return 0;
-    if (strcmp(path, "/sys/fs/cgroup/memory.max") != 0 &&
-        strcmp(path, "/sys/fs/cgroup/memory/memory.limit_in_bytes") != 0)
+    if (strcmp(path, "/sys/fs/cgroup/memory.max") == 0 ||
+        strcmp(path, "/sys/fs/cgroup/memory/memory.limit_in_bytes") == 0)
+        value = ctx->mem_limit;
+    else if (strcmp(path, "/sys/fs/cgroup/memory.current") == 0 ||
+             strcmp(path, "/sys/fs/cgroup/memory/memory.usage_in_bytes") == 0)
+        value = container_rss_bytes(ctx);
+    else
         return 0;
 
-    len = snprintf(text, sizeof(text), "%ld\n", ctx->mem_limit);
-    memfd = memfd_create("kbox-cgroup-limit", MFD_CLOEXEC);
+    len = snprintf(text, sizeof(text), "%lld\n", value);
+    memfd = memfd_create("kbox-cgroup-file", MFD_CLOEXEC);
     if (memfd < 0)
         return 0;
     if (write(memfd, text, (size_t) len) != len) {

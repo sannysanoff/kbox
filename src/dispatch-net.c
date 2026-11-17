@@ -123,8 +123,12 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
 
     int base_type = (int) type_raw & 0xFF;
 
-    /* AF_UNIX: LKL has no UNIX sockets; the socket is a host passthrough fd. */
-    if (domain == AF_UNIX) {
+    /* AF_UNIX: LKL has no UNIX sockets; the socket is a host passthrough fd.
+     * network_mode: host does the same for INET: the container shares the pod
+     * network, so localhost reaches the published ports and its own listeners
+     * are pod listeners. */
+    if (domain == AF_UNIX ||
+        (ctx->host_net && (domain == AF_INET || domain == AF_INET6))) {
         int hfd =
             socket(AF_UNIX, (int) type_raw | SOCK_CLOEXEC, (int) protocol);
         if (hfd < 0)
@@ -135,7 +139,7 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
         if (tfd < 0)
             return kbox_dispatch_errno(-tfd);
         track_host_passthrough_fd(ctx->fd_table, tfd);
-        if (tfd >= 0 && tfd < KBOX_UNIX_TYPE_MAX)
+        if (domain == AF_UNIX && tfd >= 0 && tfd < KBOX_UNIX_TYPE_MAX)
             g_unix_type[tfd] =
                 (uint8_t) ((base_type & 0x7f) |
                            ((type_raw & SOCK_NONBLOCK) ? 0x80 : 0));

@@ -997,6 +997,7 @@ class DockerEngineState:
             "binds": binds,
             "aliases": aliases,
             "ports": ports,
+            "host_net": host_cfg.get("NetworkMode") == "host",
         })
 
         hc = body.get("Healthcheck")

@@ -69,7 +69,10 @@ if [[ -n "$REV_RANGE" ]]; then
         RANGE_START="${REV_RANGE%%..*}"
         RANGE_END="${REV_RANGE##*..}"
         if ! git rev-parse --verify "${RANGE_START}^{commit}" > /dev/null 2>&1; then
-            throw "Revision range start %s not found." "$RANGE_START"
+            # A rewritten history leaves no object for a recorded old tip.
+            # Fall back to validating everything reachable from the range end.
+            echo -e "${YELLOW}Range start ${RANGE_START} not found; checking all history.${NC}" >&2
+            RANGE_START=""
         fi
     else
         RANGE_END="$REV_RANGE"

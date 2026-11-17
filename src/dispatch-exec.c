@@ -1283,6 +1283,33 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
     if (interp_memfd < 0)
         return interp_memfd;
 
+    /* The interpreter may itself be a script: Oracle Linux ships /usr/bin/env
+     * as "#!/usr/bin/coreutils --coreutils-prog-shebang=env". Its shebang names
+     * a guest path as well, so rewrite it the same way. The kernel then follows
+     * two shebang levels, both pointing at injected descriptors. */
+    static __thread int nested_depth;
+    int interp_is_script = 0;
+    {
+        char magic[2];
+
+        if (pread(interp_memfd, magic, sizeof(magic), 0) ==
+                (ssize_t) sizeof(magic) &&
+            magic[0] == '#' && magic[1] == '!') {
+            if (nested_depth >= 4) {
+                close(interp_memfd);
+                return -ELOOP;
+            }
+            nested_depth++;
+            int nrc = rewrite_script_shebang(ctx, req, &interp_memfd, interp);
+            nested_depth--;
+            if (nrc < 0) {
+                close(interp_memfd);
+                return nrc;
+            }
+            interp_is_script = 1;
+        }
+    }
+
     /* The interpreter is a program in its own right: when it is dynamically
      * linked its PT_INTERP names the guest loader, which the host kernel
      * cannot open either. Patch it to an injected memfd of the loader, the
@@ -1334,7 +1361,10 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
         }
     }
 
-    int tracee_interp_fd = request_addfd(ctx, req, interp_memfd, O_CLOEXEC);
+    /* A script interpreter stays open across exec: the interpreter that runs it
+     * can still be handed its path as an argument. */
+    int tracee_interp_fd =
+        request_addfd(ctx, req, interp_memfd, interp_is_script ? 0 : O_CLOEXEC);
     close(interp_memfd);
     if (tracee_interp_fd < 0)
         return tracee_interp_fd;

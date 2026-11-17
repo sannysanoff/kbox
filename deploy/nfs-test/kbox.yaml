@@ -71,7 +71,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kboxd
-          image: kbox-nfs-test/kbox:v148
+          image: kbox-nfs-test/kbox:v149
           imagePullPolicy: IfNotPresent
           args:
             - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=10240M loglevel=4"
@@ -114,7 +114,7 @@ spec:
             periodSeconds: 2
             failureThreshold: 150
         - name: shim
-          image: kbox-nfs-test/kbox:v148
+          image: kbox-nfs-test/kbox:v149
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

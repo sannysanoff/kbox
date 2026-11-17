@@ -71,7 +71,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kboxd
-          image: kbox-nfs-test/kbox:v130
+          image: kbox-nfs-test/kbox:v131
           imagePullPolicy: IfNotPresent
           args:
             - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=10240M loglevel=4" -v
@@ -97,6 +97,8 @@ spec:
               mountPath: /data
             - name: run
               mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
           resources:
             requests:
               cpu: 250m
@@ -112,7 +114,7 @@ spec:
             periodSeconds: 2
             failureThreshold: 150
         - name: shim
-          image: kbox-nfs-test/kbox:v130
+          image: kbox-nfs-test/kbox:v131
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -141,6 +143,8 @@ spec:
               mountPath: /dev/shm
             - name: run
               mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
             - name: data
               mountPath: /data
         # Pod-local image registry. kbox cannot `docker build` or `docker load`,
@@ -173,6 +177,10 @@ spec:
           persistentVolumeClaim:
             claimName: kbox-data
         - name: run
+          emptyDir: {}
+        # kboxd writes container and exec output here and the shim streams it
+        # back for docker logs / exec / run / attach.
+        - name: logs
           emptyDir: {}
 ---
 apiVersion: v1

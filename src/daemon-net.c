@@ -212,6 +212,10 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
     cfg->gateway_ip[0] = '\0';
     memset(cfg->nfs, 0, sizeof(cfg->nfs));
     cfg->nfs_count = 0;
+    cfg->images_hostfs = 0;
+    cfg->ephemeral_hostfs = 0;
+    snprintf(cfg->ephemeral_root, sizeof(cfg->ephemeral_root), "%s",
+             KBOX_DAEMON_DEFAULT_EPHEMERAL_ROOT);
 
     char resolved[512];
     const char *eff = path;
@@ -294,6 +298,24 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
                         fprintf(stderr,
                                 "kboxd: config: bad mount entry %s.%s\n",
                                 subsection, key);
+                    continue;
+                }
+
+                int in_storage = (strcmp(section, "storage") == 0);
+                if (in_storage) {
+                    /* storage:
+                     *   images:         copy | hostfs
+                     *   ephemeral:      tmpfs | hostfs
+                     *   ephemeral_root: /tmp/.kboxd/ephemeral
+                     */
+                    if (strcmp(key, "images") == 0)
+                        cfg->images_hostfs = (strcmp(val, "hostfs") == 0);
+                    else if (strcmp(key, "ephemeral") == 0)
+                        cfg->ephemeral_hostfs = (strcmp(val, "hostfs") == 0);
+                    else if (strcmp(key, "ephemeral_root") == 0 ||
+                             strcmp(key, "ephemeral-root") == 0)
+                        snprintf(cfg->ephemeral_root,
+                                 sizeof(cfg->ephemeral_root), "%s", val);
                     continue;
                 }
 

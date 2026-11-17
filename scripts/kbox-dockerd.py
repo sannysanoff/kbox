@@ -8,10 +8,8 @@ Docker Compose v5.x) over TCP (--host 0.0.0.0:2375) and/or Unix socket.
 
 import argparse
 import faulthandler
-import gzip
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import io
 import ipaddress
 import json
 import os
@@ -78,6 +76,12 @@ def load_kbox_config(config_path=None):
         "gateway": "",
         "volumes_root": os.path.abspath(os.path.expanduser(DEFAULT_VOLUMES_ROOT)),
         "config_path": "",
+        # Storage layout. Empty means "under the state directory".
+        "blobs_dir": "",
+        "images_dir": "",
+        "layers_dir": "",
+        "manifests_dir": "",
+        "images_driver": "copy",
     }
     eff = config_path or os.environ.get("KBOX_CONFIG") or os.path.expanduser(DEFAULT_CONFIG_PATH)
     cfg["config_path"] = eff
@@ -114,6 +118,20 @@ def load_kbox_config(config_path=None):
                         cfg["volumes_root"] = os.path.abspath(os.path.expanduser(val))
                 elif not section and key == "volumes_root" and val:
                     cfg["volumes_root"] = os.path.abspath(os.path.expanduser(val))
+                elif section == "storage" and key in ("images_dir", "images-dir"):
+                    if val:
+                        cfg["images_dir"] = os.path.abspath(os.path.expanduser(val))
+                elif section == "storage" and key in ("blobs_dir", "blobs-dir"):
+                    if val:
+                        cfg["blobs_dir"] = os.path.abspath(os.path.expanduser(val))
+                elif section == "storage" and key in ("layers_dir", "layers-dir"):
+                    if val:
+                        cfg["layers_dir"] = os.path.abspath(os.path.expanduser(val))
+                elif section == "storage" and key in ("manifests_dir", "manifests-dir"):
+                    if val:
+                        cfg["manifests_dir"] = os.path.abspath(os.path.expanduser(val))
+                elif section == "storage" and key == "images":
+                    cfg["images_driver"] = "hostfs" if val == "hostfs" else "copy"
     if not cfg["gateway"]:
         cfg["gateway"] = _derive_gateway_ip(cfg["start_ip"])
     return cfg
@@ -230,17 +248,55 @@ class EventBus:
 
 
 class ImageStore:
-    """OCI image puller, unpacker, and metadata registry."""
+    """OCI image puller, layer cache, and metadata registry.
 
-    def __init__(self, state_dir, rpc):
+    Layout (each directory is configurable through the storage: section of
+    kbox-config.yaml, and defaults to a subdirectory of the state dir):
+
+      <blobs_dir>/<digest>.tar     downloaded layer blobs, as pulled
+      <layers_dir>/<digest>/       unpacked layer trees, immutable
+      <manifests_dir>/<id>.json    image -> ordered layer digests
+      <images_dir>/<id>/rootfs     merged tree, only for storage.images=copy
+    """
+
+    def __init__(self, state_dir, rpc, config=None):
+        cfg = config or {}
         self.state_dir = state_dir
-        self.img_dir = os.path.join(state_dir, "images")
+        self.blobs_dir = cfg.get("blobs_dir") or os.path.join(state_dir, "blobs")
+        self.layers_dir = cfg.get("layers_dir") or os.path.join(state_dir, "layers")
+        self.images_dir = cfg.get("images_dir") or os.path.join(state_dir, "images")
+        self.manifests_dir = cfg.get("manifests_dir") or os.path.join(state_dir, "manifests")
+        self.images_driver = cfg.get("images_driver", "copy")
         self.tags_file = os.path.join(state_dir, "tags.json")
-        os.makedirs(self.img_dir, exist_ok=True)
+        for d in (self.blobs_dir, self.layers_dir, self.images_dir,
+                  self.manifests_dir):
+            os.makedirs(d, exist_ok=True)
         self.rpc = rpc
         self.lock = threading.Lock()
         self.tags = {}
+        self._sweep_partials()
         self._load_tags()
+
+    def _sweep_partials(self):
+        """Remove leftovers of an interrupted pull; nothing is resumable."""
+        for d in (self.blobs_dir, self.layers_dir, self.images_dir,
+                  self.manifests_dir):
+            try:
+                entries = os.listdir(d)
+            except OSError:
+                continue
+            for name in entries:
+                if not (name.endswith(".part") or name.endswith(".tmp")
+                        or ".stage-" in name or ".tmp." in name):
+                    continue
+                path = os.path.join(d, name)
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
 
     def _load_tags(self):
         if os.path.exists(self.tags_file):
@@ -296,16 +352,25 @@ class ImageStore:
         return norm
 
     def get_meta(self, img_id):
-        meta_path = os.path.join(self.img_dir, img_id.removeprefix("sha256:"), "meta.json")
+        meta_path = os.path.join(self.images_dir, img_id.removeprefix("sha256:"), "meta.json")
         if not os.path.exists(meta_path):
             return None
         with open(meta_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def ensure_imported(self, img_id):
+    def ensure_imported(self, img_id, layers=None):
         short = img_id.removeprefix("sha256:")
-        rootfs = os.path.join(self.img_dir, short, "rootfs")
-        self.rpc.call({"op": "image_import", "id": short, "src": rootfs})
+        rootfs = os.path.join(self.images_dir, short, "rootfs")
+        if layers is None:
+            # The manifest is the source of truth: container create and other
+            # paths import an image that was pulled earlier.
+            cached = self.load_manifest(img_id) or {}
+            layers = cached.get("layers") or None
+        msg = {"op": "image_import", "id": short, "src": rootfs}
+        if layers:
+            # Overlay lowerdir order is top-first, the manifest is base-first.
+            msg["layers"] = [self.layer_path(d) for d in reversed(layers)]
+        self.rpc.call(msg)
 
     def list_images(self):
         res = []
@@ -388,52 +453,120 @@ class ImageStore:
             hdrs["Authorization"] = f"Bearer {tok}"
             return urllib.request.urlopen(urllib.request.Request(url, headers=hdrs), timeout=60)
 
+    # ---- layer cache -----------------------------------------------------
+
     @staticmethod
-    def _extract_layer_tar(tar_bytes, rootfs):
-        # Support gzip or uncompressed tar
-        if tar_bytes[:2] == b"\x1f\x8b":
-            bio = gzip.GzipFile(fileobj=io.BytesIO(tar_bytes))
-        else:
-            bio = io.BytesIO(tar_bytes)
-        with tarfile.open(fileobj=bio, mode="r:*") as tf:
-            members = tf.getmembers()
-            # Handle opaque directories (.wh..wh..opq) and whiteouts (.wh.<file>)
-            for m in members:
-                rel = m.name.lstrip("./")
+    def digest_hex(digest):
+        return digest.split(":", 1)[-1]
+
+    def layer_path(self, digest):
+        return os.path.join(self.layers_dir, self.digest_hex(digest))
+
+    def blob_path(self, digest):
+        return os.path.join(self.blobs_dir, self.digest_hex(digest) + ".tar")
+
+    def _download_blob(self, url, token_cache, digest_hex):
+        """Stream a layer blob to disk, verifying the digest on the way.
+
+        The body is copied in 1 MiB chunks so peak memory stays constant: a
+        1 GiB layer costs 1 MiB of RAM here, not 1 GiB.
+        """
+        final = os.path.join(self.blobs_dir, digest_hex + ".tar")
+        part = final + ".part"
+        h = hashlib.sha256()
+        with self._http_get_with_auth(url, {}, token_cache) as r, \
+                open(part, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                h.update(chunk)
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+        return part, final, h.hexdigest()
+
+    @staticmethod
+    def _set_xattr(path, name):
+        # os.setxattr is absent where Python lacks xattr support; the layer is
+        # then unpacked without markers, which only affects whiteout layers.
+        setxattr = getattr(os, "setxattr", None)
+        if setxattr is None:
+            return
+        try:
+            setxattr(path, name, b"y")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _is_whiteout(path):
+        getxattr = getattr(os, "getxattr", None)
+        if getxattr is None:
+            return False
+        try:
+            getxattr(path, "user.overlay.whiteout")
+            return True
+        except OSError:
+            return False
+
+    def _extract_layer(self, tar_path, dest_dir):
+        """Unpack one layer, keeping whiteouts as overlay markers.
+
+        A layer unpacked on its own cannot delete entries of the layers below
+        it, so .wh. markers are preserved instead of applied: a whiteout
+        becomes an empty file carrying user.overlay.whiteout, and
+        .wh..wh..opq marks the directory with user.overlay.opaque. overlayfs
+        understands both when the mount uses the userxattr option.
+        """
+        with tarfile.open(tar_path, mode="r:*") as tf:
+            for m in tf:
+                # Only a real "./" prefix is cosmetic; lstrip("./") would also
+                # eat the dot of a root-level whiteout like ".wh.hostname".
+                rel = m.name
+                while rel.startswith("./"):
+                    rel = rel[2:]
+                rel = rel.lstrip("/")
                 if not rel:
                     continue
                 base = os.path.basename(rel)
-                parent = os.path.join(rootfs, os.path.dirname(rel))
+                parent = os.path.join(dest_dir, os.path.dirname(rel))
                 if base == ".wh..wh..opq":
-                    if os.path.isdir(parent):
-                        for entry in os.listdir(parent):
-                            ep = os.path.join(parent, entry)
-                            if os.path.isdir(ep) and not os.path.islink(ep):
-                                shutil.rmtree(ep)
-                            else:
-                                os.unlink(ep)
+                    os.makedirs(parent, exist_ok=True)
+                    self._set_xattr(parent, "user.overlay.opaque")
                     continue
                 if base.startswith(".wh."):
+                    os.makedirs(parent, exist_ok=True)
                     target = os.path.join(parent, base[4:])
                     if os.path.lexists(target):
                         if os.path.isdir(target) and not os.path.islink(target):
                             shutil.rmtree(target)
                         else:
                             os.unlink(target)
+                    try:
+                        with open(target, "wb"):
+                            pass
+                        self._set_xattr(target, "user.overlay.whiteout")
+                    except OSError:
+                        pass
                     continue
 
-                dest = os.path.normpath(os.path.join(rootfs, rel))
-                if not (dest == rootfs or dest.startswith(rootfs + os.sep)):
+                dest = os.path.normpath(os.path.join(dest_dir, rel))
+                if not (dest == dest_dir or dest.startswith(dest_dir + os.sep)):
                     continue
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 if m.isdir():
                     os.makedirs(dest, exist_ok=True)
+                    try:
+                        os.chmod(dest, m.mode & 0o7777)
+                    except OSError:
+                        pass
                 elif m.issym():
                     if os.path.lexists(dest):
                         os.unlink(dest)
                     os.symlink(m.linkname, dest)
                 elif m.islnk():
-                    link_target = os.path.normpath(os.path.join(rootfs, m.linkname.lstrip("./")))
+                    link_target = os.path.normpath(
+                        os.path.join(dest_dir, m.linkname.lstrip("./")))
                     if os.path.lexists(dest):
                         os.unlink(dest)
                     if os.path.exists(link_target):
@@ -447,8 +580,114 @@ class ImageStore:
                     src_f = tf.extractfile(m)
                     if src_f is not None:
                         with open(dest, "wb") as out_f:
-                            shutil.copyfileobj(src_f, out_f)
+                            shutil.copyfileobj(src_f, out_f, 1 << 20)
                         os.chmod(dest, m.mode & 0o7777)
+
+    def ensure_layer(self, digest, url, token_cache, progress_cb=None):
+        """Make sure layers/<digest>/ exists; download and unpack if not.
+
+        Returns (layer_dir, tar_size). The unpacked tree is published with a
+        rename, so a reader never sees a half-extracted layer.
+        """
+        hexdigest = self.digest_hex(digest)
+        layer_dir = self.layer_path(digest)
+        blob = self.blob_path(digest)
+        if os.path.isdir(layer_dir):
+            size = os.path.getsize(blob) if os.path.exists(blob) else 0
+            return layer_dir, size
+
+        if not os.path.exists(blob):
+            part, final, got = self._download_blob(url, token_cache, hexdigest)
+            if got != hexdigest:
+                try:
+                    os.unlink(part)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"layer {digest}: digest mismatch ({got})")
+            os.replace(part, final)
+        size = os.path.getsize(blob)
+
+        stage = os.path.join(self.layers_dir, ".stage-" + hexdigest[:16])
+        shutil.rmtree(stage, ignore_errors=True)
+        os.makedirs(stage, exist_ok=True)
+        try:
+            self._extract_layer(blob, stage)
+            os.replace(stage, layer_dir)
+        except BaseException:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+        return layer_dir, size
+
+    def _clear_path(self, path):
+        if not os.path.lexists(path):
+            return
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+
+    def _assemble_merged(self, layers, rootfs):
+        """Build the merged tree for storage.images=copy.
+
+        Files are hardlinked from the layer cache where the filesystem allows
+        it (so identical bytes are stored once) and copied otherwise. Whiteout
+        markers delete the lower entry, opaque directories are cleared.
+        """
+        shutil.rmtree(rootfs, ignore_errors=True)
+        os.makedirs(rootfs, exist_ok=True)
+        for digest in layers:  # base first
+            layer_dir = self.layer_path(digest)
+            if not os.path.isdir(layer_dir):
+                continue
+            for root, dirs, files in os.walk(layer_dir):
+                rel = os.path.relpath(root, layer_dir)
+                dst_root = rootfs if rel == "." else os.path.join(rootfs, rel)
+                os.makedirs(dst_root, exist_ok=True)
+                try:
+                    if os.getxattr(root, "user.overlay.opaque") is not None:
+                        for name in os.listdir(dst_root):
+                            self._clear_path(os.path.join(dst_root, name))
+                except (OSError, AttributeError):
+                    pass
+                for name in dirs:
+                    os.makedirs(os.path.join(dst_root, name), exist_ok=True)
+                for name in files:
+                    src = os.path.join(root, name)
+                    dst = os.path.join(dst_root, name)
+                    is_marker = (os.path.isfile(src) and not os.path.islink(src)
+                                 and self._is_whiteout(src))
+                    if is_marker:
+                        self._clear_path(dst)
+                        continue
+                    self._clear_path(dst)
+                    try:
+                        os.link(src, dst)
+                    except OSError:
+                        shutil.copy2(src, dst, follow_symlinks=False)
+
+    # ---- manifests -------------------------------------------------------
+
+    def manifest_path(self, img_id):
+        return os.path.join(self.manifests_dir,
+                            self.digest_hex(img_id) + ".json")
+
+    def load_manifest(self, img_id):
+        path = self.manifest_path(img_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def save_manifest(self, img_id, meta):
+        path = self.manifest_path(img_id)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        os.replace(tmp, path)
 
     def pull(self, from_image, tag="latest", progress_cb=None):
         norm, repo, tag = self.normalize_ref(from_image, tag)
@@ -490,45 +729,58 @@ class ImageStore:
         cfg_json = json.loads(cfg_bytes.decode("utf-8"))
         img_id = "sha256:" + hashlib.sha256(cfg_bytes).hexdigest()
         short_id = img_id.removeprefix("sha256:")
-        dest_dir = os.path.join(self.img_dir, short_id)
+        dest_dir = os.path.join(self.images_dir, short_id)
         rootfs = os.path.join(dest_dir, "rootfs")
 
+        # Digests never change for a finished image, so a manifest decides the
+        # layer list. ensure_layer is a no-op for an unpacked layer and repairs
+        # a missing one from the cached blob, without touching the network.
+        cached = self.load_manifest(img_id)
+        digests = []
+        if cached and cached.get("layers"):
+            digests = cached["layers"]
+        else:
+            digests = [layer["digest"] for layer in manifest.get("layers", [])]
+
+        layers = []
+        total_size = 0
+        for ldig in digests:
+            if progress_cb:
+                progress_cb({"status": "Pulling fs layer", "id": ldig[7:19]})
+            _, size = self.ensure_layer(ldig, f"{base}/blobs/{ldig}",
+                                        token_cache, progress_cb)
+            if progress_cb:
+                progress_cb({"status": "Extracting", "id": ldig[7:19]})
+            total_size += size
+            layers.append(ldig)
+
+        meta = {
+            "id": img_id,
+            "created": int(time.time()),
+            "size": total_size,
+            "architecture": cfg_json.get("architecture", self._target_arch()),
+            "os": cfg_json.get("os", "linux"),
+            "config": cfg_json.get("config", {}),
+            "layers": layers,
+        }
+        self.save_manifest(img_id, meta)
+
+        os.makedirs(dest_dir, exist_ok=True)
+        if self.images_driver != "hostfs":
+            # storage.images=copy needs one merged tree for the daemon to copy
+            # into the guest; hostfs mounts the layers themselves and skips it.
+            if not os.path.isdir(rootfs):
+                self._assemble_merged(layers, rootfs)
         if not os.path.exists(os.path.join(dest_dir, "meta.json")):
-            stage = dest_dir + ".tmp." + secrets.token_hex(4)
-            stage_rootfs = os.path.join(stage, "rootfs")
-            os.makedirs(stage_rootfs, exist_ok=True)
-            total_size = 0
-            for layer in manifest.get("layers", []):
-                ldig = layer["digest"]
-                if progress_cb:
-                    progress_cb({"status": "Pulling fs layer", "id": ldig[7:19]})
-                with self._http_get_with_auth(f"{base}/blobs/{ldig}", {}, token_cache) as r:
-                    blob = r.read()
-                total_size += len(blob)
-                if progress_cb:
-                    progress_cb({"status": "Extracting", "id": ldig[7:19]})
-                self._extract_layer_tar(blob, stage_rootfs)
-            meta = {
-                "id": img_id,
-                "created": int(time.time()),
-                "size": total_size,
-                "architecture": cfg_json.get("architecture", self._target_arch()),
-                "os": cfg_json.get("os", "linux"),
-                "config": cfg_json.get("config", {}),
-            }
-            with open(os.path.join(stage, "meta.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(dest_dir, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2)
-            if os.path.exists(dest_dir):
-                shutil.rmtree(stage)
-            else:
-                os.replace(stage, dest_dir)
 
         with self.lock:
             self.tags[norm] = img_id
             self.tags[short_norm] = img_id
             self._save_tags()
 
-        self.ensure_imported(img_id)
+        self.ensure_imported(img_id, layers)
         if progress_cb:
             progress_cb({"status": f"Status: Downloaded newer image for {short_norm}"})
         return img_id
@@ -538,7 +790,7 @@ class ImageStore:
         short_norm = re.sub(r"^(docker\.io/)?(library/)?", "", norm)
         img_id = "sha256:" + hashlib.sha256(norm.encode()).hexdigest()
         short_id = img_id.removeprefix("sha256:")
-        dest_dir = os.path.join(self.img_dir, short_id)
+        dest_dir = os.path.join(self.images_dir, short_id)
         rootfs = os.path.join(dest_dir, "rootfs")
         if not os.path.exists(rootfs):
             os.makedirs(dest_dir, exist_ok=True)
@@ -573,7 +825,7 @@ class DockerEngineState:
         self.gateway_ip = self.config.get("gateway") or _derive_gateway_ip(self.start_ip)
         self.subnet_cidr = str(ipaddress.IPv4Network(f"{self.gateway_ip}/16", strict=False))
         self.events = EventBus()
-        self.images = ImageStore(state_dir, rpc)
+        self.images = ImageStore(state_dir, rpc, config=self.config)
         self.lock = threading.Lock()
         self.containers = {}
         self.networks = {
@@ -1047,6 +1299,11 @@ class DockerEngineState:
             "healthcheck": hc,
             "health": None,
             "health_stop": threading.Event(),
+            # Set once start_container() has seen the run begin. A /wait that
+            # arrives before it must not ask the daemon: a container that has
+            # not started yet reads as exited there, and the client would stop
+            # following output while the container keeps running.
+            "run_ev": threading.Event(),
         }
         with self.lock:
             self.containers[cid] = rec
@@ -1221,6 +1478,7 @@ class DockerEngineState:
         c["finished_at"] = 0
         c["gen"] = c.get("gen", 0) + 1
         gen = c["gen"]
+        c["run_ev"].set()
         if c.get("healthcheck"):
             c["health"] = {"Status": "starting", "FailingStreak": 0, "Log": []}
             c["health_stop"].clear()
@@ -1931,10 +2189,36 @@ class DockerHandler(BaseHTTPRequestHandler):
             if not c:
                 self.send_json(404, {"message": "No such container"})
                 return
+            # The Docker client blocks its start request until /wait is
+            # acknowledged with response headers, then reads the status from the
+            # body. Acknowledging first is what lets the container start at all;
+            # the daemon is asked for the status afterwards.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self.wfile.flush()
+
+            # The start request may still be in flight here, and a container
+            # that has not started yet reads as exited with status 0 in the
+            # daemon. Wait for start_container() to see the run begin, then ask
+            # for the real status. The response headers are already out, so
+            # blocking here does not hold up the client's start request.
+            c["run_ev"].wait(timeout=10.0)
             w = eng.rpc.call({"op": "container_wait", "id": c["id"]})
             c["status"] = "exited"
             c["exit_code"] = w.get("exit_code", 0)
-            self.send_json(200, {"StatusCode": c["exit_code"], "Error": None})
+            # Deliver the status only after the attach streams are done: the
+            # client stops following output as soon as it has the status, and a
+            # fast container writes its last bytes at the same moment as it
+            # exits.
+            deadline = time.time() + 5.0
+            while c.get("attach_count") and time.time() < deadline:
+                time.sleep(0.005)
+            body = json.dumps({"StatusCode": c["exit_code"], "Error": None})
+            self.wfile.write(body.encode("utf-8"))
+            self.wfile.flush()
             return
 
         m = re.match(r"^/containers/([^/]+)/attach$", path)
@@ -2105,7 +2389,12 @@ class DockerHandler(BaseHTTPRequestHandler):
             if not follow:
                 break
             if is_exited_fn():
-                pos = self._drain_frames(log_path, pos, tty, show_out, show_err, write_fn)
+                # The daemon's log pump may still be flushing output written
+                # just before the process exited, so drain a few more times
+                # before closing the stream.
+                for _ in range(3):
+                    pos = self._drain_frames(log_path, pos, tty, show_out, show_err, write_fn)
+                    time.sleep(0.02)
                 break
             time.sleep(0.05)
 
@@ -2164,7 +2453,11 @@ class DockerHandler(BaseHTTPRequestHandler):
             self.server.engine.refresh_container(c)
             return c["status"] == "exited"
 
-        self._stream_upgrade_or_chunked(c["log_path"], c["tty"], show_out, show_err, is_exited)
+        c["attach_count"] = c.get("attach_count", 0) + 1
+        try:
+            self._stream_upgrade_or_chunked(c["log_path"], c["tty"], show_out, show_err, is_exited)
+        finally:
+            c["attach_count"] = c.get("attach_count", 1) - 1
 
     def _handle_exec_start(self, e, body):
         eng = self.server.engine

@@ -130,6 +130,25 @@ class TestDockerEngine(unittest.TestCase):
         self.assertIn("web-alias", create_rpc["aliases"])
         self.assertIn("0.0.0.0:18080:8080", create_rpc["ports"])
 
+    def test_create_container_sets_home_and_hostname(self):
+        # Docker gives the container process HOME and HOSTNAME when the image and the
+        # request do not; entrypoints write $HOME/.aws/credentials and the like.
+        self.engine.create_container(
+            "env-1", {"Image": "alpine:latest", "Cmd": ["true"]}
+        )
+        env = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]["env"]
+        self.assertIn("HOME=/root", env)
+        self.assertIn("HOSTNAME=env-1", env)
+
+        # ...but an explicit value wins
+        self.engine.create_container(
+            "env-2",
+            {"Image": "alpine:latest", "Cmd": ["true"], "Env": ["HOME=/srv/app"]},
+        )
+        env = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]["env"]
+        self.assertIn("HOME=/srv/app", env)
+        self.assertNotIn("HOME=/root", env)
+
     def test_create_container_passes_memory_limit(self):
         # compose mem_limit / a Kubernetes resources limit arrives as HostConfig
         # Memory. The daemon shows it to the guest as the cgroup memory limit,

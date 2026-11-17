@@ -848,10 +848,18 @@ class DockerEngineState:
             if k not in env_map:
                 env_order.append(k)
             env_map[k] = item
+        hostname = body.get("Hostname") or cname
+        # Docker sets these for the container process when neither the image nor the
+        # request does. HOME matters: an entrypoint that writes $HOME/.aws/credentials
+        # (the lambda-sim containers) put the file in "/" instead of /root, and the
+        # SDK, which reads the passwd home, found no credentials.
+        for k, v in (("HOME", "/root"), ("HOSTNAME", hostname)):
+            if k not in env_map:
+                env_order.append(k)
+                env_map[k] = f"{k}={v}"
         merged_env = [env_map[k] for k in env_order]
 
         workdir = body.get("WorkingDir") or img_cfg.get("WorkingDir") or "/"
-        hostname = body.get("Hostname") or cname
         labels = dict(img_cfg.get("Labels") or {})
         labels.update(body.get("Labels") or {})
 

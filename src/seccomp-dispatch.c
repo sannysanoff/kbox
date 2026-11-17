@@ -347,6 +347,22 @@ static const struct kbox_fd_inject_ops local_fd_inject_ops = {
     .addfd_at = local_request_addfd_at,
 };
 
+static int find_available_tracee_fd(const struct kbox_supervisor_ctx *ctx,
+                                    pid_t pid,
+                                    int minfd);
+
+/* True when a redirect onto stdin/stdout/stderr lives only in kbox's table. */
+static int virtual_stdio_redirect_active(const struct kbox_supervisor_ctx *ctx)
+{
+    if (!ctx || !ctx->fd_table)
+        return 0;
+    for (long fd = 0; fd < 3; fd++) {
+        if (kbox_fd_table_get_lkl(ctx->fd_table, fd) >= 0)
+            return 1;
+    }
+    return 0;
+}
+
 int request_addfd(const struct kbox_supervisor_ctx *ctx,
                   const struct kbox_syscall_request *req,
                   int srcfd,
@@ -354,6 +370,22 @@ int request_addfd(const struct kbox_supervisor_ctx *ctx,
 {
     if (!ctx || !ctx->fd_inject_ops || !ctx->fd_inject_ops->addfd || !req)
         return -EINVAL;
+
+    /* The kernel hands out the lowest free number. A shell redirect onto fd
+     * 0-2 is purely virtual here -- dash closes the real descriptor first --
+     * so that number looks free to the kernel and the injected descriptor
+     * (the dynamic loader's memfd at exec) landed on it. Its later close then
+     * erased the redirect, and the program's output failed with EBADF
+     * (ls, id, stat, cp -v >> file). Pick a number the table is not using.
+     */
+    if (virtual_stdio_redirect_active(ctx) && ctx->fd_inject_ops->addfd_at) {
+        int target =
+            find_available_tracee_fd(ctx, kbox_syscall_request_pid(req), 0);
+        if (target >= 0)
+            return ctx->fd_inject_ops->addfd_at(
+                ctx, kbox_syscall_request_cookie(req), srcfd, target,
+                newfd_flags);
+    }
     return ctx->fd_inject_ops->addfd(ctx, kbox_syscall_request_cookie(req),
                                      srcfd, newfd_flags);
 }
@@ -560,6 +592,36 @@ static void dup_table_supervisor_fds(struct kbox_fd_table *t)
     }
 }
 
+/* Copy every writable shadow in a process's table back into its LKL file.
+ *
+ * A "> file" redirect gives the process a memfd shadow instead of the LKL file,
+ * and the bytes only reach LKL on close, fsync or exec. A stdio program (ls,
+ * tr, cp -v, sed) writes and then simply exits, so without this its output was
+ * lost and the redirect target stayed empty.
+ */
+static void sync_table_writebacks(struct kbox_supervisor_ctx *ctx,
+                                  struct kbox_fd_table *t)
+{
+    if (!ctx || !t)
+        return;
+
+    struct {
+        struct kbox_fd_entry *arr;
+        long count;
+    } ranges[3] = {
+        {t->low_fds, KBOX_LOW_FD_MAX},
+        {t->mid_fds, KBOX_MID_FD_MAX},
+        {t->entries, KBOX_FD_TABLE_MAX},
+    };
+    for (int r = 0; r < 3; r++) {
+        for (long j = 0; j < ranges[r].count; j++) {
+            struct kbox_fd_entry *e = &ranges[r].arr[j];
+            if (e->lkl_fd >= 0 && e->shadow_writeback)
+                (void) sync_shadow_writeback(ctx, e);
+        }
+    }
+}
+
 static void reap_dead_proc_fds(struct kbox_supervisor_ctx *ctx)
 {
     if (!ctx || !ctx->proc_fds)
@@ -583,6 +645,8 @@ static void reap_dead_proc_fds(struct kbox_supervisor_ctx *ctx)
         }
 
         struct kbox_fd_table *dead_tab = ctx->proc_fds[i].table;
+        /* A process killed by a signal never reaches exit_group. */
+        sync_table_writebacks(ctx, dead_tab);
         if (ctx->fd_table == dead_tab)
             ctx->fd_table = ctx->root_fd_table;
         ctx->active_proc = NULL;
@@ -3318,11 +3382,11 @@ int sync_shadow_writeback(struct kbox_supervisor_ctx *ctx,
                 entry->lkl_fd, (long long) st.st_size);
     if (kbox_lkl_ftruncate(ctx->sysnrs, entry->lkl_fd, (long) st.st_size) < 0)
         return -EIO;
-    if (lseek(entry->shadow_sp, 0, SEEK_SET) < 0)
-        return -errno;
-
     buf = dispatch_scratch;
 
+    /* pread, not lseek+read: the memfd's file offset is shared with every
+     * process holding the shadow, and syncing must not move it under a writer
+     * that is still running (this also runs when a sibling exits). */
     while (off < st.st_size) {
         size_t chunk = KBOX_IO_CHUNK_LEN;
         ssize_t rd;
@@ -3330,7 +3394,7 @@ int sync_shadow_writeback(struct kbox_supervisor_ctx *ctx,
 
         if ((off_t) chunk > st.st_size - off)
             chunk = (size_t) (st.st_size - off);
-        rd = read(entry->shadow_sp, buf, chunk);
+        rd = pread(entry->shadow_sp, buf, chunk, off);
         if (rd < 0)
             return -errno;
         if (rd == 0)
@@ -3540,6 +3604,24 @@ static struct kbox_dispatch forward_read_like(
     }
 
     return kbox_dispatch_value((int64_t) total);
+}
+
+/* forward_exit_group. */
+
+/* Copy writable shadows back to LKL before the process goes away. A process
+ * that writes through a "> file" redirect and exits (ls, tr, sed) never closes
+ * the descriptor, so without this its parent reads the file back empty. The
+ * host kernel still performs the exit. */
+static struct kbox_dispatch forward_exit_group(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    sync_table_writebacks(ctx, ctx->fd_table);
+    if (ctx->verbose)
+        fprintf(stderr, "kbox: exit_group pid=%u code=%lld\n",
+                kbox_syscall_request_pid(req),
+                (long long) kbox_syscall_request_arg(req, 0));
+    return kbox_dispatch_continue();
 }
 
 /* forward_write. */
@@ -6296,6 +6378,7 @@ static struct kbox_dispatch forward_chown_legacy(
     _(dup, forward_dup)                                                       \
     _(dup2, forward_dup2)                                                     \
     _(dup3, forward_dup3)                                                     \
+    _(exit_group, forward_exit_group)                                         \
     /* I/O. */                                                                \
     _(write, forward_write)                                                   \
     _(lseek, forward_lseek)                                                   \
@@ -6384,7 +6467,7 @@ static struct kbox_dispatch forward_chown_legacy(
 /* clang-format off */
 #define DISPATCH_CONTINUE_TABLE(_)                                             \
     _(setpgid) _(getpgid) _(getsid) _(setsid) _(brk) _(wait4) _(waitid)        \
-    _(exit) _(exit_group) _(rt_sigreturn) _(rt_sigaltstack) _(rt_sigsuspend)  \
+    _(exit) _(rt_sigreturn) _(rt_sigaltstack) _(rt_sigsuspend)                 \
     _(setitimer)                                                               \
     _(getitimer) _(set_tid_address) _(set_robust_list) _(futex) _(rseq)        \
     _(membarrier) _(madvise) _(getrlimit) _(getrusage)                         \
@@ -6661,16 +6744,6 @@ static struct kbox_dispatch dispatch_request_impl(
      */
     if (nr == h->setpriority)
         return kbox_dispatch_continue();
-
-    /* exit_group is notified (not BPF-allowed) so verbose mode can show how a
-     * process ended; the host kernel still performs the exit. */
-    if (nr == h->exit_group) {
-        if (ctx->verbose)
-            fprintf(stderr, "kbox: exit_group pid=%u code=%lld\n",
-                    kbox_syscall_request_pid(req),
-                    (long long) kbox_syscall_request_arg(req, 0));
-        return kbox_dispatch_continue();
-    }
 
     if (nr == h->getpid) {
         if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP)

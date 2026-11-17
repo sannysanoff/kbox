@@ -86,6 +86,16 @@ else
     fi
 fi
 
+# ---- Kernel-side requirements -------------------------------------------
+
+# hostfs (the host directory filesystem) and the overlayfs fix that makes an
+# unprivileged upper understand its xattr whiteouts live in the fork:
+#
+#   4710939b6 overlayfs: honour userxattr whiteouts in the upper layer
+#   ba619e886 hostfs: support xattrs, tmpfiles and unprivileged whiteouts
+#
+# Nothing is patched here, so a fresh clone of the fork is the source of truth.
+
 # ---- Configure -----------------------------------------------------------
 
 if [ ! -f "${LKL_SRC}/.config" ]; then
@@ -149,10 +159,16 @@ if [ ! -f "${LKL_SRC}/.config" ]; then
         CONFIG_NFS_V4_2 \
         CONFIG_NFS_USE_KERNEL_DNS \
         CONFIG_LOCKD \
-        CONFIG_LOCKD_V4; do
+        CONFIG_LOCKD_V4 \
+        CONFIG_HOSTFS; do
         "${LKL_SRC}/scripts/config" --file "${LKL_SRC}/.config" --enable "${opt}"
     done
 
+    # CONFIG_LKL_HOST_MEMCPY routes the guest kernel's memcpy to the host libc.
+    # glibc's aarch64 memcpy reads up to a block past the end of the source, and
+    # raw_copy_from_user() uses memcpy directly, so a user buffer that ends at a
+    # page boundary faults: mount(2) option strings hit this reliably
+    # (copy_mount_options). Use the kernel's own byte-accurate memcpy instead.
     for opt in \
         CONFIG_DEBUG_INFO \
         CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
@@ -166,6 +182,7 @@ if [ ! -f "${LKL_SRC}/.config" ]; then
         CONFIG_SOUND \
         CONFIG_USB_SUPPORT \
         CONFIG_INPUT \
+        CONFIG_LKL_HOST_MEMCPY \
         CONFIG_CIFS; do
         "${LKL_SRC}/scripts/config" --file "${LKL_SRC}/.config" --disable "${opt}"
     done

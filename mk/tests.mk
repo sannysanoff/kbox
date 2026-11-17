@@ -73,7 +73,7 @@ ROOTFS       = alpine.ext4
 
 # ---- Test targets ----
 
-check: check-unit check-integration check-stress
+check: check-unit check-integration check-stress check-hostfs
 
 check-unit: $(TEST_TARGET)
 	@echo "  RUN     check-unit"
@@ -95,6 +95,19 @@ check-integration: $(TARGET) guest-bins stress-bins $(ROOTFS)
 check-stress: $(TARGET) stress-bins $(ROOTFS)
 	@echo "  RUN     check-stress"
 	$(Q)./scripts/run-stress.sh ./$(TARGET) $(ROOTFS)
+
+# Hostfs: the host-directory filesystem used as an overlay lower/upper layer.
+# Boots LKL directly, so it needs the LKL source tree for its headers.
+HOSTFS_TEST = tests/lkl/hostfs-test
+
+$(HOSTFS_TEST): tests/lkl/hostfs-test.c $(LKL_LIB)
+	@echo "  LD      $@"
+	$(Q)$(CC) -O1 -o $@ $< -Ibuild/lkl-src/tools/lkl/include \
+		-L$(LKL_DIR) -llkl -lpthread -lrt -lm
+
+check-hostfs: $(HOSTFS_TEST)
+	@echo "  RUN     check-hostfs"
+	$(Q)./scripts/run-hostfs-test.sh ./$(HOSTFS_TEST)
 
 # ---- Guest / stress binaries (static, no ASAN) ----
 # These are cross-compiled on Linux and placed into the rootfs.

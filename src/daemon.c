@@ -137,6 +137,7 @@ struct daemon_container {
     pthread_t worker_thread;
     int worker_started;
     pthread_mutex_t lock;
+    int setup_held; /* this container holds the start-up gate */
     pthread_cond_t cv;
 };
 
@@ -1221,8 +1222,44 @@ static void *sigchld_reaper_thread(void *arg)
     return NULL;
 }
 
+/* Container start-up gate.
+ *
+ * Starting a container unshares namespaces, builds an overlay mount, creates a
+ * veth and spawns the process, all against the one LKL kernel. Compose starts
+ * several containers at once, and when those set-ups overlapped they tripped
+ * over each other: mkdir ENOENT in a directory that exists in the image
+ * (nginx, maven), EEXIST creating a veth, and containers that "started" with a
+ * half-built root. Only one container runs its set-up at a time; the gate is
+ * released as soon as the process is running or the start has failed.
+ */
+static pthread_mutex_t g_setup_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_setup_cv = PTHREAD_COND_INITIALIZER;
+static int g_setup_busy;
+
+static void setup_gate_acquire(struct daemon_container *c)
+{
+    pthread_mutex_lock(&g_setup_mu);
+    while (g_setup_busy)
+        pthread_cond_wait(&g_setup_cv, &g_setup_mu);
+    g_setup_busy = 1;
+    c->setup_held = 1;
+    pthread_mutex_unlock(&g_setup_mu);
+}
+
+static void setup_gate_release(struct daemon_container *c)
+{
+    pthread_mutex_lock(&g_setup_mu);
+    if (c->setup_held) {
+        c->setup_held = 0;
+        g_setup_busy = 0;
+        pthread_cond_signal(&g_setup_cv);
+    }
+    pthread_mutex_unlock(&g_setup_mu);
+}
+
 static void fail_container_start(struct daemon_container *c, const char *msg)
 {
+    setup_gate_release(c);
     pthread_mutex_lock(&c->lock);
     snprintf(c->start_err, sizeof(c->start_err), "%s", msg);
     c->state = CONT_EXITED;
@@ -1506,6 +1543,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
 static void cont_on_running(void *opaque)
 {
     struct daemon_container *c = opaque;
+    setup_gate_release(c);
     pthread_mutex_lock(&c->lock);
     c->state = CONT_RUNNING;
     c->started_at = time(NULL);
@@ -1555,6 +1593,7 @@ static void *container_worker_thread(void *arg)
     char img_dir[160];
     char err_msg[256] = {0};
 
+    setup_gate_acquire(c);
     if (kbox_lkl_new_thread_group_leader(sysnrs) < 0) {
         fail_container_start(c, "lkl_new_thread_group_leader failed");
         return NULL;
@@ -1660,6 +1699,12 @@ static void *container_worker_thread(void *arg)
         (void) kbox_lkl_fchmodat(sysnrs, AT_FDCWD_LINUX, tmp_p, 01777, 0);
     }
 
+    /* A fresh interface name for every start. A start that failed after the
+     * veth was created leaves it behind, and starting the same container again
+     * (compose retries one that is still "Created") asked for the same name and
+     * got EEXIST, failing every container that followed. */
+    snprintf(c->host_if, sizeof(c->host_if), "veth%d",
+             __atomic_add_fetch(&g_veth_seq, 1, __ATOMIC_SEQ_CST));
     int vrc =
         kbox_daemon_net_create_veth(sysnrs, c->host_if, "eth0", net_fd, c->ip);
     if (vrc < 0) {
@@ -1821,6 +1866,7 @@ static void *container_worker_thread(void *arg)
         .on_failed = cont_on_failed,
     };
     int exit_code = launch_and_supervise_proc(sysnrs, &pe, c->log_path, &hooks);
+    setup_gate_release(c);
 
     pthread_mutex_lock(&c->lock);
     c->state = CONT_EXITED;
@@ -2228,7 +2274,7 @@ static void handle_rpc_line(int client_fd, const char *req)
             !slot->ip[0])
             kbox_daemon_net_alloc_ip(slot->ip, sizeof(slot->ip));
 
-        int vseq = ++g_veth_seq;
+        int vseq = __atomic_add_fetch(&g_veth_seq, 1, __ATOMIC_SEQ_CST);
         snprintf(slot->host_if, sizeof(slot->host_if), "veth%d", vseq);
         snprintf(slot->log_path, sizeof(slot->log_path), "%s/%s.log",
                  DAEMON_LOG_DIR, cid);

@@ -72,13 +72,27 @@ static inline int fd_should_deny_io(long fd, long lkl_fd)
     return 1;
 }
 
-static inline int fd_should_deny_io_ctx(const struct kbox_fd_table *t,
+/* The tracee being dispatched on this thread, for adopting fds the supervisor
+ * did not create. */
+extern __thread pid_t kbox_cur_tracee_pid;
+
+/* An fd that arrived by SCM_RIGHTS (Chromium's shared memory and pipes between
+ * its processes) never passed through the supervisor, so the table does not
+ * know it. If /proc shows it is an anonymous kernel object, track it as a host
+ * passthrough fd. A host path file stays denied: that is the leak this policy
+ * exists to stop. */
+int kbox_fd_adopt_host_object(struct kbox_fd_table *t, pid_t pid, long fd);
+
+static inline int fd_should_deny_io_ctx(struct kbox_fd_table *t,
                                         long fd,
                                         long lkl_fd)
 {
     if (!fd_should_deny_io(fd, lkl_fd))
         return 0;
     if (t && kbox_fd_table_find_by_host_fd(t, fd) >= 0)
+        return 0;
+    if (t && fd >= 0 && fd < KBOX_FD_BASE &&
+        kbox_fd_adopt_host_object(t, kbox_cur_tracee_pid, fd))
         return 0;
     return 1;
 }

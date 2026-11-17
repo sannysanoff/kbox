@@ -1698,9 +1698,22 @@ static void *container_worker_thread(void *arg)
     long rfd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, resolv_p,
                                0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
     if (rfd >= 0) {
-        char res[64];
-        snprintf(res, sizeof(res), "nameserver %s\n", gw_ip);
-        kbox_lkl_write(sysnrs, rfd, res, (long) strlen(res));
+        char res[2048];
+        size_t rlen = 0;
+        if (c->host_net) {
+            /* Host networking: the container resolves through the pod's own
+             * sockets, so it needs the pod's nameservers, not the LKL
+             * gateway. */
+            FILE *hf = fopen("/etc/resolv.conf", "r");
+            if (hf) {
+                rlen = fread(res, 1, sizeof(res) - 1, hf);
+                fclose(hf);
+            }
+        }
+        if (rlen == 0)
+            rlen =
+                (size_t) snprintf(res, sizeof(res), "nameserver %s\n", gw_ip);
+        kbox_lkl_write(sysnrs, rfd, res, (long) rlen);
         kbox_lkl_close(sysnrs, rfd);
     }
 
@@ -2721,6 +2734,17 @@ int kbox_daemon_run(const char *sock_path, const char *cmdline, int verbose)
 
     /* Setup base LKL root filesystem hierarchy for daemon control plane. */
     lkl_mkdir_p(g_sysnrs, "/proc", 0755);
+    /* Every guest file and socket is an LKL descriptor, and LKL starts with a
+     * soft limit of 1024 for the whole daemon. A broker or JVM exhausts that
+     * within minutes (EMFILE from open, from socket, from veth creation). Raise
+     * it for this task and for init, which new tasks inherit from. */
+    {
+        struct {
+            unsigned long long cur, max;
+        } nofile = {1048576ULL, 1048576ULL};
+        kbox_lkl_prlimit64(g_sysnrs, 0, 7 /* RLIMIT_NOFILE */, &nofile);
+        kbox_lkl_prlimit64(g_sysnrs, 1, 7, &nofile);
+    }
     kbox_lkl_mount(g_sysnrs, "proc", "/proc", "proc", 0, NULL);
     lkl_mkdir_p(g_sysnrs, "/sys", 0755);
     kbox_lkl_mount(g_sysnrs, "sysfs", "/sys", "sysfs", 0, NULL);

@@ -249,6 +249,7 @@ struct kbox_sysnrs {
     long getrandom;
     long prctl;
     long syslog;
+    long prlimit64;
 };
 
 extern const struct kbox_sysnrs SYSNRS_X86_64;

@@ -16,7 +16,7 @@ struct kbox_sysnrs; /* forward declaration */
  */
 
 #define KBOX_FD_BASE 32768
-#define KBOX_FD_TABLE_MAX 4096
+#define KBOX_FD_TABLE_MAX 16384
 #define KBOX_FD_FAST_BASE (KBOX_FD_BASE + (KBOX_FD_TABLE_MAX / 2))
 #define KBOX_FD_HOSTONLY_BASE (KBOX_FD_BASE + ((KBOX_FD_TABLE_MAX * 3) / 4))
 /* redirect slots for FDs 0..1023 (dup2 targets) */
@@ -45,13 +45,14 @@ struct kbox_sysnrs; /* forward declaration */
 #define KBOX_LKL_FD_SHADOW_ONLY (-2)
 
 struct kbox_fd_entry {
-    long lkl_fd;   /* LKL-internal FD, -1 if slot is free */
-    long host_fd;  /* host memfd shadow / tracee FD number, -1 if none */
-    int host_sv_fd; /* supervisor-side FD sharing host-passthrough struct file */
-    int shadow_sp; /* supervisor's dup of shadow socket sp[1], -1 if none.
-                    * Kept alive so dup/dup2/dup3 can inject new copies into
-                    * the tracee via ADDFD.
-                    */
+    long lkl_fd;    /* LKL-internal FD, -1 if slot is free */
+    long host_fd;   /* host memfd shadow / tracee FD number, -1 if none */
+    int host_sv_fd; /* supervisor-side FD sharing host-passthrough struct file
+                     */
+    int shadow_sp;  /* supervisor's dup of shadow socket sp[1], -1 if none.
+                     * Kept alive so dup/dup2/dup3 can inject new copies into
+                     * the tracee via ADDFD.
+                     */
     int shadow_writeback; /* 1 if shadow_sp must be synced back to lkl_fd */
     int mirror_tty;       /* 1 if this FD mirrors a host TTY */
     int cloexec;          /* O_CLOEXEC tracking */

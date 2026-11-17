@@ -3705,6 +3705,9 @@ static struct kbox_dispatch forward_sendfile(
         if (kbox_lkl_fstat(ctx->sysnrs, out_lkl, &out_st) < 0 ||
             (out_st.st_mode & S_IFMT) != S_IFSOCK)
             return kbox_dispatch_errno(ENOSYS);
+        /* Header bytes the guest already wrote sit in the shadow socket's
+         * host queue. Push them into LKL first, or the body overtakes them. */
+        kbox_net_flush_socket((int) out_lkl);
     }
 
     if (count_raw <= 0)
@@ -4074,7 +4077,7 @@ static struct kbox_dispatch forward_fcntl(
                 return kbox_dispatch_value(0);
             }
         }
-        if (!fd_should_deny_io(fd, lkl_fd))
+        if (!fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))
             goto fcntl_shadow_continue;
         return kbox_dispatch_errno(EBADF);
     fcntl_shadow_continue:
@@ -4497,7 +4500,7 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
         /* Check for shadow socket (tracee holds host_fd from ADDFD). */
         long orig_vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
         if (orig_vfd < 0) {
-            if (!fd_should_deny_io(fd, lkl_fd))
+            if (!fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))
                 return kbox_dispatch_continue();
             return kbox_dispatch_errno(EBADF);
         }
@@ -4665,7 +4668,7 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
                     return finish_shadow_dup_at(ctx, orig, newfd, new_host, 0);
             }
         }
-        if (!fd_should_deny_io(oldfd, lkl_old)) {
+        if (!fd_should_deny_io_ctx(ctx->fd_table, oldfd, lkl_old)) {
             cleanup_replaced_fd_tracking(ctx, newfd);
             return kbox_dispatch_continue();
         }
@@ -4818,7 +4821,7 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
                                                 (flags & O_CLOEXEC) != 0);
             }
         }
-        if (!fd_should_deny_io(oldfd, lkl_old)) {
+        if (!fd_should_deny_io_ctx(ctx->fd_table, oldfd, lkl_old)) {
             cleanup_replaced_fd_tracking(ctx, newfd);
             return kbox_dispatch_continue();
         }
@@ -6489,6 +6492,28 @@ static void verbose_monitor_pids(pid_t seen)
     }
 }
 
+__thread pid_t kbox_cur_tracee_pid;
+
+int kbox_fd_adopt_host_object(struct kbox_fd_table *t, pid_t pid, long fd)
+{
+    char link[64], target[128];
+
+    if (pid <= 0)
+        return 0;
+    snprintf(link, sizeof(link), "/proc/%d/fd/%ld", (int) pid, fd);
+    ssize_t n = readlink(link, target, sizeof(target) - 1);
+    if (n <= 0)
+        return 0;
+    target[n] = '\0';
+    if (strncmp(target, "socket:", 7) != 0 &&
+        strncmp(target, "pipe:", 5) != 0 &&
+        strncmp(target, "anon_inode:", 11) != 0 &&
+        strncmp(target, "/memfd:", 7) != 0)
+        return 0;
+    track_host_passthrough_fd(t, (int) fd);
+    return 1;
+}
+
 static struct kbox_dispatch dispatch_request_impl(
     struct kbox_supervisor_ctx *ctx,
     const struct kbox_syscall_request *req)
@@ -6499,6 +6524,7 @@ static struct kbox_dispatch dispatch_request_impl(
     if (!ctx || !req)
         return kbox_dispatch_errno(EINVAL);
     h = ctx->host_nrs;
+    kbox_cur_tracee_pid = kbox_syscall_request_pid(req);
 
     /* A vfork parent is suspended until its child execs, so its first syscall
      * afterwards is the moment the exec rewrite can be undone. Doing it here,

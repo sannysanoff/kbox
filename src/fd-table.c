@@ -11,6 +11,7 @@
  * handles all ranges in O(1).
  */
 
+#include <stdio.h>
 #include <unistd.h>
 
 #include "fd-table.h"
@@ -200,6 +201,16 @@ long kbox_fd_table_insert(struct kbox_fd_table *t, long lkl_fd, int mirror_tty)
         }
     }
 
+    /* A JVM or database can legitimately hold thousands of files, and a leak
+     * shows up here too, so say how full the pool is when it runs out. */
+    {
+        long live = 0;
+        for (idx = 0; idx < limit_idx; idx++)
+            if (t->entries[idx].lkl_fd != -1)
+                live++;
+        fprintf(stderr, "kbox: virtual fd table full (%ld live of %ld)\n", live,
+                limit_idx);
+    }
     return -1; /* table truly full */
 }
 

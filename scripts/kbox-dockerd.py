@@ -1848,6 +1848,28 @@ class DockerHandler(BaseHTTPRequestHandler):
             self.send_empty(204)
             return
 
+        m = re.match(r"^/containers/([^/]+)/restart$", path)
+        if m:
+            c = eng.find_container(urllib.parse.unquote(m.group(1)))
+            if not c:
+                self.send_json(404, {"message": "No such container"})
+                return
+            timeout = int((qs.get("t") or ["10"])[0] or "10")
+            try:
+                eng.refresh_container(c)
+                if c["status"] == "running":
+                    eng.rpc.call({"op": "container_stop", "id": c["id"], "timeout": timeout})
+                    if c.get("health_stop") is not None:
+                        c["health_stop"].set()
+                    eng.refresh_container(c)
+                    eng.events.emit("container", "stop", c["id"], {**c["labels"], "name": c["name"]})
+                eng.start_container(c)
+                eng.events.emit("container", "restart", c["id"], {**c["labels"], "name": c["name"]})
+                self.send_empty(204)
+            except Exception as e:
+                self.send_json(500, {"message": str(e)})
+            return
+
         m = re.match(r"^/containers/([^/]+)/kill$", path)
         if m:
             c = eng.find_container(urllib.parse.unquote(m.group(1)))

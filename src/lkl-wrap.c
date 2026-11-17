@@ -426,7 +426,9 @@ long kbox_lkl_fsync(const struct kbox_sysnrs *s, long fd)
     return lkl_syscall6(s->fsync, fd, 0, 0, 0, 0, 0);
 }
 
-long kbox_lkl_msync(const struct kbox_sysnrs *s, long addr, long length,
+long kbox_lkl_msync(const struct kbox_sysnrs *s,
+                    long addr,
+                    long length,
                     long flags)
 {
     return lkl_syscall6(s->msync, addr, length, flags, 0, 0, 0);
@@ -588,6 +590,14 @@ long kbox_lkl_ppoll(const struct kbox_sysnrs *s,
 long kbox_lkl_unshare(const struct kbox_sysnrs *s, long flags)
 {
     return lkl_syscall6(s->unshare, flags, 0, 0, 0, 0, 0);
+}
+
+long kbox_lkl_prlimit64(const struct kbox_sysnrs *s,
+                        long pid,
+                        long resource,
+                        const void *new_limit)
+{
+    return lkl_syscall6(s->prlimit64, pid, resource, (long) new_limit, 0, 0, 0);
 }
 
 long kbox_lkl_setns(const struct kbox_sysnrs *s, long fd, long nstype)

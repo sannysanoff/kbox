@@ -770,6 +770,11 @@ class TestLayerCache(unittest.TestCase):
         self.assertTrue(store.manifest_path(digest).startswith(manifests + os.sep))
         self.assertEqual(store.images_driver, "hostfs")
 
+    def test_default_image_driver_is_hostfs(self):
+        missing = os.path.join(self.tmpdir.name, "absent.yaml")
+        cfg = kbox_dockerd.load_kbox_config(missing)
+        self.assertEqual(cfg["images_driver"], "hostfs")
+
     def test_config_file_sets_storage_paths(self):
         cfg_path = os.path.join(self.tmpdir.name, "kbox-config.yaml")
         with open(cfg_path, "w", encoding="utf-8") as f:

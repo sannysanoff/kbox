@@ -84,6 +84,26 @@ void kbox_owner_set(dev_t dev, ino_t ino, int64_t uid, int64_t gid);
  * real uid/gid appears owned by pid's effective ids. */
 void kbox_owner_apply(pid_t pid, struct stat *st);
 
+/* Guest ownership of a host file behind a bind mount, stored in the same
+ * "uid:gid" form as the LKL hostfs driver uses, so the identity survives a
+ * container restart and is shared by every container that sees the file.
+ *
+ * path may be absolute, or relative to dirfd, or empty (dirfd itself). The
+ * lookup follows symlinks unless nofollow is set. Returns 1 when the xattr is
+ * present and parsed, 0 when it is absent or unreadable. */
+int kbox_owner_xattr_get(int dirfd,
+                         const char *path,
+                         int nofollow,
+                         int64_t *uid,
+                         int64_t *gid);
+int kbox_owner_xattr_set(int dirfd,
+                         const char *path,
+                         int nofollow,
+                         int64_t uid,
+                         int64_t gid);
+int kbox_owner_xattr_format(char *buf, size_t len, int64_t uid, int64_t gid);
+int kbox_owner_xattr_parse(const char *buf, int64_t *uid, int64_t *gid);
+
 /* Test hook: forget everything. */
 void kbox_vcred_reset_for_test(void);
 

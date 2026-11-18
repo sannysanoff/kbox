@@ -39,6 +39,15 @@ struct kbox_dispatch forward_clock_gettime(
     int clockid = (int) to_c_long_arg(kbox_syscall_request_arg(req, 0));
     uint64_t remote_ts = kbox_syscall_request_arg(req, 1);
 
+    /* A CPU clock id that names a thread or a process encodes that id and is
+     * negative. Linux answers such a clock only in the process that owns the
+     * thread, and the supervisor is a different process: its own call answered
+     * EINVAL for the guest's time.pthread_getcpuclockid()
+     * (test_time.test_pthread_getcpuclockid). The tracee owns the thread, so
+     * let its own kernel call answer. */
+    if (clockid < 0)
+        return kbox_dispatch_continue();
+
     if (remote_ts == 0)
         return kbox_dispatch_errno(EFAULT);
 
@@ -60,6 +69,11 @@ struct kbox_dispatch forward_clock_getres(
     pid_t pid = kbox_syscall_request_pid(req);
     int clockid = (int) to_c_long_arg(kbox_syscall_request_arg(req, 0));
     uint64_t remote_ts = kbox_syscall_request_arg(req, 1);
+
+    /* Same reason as in forward_clock_gettime: an encoded CPU clock belongs to
+     * the tracee's process, not to the supervisor's. */
+    if (clockid < 0)
+        return kbox_dispatch_continue();
 
     struct timespec ts;
     if (clock_getres(clockid, remote_ts ? &ts : NULL) < 0)

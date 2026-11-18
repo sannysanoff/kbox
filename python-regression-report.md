@@ -1,9 +1,11 @@
 # CPython 3.12 regression suite under kbox
 
-Environment: local OrbStack Kubernetes, namespace `kbox-python`. Pod image
-`kbox-python/kbox:v22`, unprivileged (uid 65534, all capability sets empty,
+Environment: local OrbStack Kubernetes, namespace `kbox-python`. The two full
+sweeps below ran on pod image `kbox-python/kbox:v22`; each later section names
+the image and the LKL commit it was re-checked with (latest `v71`, LKL
+`e7a0d32c9d`). The pod is unprivileged (uid 65534, all capability sets empty,
 `Seccomp: 2`). Guest kernel `Linux 6.8.0-kbox aarch64` (LKL from
-`sannysanoff/linux`, commit `54accd5c2`).
+`sannysanoff/linux`).
 
 Workload: CPython 3.12.16 `Lib/test`, merged over the image's stdlib and mounted
 at `/usr/local/lib/python3.12`. Every module is run in its own container so one
@@ -82,6 +84,95 @@ Modules that fail in either environment:
 | `test_zipfile` | FAIL | PASS | PASS |
 | `test_zipfile64` | FAIL | FAIL | PASS |
 
+
+### The merged branch and the current LKL in the pod (`v71`)
+
+`v71` is the first image built from the merged tree: kbox `84f2e09` (the local
+descriptor and socket work merged with 12 upstream commits that bring the host
+layer cache, per-container cgroups, host networking and their `sendfile`
+changes) on top of LKL `e7a0d32c9d` (hostfs xattrs, hostfs tmpfiles and
+unprivileged whiteouts, overlayfs `userxattr` whiteouts, hostfs `chown` through
+`user.kbox.owner`). The LKL rebuild was required: the merged kbox mounts host
+directories through `hostfs`, which the previous `liblkl.a` did not have.
+
+One container per module, `python3 -m test -q --timeout 180`:
+
+| module | tests run | skipped | duration | result |
+|---|---|---|---|---|
+| `test_ssl` | 188 | 16 | 20.7 s | SUCCESS |
+| `test_epoll` | 10 | 0 | 0.13 s | SUCCESS |
+| `test_socket` | 732 | 117 | 51.8 s | SUCCESS |
+| `test_asyncio` | 2 577 | 54 | 1 min 19 s | SUCCESS |
+| `test_largefile` | 16 | 6 | 0.04 s | SUCCESS |
+| `test_io` | 644 | 18 | 12.9 s | SUCCESS |
+| `test_logging` | 260 | 4 | 19.8 s | SUCCESS |
+| `test_ssl` (repeat) | 188 | 16 | 20.7 s | SUCCESS |
+
+4 615 tests executed, 231 skipped, 0 failed. Earlier these seven modules cost a
+pod restart each (`test_socket` wedged the shim, `test_asyncio` and `test_ssl`
+aborted by the per-test timeout); this is the first sweep in which all of them
+complete in one pass.
+
+Two defects from the open list do not reproduce:
+
+- **`test_asyncio`, the sendfile wedge.** The module no longer sits in
+  `_sock_sendfile_native_impl` for the whole budget: 2 577 tests finish in
+  79-81 s. It is still flaky in the pod, at a much lower rate: 3 of 21
+  full-module runs end at the 180 s per-test timeout. Two distinct stacks were
+  captured:
+
+  ```
+  File "/usr/local/lib/python3.12/test/test_asyncio/test_unix_events.py", line 513 in run_loop
+  File "/usr/local/lib/python3.12/test/test_asyncio/test_unix_events.py", line 528 in cleanup
+
+  File "/usr/local/lib/python3.12/asyncio/unix_events.py", line 397 in _sock_sendfile_native_impl
+  File "/usr/local/lib/python3.12/test/test_asyncio/test_unix_events.py", line 579 in test_sock_sendfile_cancel1
+  ```
+
+  The first waits for `connection_lost` from `proto.wait_closed()`, the second is
+  inside the synchronous `os.sendfile` that `test_sock_sendfile_cancel1` calls
+  before the event loop is running. Eight further full-module runs and 200
+  repetitions of `SelectorEventLoopUnixSockSendfileTests` alone did not
+  reproduce either, so neither is a property of that test class by itself. Row
+  kept open, with the new rate.
+
+- **`test_largefile`, `EFBIG` on the pod rootfs.** Same counts as the failing
+  runs (`run=16 skipped=6`), now SUCCESS in three separate runs, and the whole
+  pod log for the sweep contains no `writeback failed` and no `-27`:
+
+  ```
+  $ grep -c "writeback failed" kboxd.log        → 0
+  $ grep -c "EFBIG\|: -27"     kboxd.log        → 0
+  ```
+
+  The mechanism is **not** isolated and is not claimed here. `EFBIG` comes from
+  `inode_newsize_ok` (`fs/attr.c`) either through `rlimit(RLIMIT_FSIZE)` or
+  through `s_maxbytes`, and both filesystems in the path declare
+  `MAX_LFS_FILESIZE` in this tree (`fs/hostfs/hostfs_kern.c:1347`,
+  `fs/overlayfs/super.c:1350`), so the limit that answered `-27` was attached to
+  the task the copy-back ran on, not to the destination filesystem. What changed
+  between `v70` and `v71` in that area is the LKL rebase and the upstream image
+  and layer handling.
+
+The pod log of the sweep also records these, none of which fails a test:
+
+```
+kbox: net: close drained lkl=15 after 5s, dropping to_lkl=160 to_sup=0
+kbox: net: close drained lkl=16 after 5s, dropping to_lkl=576 to_sup=0
+kbox: syscall pid=3280 nr=278 (getrandom) not returned after 5s; the guest waits
+kbox: answer lost pid=18682 nr=222 (mmap): No such file or directory
+kbox: answer lost pid=13277 nr=59 (pipe2): No such file or directory
+```
+
+- `close drained ... dropping` is the documented cap at `net-slirp.c:908`
+  (`KBOX_CLOSE_DRAIN_NS`): when the bridge cannot hand the rest to LKL within
+  5 s, the LKL socket is closed and the queued bytes are dropped. Two transfers
+  lost 160 and 576 bytes this way. It is a data-loss path for a slow peer, not a
+  defect of a test.
+- `answer lost` is explained at `seccomp-supervisor.c:477`: `ENOENT` means the
+  tracee died between the receive and the answer, `EBADF` means a thread exit
+  invalidated the notification. The loop continues in both cases.
+- `getrandom` stalled for 6 s once and then returned.
 
 ### Writeback ordering and the stale copy size (`v70`)
 
@@ -664,15 +755,16 @@ names the test that failed before the fix and passes after it.
 | Defect | Status |
 |---|---|
 | `test_concurrent_futures` spawn-class `SIGSEGV` | Isolated to `ProcessPoolSpawnProcessPoolExecutorTest`; fork and forkserver classes pass. The crash is in the parent during `popen_spawn_posix._launch` → `reduction.dump` → `DupFd` → `list.append`, and disappears under `PYTHONMALLOC=debug` and `PYTHONMALLOC=malloc`, which points at a small out-of-bounds write into pymalloc-managed memory. The writing syscall is not yet identified. |
-| `test_asyncio` under cumulative load in the pod | One test exceeds the 120 s budget inside `socket_helper.bind_port` after ~2,000 tests have run in the same process. The same module completes locally (2,577 tests). The whole-module run in the pod is the only place it reproduces; a single test extracted from it passes. |
+| `test_asyncio` in the pod | Rate dropped from "2 of 3 runs spend the whole budget in one test" to 3 of 21 full-module runs ending at the 180 s per-test timeout, with two different stacks: `cleanup` → `proto.wait_closed()` waiting for `connection_lost`, and the synchronous `os.sendfile` inside `test_sock_sendfile_cancel1` (`_sock_sendfile_native_impl` line 397) not returning. Eight further full-module runs and 300 repetitions of `SelectorEventLoopUnixSockSendfileTests` alone did not reproduce either, so the trigger is load in the pod, not the class. See the `v71` section. |
 | `test_epoll.test_control_and_wait` | Intermittent without the pod: 4 of 8 repeats of the module fail locally with `[(11, 4), (12, 5)] != [(11, 5), (12, 5)]`. Measured inside the running test: `epoll` reports `EPOLLIN` only for that descriptor, `select.poll()` reports `POLLIN` only (`{11: 4, 12: 5}`), the socket inode is unchanged since registration (no descriptor replacement), and `os.write(fd, b"Z")` on that very descriptor returns 1, so the socket is writable while readiness says it is not. A native AF_UNIX socket whose peer closed reports `POLLIN|POLLOUT|POLLERR|POLLHUP` (21), so a dead peer does not explain the mask either. The divergence is in kbox's readiness translation for shadow sockets, not in edge-triggered delivery. |
 | ~~`test_io.test_threads_write` on the guest's own filesystem~~ | Closed: not reproducible (60 single-test and 20 module runs pass); the copy-back ordering defect behind it is fixed in `v70` (see the `v70` section) Historical evidence: with raw `os.write` as well as with Python's buffered layer: 4 of 40 repeats end 10 bytes short, and every write returned its full 10 bytes (`short_writes=0`). The descriptor itself is short, not just the file: after the threads join, `fstat(fd)`, `fstat(dup(fd))`, `pread(dup(fd), …)` and `stat(path)` all report 190 bytes, and one line is absent. The size recorded per writer is non-monotonic (for example 190, 130, 130, 190, 30 …), so the shared description is truncated while the writers run, and `test_io` also drives 20 thread exits, each of which runs a writeback of that shadow. Plain Docker passes 40 of 40. |
 | `test_import.test_unwritable_directory`, `test_netrc` on the mounted volume only | Both pass on the guest's internal filesystem and fail on the bind mount. `netrc` reports `~/.netrc file owner (nobody, root) does not match current user`: the pod runs kboxd as uid 65534, so files the guest creates on the mount are owned by 65534 while the guest believes it is root, and the guest's own permission checks see the host identity. `test_import` creates a bytecode file in a mode-0555 directory, because the write lands in a shadow memfd that ignores the mount directory's mode. |
-| `test_largefile` on the pod's own rootfs (8 of 16 tests) | The cause is now named: writeback answers `EFBIG`. The daemon log repeats `kbox: writeback failed: ftruncate lkl_fd=11 size=2500000001: -27` sixteen times per run, and the file therefore keeps size 0, so `os.stat(...).st_size`, `f.tell()` and `os.lseek(fd, 0, SEEK_END)` all read 0 and `f.read(1)` is empty. The guest filesystem accepts the same size from a direct `ftruncate`: inside the pod a guest truncating `/tmp/big`, `/data/tmp/big` and `/big` to 2,500,000,001 bytes succeeds (`size=2500000001`, `blocks=0`). The limit therefore applies to the descriptor writeback uses, not to the filesystem. The same module passes on the pod's bind-mounted btrfs volume and on the local ext4 guest image, so the trigger is the container `overlay` rootfs. |
+| ~~`test_largefile` on the pod's own rootfs (8 of 16 tests)~~ | Closed on `v71`: the same counts (`run=16 skipped=6`) are SUCCESS in three separate runs and the daemon log holds no `writeback failed` and no `-27`; the cause was not isolated, so the closed row claims only the measurement. Historical evidence: writeback answers `EFBIG`. The daemon log repeats `kbox: writeback failed: ftruncate lkl_fd=11 size=2500000001: -27` sixteen times per run, and the file therefore keeps size 0, so `os.stat(...).st_size`, `f.tell()` and `os.lseek(fd, 0, SEEK_END)` all read 0 and `f.read(1)` is empty. The guest filesystem accepted the same size from a direct `ftruncate`: inside the pod a guest truncating `/tmp/big`, `/data/tmp/big` and `/big` to 2,500,000,001 bytes succeeded (`size=2500000001`, `blocks=0`). The limit therefore applied to the descriptor writeback used, not to the filesystem. The same module passed on the pod's bind-mounted volume and on the local ext4 guest image, so the trigger was the container rootfs. |
 | `test_zipfile.test_append_to_concatenated_zip_file` on the pod's own rootfs (1 of 344) | After writing a 20 MB prefix plus a zip file and reopening it for append, `ZipFile(...).namelist()` returns `[]` where the local ext4 guest and the pod's btrfs volume both return `['@test_6394_tmpæ']`. No writeback error is logged, so the read-back sees a file whose content does not match what was written. |
 | `test_tarfile.test_parent_symlink` on the mounted volume (1 of 633) | The extraction filter must refuse an archive whose symlink escapes the destination. On the bind-mounted volume no `LinkOutsideDestinationError` is raised (`AssertionError: LinkOutsideDestinationError not raised`), while the same test passes on the guest's internal filesystem. The containment check compares resolved paths, so kbox's mount-path resolution makes an escaping link look contained. |
-| `test_ssl`, `test_asyncio`, `test_socket` in the pod | `test_ssl` now completes (188 tests, 2 failures, 32 s) and `test_logging`/`test_io` pass, all after the poisoned-LKL-task fallback. `test_asyncio` still times out inside `_sock_sendfile_native_impl` (waiting for socket writability), and `test_socket` still wedges, now in a blocking `recvmsg` for `test_socket.testOddCmsgSize`; the reporter names it (`recvmsg has not returned after 5s`). Both point at the bridge pump's backpressure: a guest socketpair end that the pump does not drain stops advertising `EPOLLOUT`, which is also what `test_epoll.test_control_and_wait` fails on. |
-| `test_socket` wedges the shim in both environments | The module produced no result in either sweep. The container stays `running` past the 240 s limit, `docker rm -f` cannot kill the guest, and while it is wedged the shim answers unrelated calls slowly. The driver now records `WEDGED` and continues, but a pod restart is the only way to clear such a guest. |
+| ~~`test_ssl`, `test_asyncio`, `test_socket` in the pod~~ | Closed on `v71` except for the `test_asyncio` rate in its own row: `test_ssl` 188 tests SUCCESS (20.7 s, twice), `test_socket` 732 tests SUCCESS (51.8 s), `test_io` 644 and `test_logging` 260 SUCCESS. Historical evidence: `test_ssl` completed with 2 failures after the poisoned-LKL-task fallback, `test_asyncio` timed out inside `_sock_sendfile_native_impl`, and `test_socket` wedged in a blocking `recvmsg` for `test_socket.testOddCmsgSize` (`recvmsg has not returned after 5s`), which pointed at the bridge pump's backpressure: a guest socketpair end the pump did not drain stopped advertising `EPOLLOUT`, the same mechanism `test_epoll.test_control_and_wait` still fails on. |
+| ~~`test_socket` wedges the shim in both environments~~ | Closed on `v71`: 732 tests finish in 51.8 s and the driver records PASS, not `WEDGED`. Historical evidence: the module produced no result in either `v22` sweep, the container stayed `running` past the 240 s limit, `docker rm -f` could not kill the guest, and while it was wedged the shim answered unrelated calls slowly. |
+| A close that the pump cannot finish drops what it still holds | `net-slirp.c:908` caps the drain at `KBOX_CLOSE_DRAIN_NS` (5 s), then closes the LKL socket: two transfers in the `v71` sweep lost 160 and 576 bytes this way (`kbox: net: close drained lkl=15 after 5s, dropping to_lkl=160 to_sup=0`). No test fails on it, and the cap exists so a descriptor the supervisor still holds cannot pin a bridge slot and an LKL FD forever. |
 | ~~`test_fexecve`~~ | Fixed: see the fix table. `test_posix.test_fexecve` passes on the internal filesystem and on the mounted volume. |
 
 ## Repro

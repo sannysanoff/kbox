@@ -233,6 +233,9 @@ printf 'commit=%s\ndate=%s\narch=%s\n' \
     "${ARCH}" \
     > "${LKL_DIR}/BUILD_INFO"
 
-(cd "${LKL_DIR}" && sha256sum ./* > sha256sums.txt)
+# Hash the installed files only. The directory may also hold header trees from
+# an older layout, and sha256sum fails on a directory under `set -e`.
+(cd "${LKL_DIR}" && find . -maxdepth 1 -type f | sort | xargs sha256sum \
+    > sha256sums.txt)
 
 echo "OK: ${LKL_DIR}/liblkl.a"

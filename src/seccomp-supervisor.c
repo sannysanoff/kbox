@@ -740,8 +740,13 @@ int kbox_run_supervisor_volumes(const struct kbox_sysnrs *sysnrs,
     int listener_fd;
     int exit_code;
     int status;
-    struct kbox_fd_table fd_table;
-    struct kbox_supervisor_ctx ctx;
+    /* The FD table holds KBOX_FD_TABLE_MAX + KBOX_MID_FD_MAX + KBOX_LOW_FD_MAX
+     * entries (4.5 MiB) and the context adds 0.4 MiB. As locals they overflowed
+     * the 8 MiB stack at -O2, where the caller's frame is still on the stack,
+     * and the supervisor died with SIGSEGV before its first statement. They
+     * live for the whole process, so they belong on the heap. */
+    struct kbox_fd_table *fd_table;
+    struct kbox_supervisor_ctx *ctx;
     sigset_t old_mask;
 
     /* Architecture-specific host syscall numbers for the BPF filter. */
@@ -877,49 +882,58 @@ int kbox_run_supervisor_volumes(const struct kbox_sysnrs *sysnrs,
         return -1;
     }
 
+    fd_table = calloc(1, sizeof(*fd_table));
+    ctx = calloc(1, sizeof(*ctx));
+    if (!fd_table || !ctx) {
+        fprintf(stderr, "kbox: supervisor: out of memory\n");
+        free(fd_table);
+        free(ctx);
+        return -1;
+    }
+
     /* 4b. Set up supervisor context. */
-    kbox_fd_table_init(&fd_table);
+    kbox_fd_table_init(fd_table);
 
     /* Register stdio (0, 1, 2) as host-passthrough FDs so the EBADF policy
      * for untracked FDs does not block inherited terminal/pipe I/O.
      */
     for (int i = 0; i < 3; i++)
-        kbox_fd_table_insert_at(&fd_table, i, KBOX_LKL_FD_SHADOW_ONLY, 0);
+        kbox_fd_table_insert_at(fd_table, i, KBOX_LKL_FD_SHADOW_ONLY, 0);
 
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.sysnrs = sysnrs;
-    ctx.host_nrs = host_nrs;
-    ctx.fd_table = &fd_table;
-    ctx.listener_fd = listener_fd;
-    ctx.proc_self_fd_dirfd = -1;
-    ctx.proc_mem_fd = -1;
-    ctx.child_pid = pid;
-    ctx.host_root = host_root;
-    ctx.verbose = verbose;
-    ctx.root_identity = root_identity;
-    ctx.override_uid = (uid_t) -1;
-    ctx.override_gid = (gid_t) -1;
-    ctx.normalize = normalize;
-    ctx.guest_mem_ops = &kbox_process_vm_guest_mem_ops;
-    ctx.fd_inject_ops = NULL;
-    ctx.web = web;
-    ctx.host_binds = host_binds;
-    ctx.host_bind_count = host_bind_count;
-    ctx.exit_notify_fd = -1;
-    ctx.exit_status_ptr = NULL;
+    /* calloc() already cleared both. */
+    ctx->sysnrs = sysnrs;
+    ctx->host_nrs = host_nrs;
+    ctx->fd_table = fd_table;
+    ctx->listener_fd = listener_fd;
+    ctx->proc_self_fd_dirfd = -1;
+    ctx->proc_mem_fd = -1;
+    ctx->child_pid = pid;
+    ctx->host_root = host_root;
+    ctx->verbose = verbose;
+    ctx->root_identity = root_identity;
+    ctx->override_uid = (uid_t) -1;
+    ctx->override_gid = (gid_t) -1;
+    ctx->normalize = normalize;
+    ctx->guest_mem_ops = &kbox_process_vm_guest_mem_ops;
+    ctx->fd_inject_ops = NULL;
+    ctx->web = web;
+    ctx->host_binds = host_binds;
+    ctx->host_bind_count = host_bind_count;
+    ctx->exit_notify_fd = -1;
+    ctx->exit_status_ptr = NULL;
 
     /* 4c. Enter supervisor loop. */
-    exit_code = supervise_loop(&ctx);
-    kbox_dispatch_cleanup_proc_fds(&ctx);
+    exit_code = supervise_loop(ctx);
+    kbox_dispatch_cleanup_proc_fds(ctx);
 
     /* Restore the caller's signal mask now that the signalfd is closed. */
     if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0)
         fprintf(stderr, "sigprocmask(SIG_SETMASK): %s\n", strerror(errno));
 
-    if (ctx.proc_mem_fd >= 0)
-        close(ctx.proc_mem_fd);
-    if (ctx.proc_self_fd_dirfd >= 0)
-        close(ctx.proc_self_fd_dirfd);
+    if (ctx->proc_mem_fd >= 0)
+        close(ctx->proc_mem_fd);
+    if (ctx->proc_self_fd_dirfd >= 0)
+        close(ctx->proc_self_fd_dirfd);
     close(listener_fd);
 
     if (exit_code < 0) {
@@ -932,12 +946,18 @@ int kbox_run_supervisor_volumes(const struct kbox_sysnrs *sysnrs,
                 fprintf(stderr, "waitpid: %s\n", strerror(errno));
             break;
         }
+        free(fd_table);
+        free(ctx);
         return -1;
     }
     if (exit_code != 0) {
         fprintf(stderr, "child exited with status %d\n", exit_code);
+        free(fd_table);
+        free(ctx);
         return -1;
     }
+    free(fd_table);
+    free(ctx);
     return 0;
 }
 

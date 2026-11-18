@@ -649,8 +649,8 @@ static int run_trap_launch(const struct kbox_image_args *args,
 {
     struct kbox_syscall_trap_ip_range ranges[KBOX_LOADER_MAX_MAPPINGS];
     const struct kbox_host_nrs *host_nrs = select_host_nrs();
-    struct kbox_fd_table fd_table;
-    struct kbox_supervisor_ctx ctx;
+    struct kbox_fd_table *fd_table;
+    struct kbox_supervisor_ctx *ctx;
     struct kbox_syscall_trap_runtime runtime;
     size_t range_count = 0;
 
@@ -674,10 +674,18 @@ static int run_trap_launch(const struct kbox_image_args *args,
     if (args->verbose)
         dump_loader_launch(launch);
 
-    init_launch_ctx(&ctx, &fd_table, args, sysnrs, host_nrs, web_ctx);
+
+    fd_table = calloc(1, sizeof(*fd_table));
+    ctx = calloc(1, sizeof(*ctx));
+    if (!fd_table || !ctx) {
+        free(fd_table);
+        free(ctx);
+        return -1;
+    }
+    init_launch_ctx(ctx, fd_table, args, sysnrs, host_nrs, web_ctx);
 
     runtime.sqpoll = args->sqpoll;
-    if (kbox_syscall_trap_runtime_install(&runtime, &ctx) < 0) {
+    if (kbox_syscall_trap_runtime_install(&runtime, ctx) < 0) {
         fprintf(stderr,
                 "kbox: trap launch failed: cannot install SIGSYS handler\n");
         return -1;
@@ -723,8 +731,8 @@ static int run_rewrite_launch(const struct kbox_image_args *args,
 {
     struct kbox_syscall_trap_ip_range ranges[KBOX_LOADER_MAX_MAPPINGS];
     const struct kbox_host_nrs *host_nrs = select_host_nrs();
-    struct kbox_fd_table fd_table;
-    struct kbox_supervisor_ctx ctx;
+    struct kbox_fd_table *fd_table;
+    struct kbox_supervisor_ctx *ctx;
     struct kbox_syscall_trap_runtime trap_runtime;
     struct kbox_rewrite_runtime rewrite_runtime;
     size_t range_count;
@@ -756,9 +764,17 @@ static int run_rewrite_launch(const struct kbox_image_args *args,
     if (args->verbose)
         dump_loader_launch(launch);
 
-    init_launch_ctx(&ctx, &fd_table, args, sysnrs, host_nrs, web_ctx);
 
-    if (kbox_rewrite_runtime_install(&rewrite_runtime, &ctx, launch) < 0) {
+    fd_table = calloc(1, sizeof(*fd_table));
+    ctx = calloc(1, sizeof(*ctx));
+    if (!fd_table || !ctx) {
+        free(fd_table);
+        free(ctx);
+        return -1;
+    }
+    init_launch_ctx(ctx, fd_table, args, sysnrs, host_nrs, web_ctx);
+
+    if (kbox_rewrite_runtime_install(&rewrite_runtime, ctx, launch) < 0) {
         fprintf(
             stderr,
             "kbox: rewrite launch failed: cannot install rewrite runtime: %s\n",
@@ -767,7 +783,7 @@ static int run_rewrite_launch(const struct kbox_image_args *args,
     }
 
     trap_runtime.sqpoll = args->sqpoll;
-    if (kbox_syscall_trap_runtime_install(&trap_runtime, &ctx) < 0) {
+    if (kbox_syscall_trap_runtime_install(&trap_runtime, ctx) < 0) {
         fprintf(stderr,
                 "kbox: rewrite launch failed: cannot install SIGSYS handler\n");
         kbox_rewrite_runtime_reset(&rewrite_runtime);

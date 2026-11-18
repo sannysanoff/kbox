@@ -85,6 +85,84 @@ Modules that fail in either environment:
 | `test_zipfile64` | FAIL | FAIL | PASS |
 
 
+### The launcher's stack overflow (`v72`)
+
+The merged tree added fields to `struct kbox_fd_entry` (the recorded peer address
+here, the fd-handling fields upstream), and that pushed two launcher frames past
+the 8 MiB default stack. Only the release build showed it.
+
+```
+$ ./kbox --syscall-mode=seccomp --net -r py312f.ext4 -- /bin/echo hi
+kbox: net: initialized (10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3)
+Segmentation fault
+```
+
+The same command works in the debug build (default `-O0` plus sanitizers, prints
+`hi`) and in the pod, whose daemon path calls a smaller callee. It dies with
+either guest image, so the image is not the variable, and the build mode is.
+
+gdb shows the fault at the first statement of the supervisor, with a corrupt
+backtrace and garbage in the argument registers:
+
+```
+#0  kbox_run_supervisor_volumes (sysnrs=0xaaaaab634ae0 <SYSNRS_GENERIC>,
+    command=0xffffffffff5f "/bin/echo", args=0xfffffffffd40, nargs=1,
+    host_root=0x0, exec_memfd=11, verbose=0, root_identity=0,
+    normalize=-2528, web=0xaaaaaaefbff0, host_binds=0xffffffa6e020,
+    host_bind_count=281474792161536) at src/seccomp-supervisor.c:737
+Backtrace stopped: previous frame identical to this frame (corrupt stack?)
+```
+
+Raising the limit fixes it, which names the mechanism:
+
+| stack limit | result |
+|---|---|
+| `ulimit -s 8192` (default) | `Segmentation fault` |
+| `ulimit -s 65536` | `hi`, clean exit |
+| `ulimit -s unlimited` | `hi`, clean exit |
+
+`-fstack-usage` at `-O2` gives the two frames that do not fit together:
+
+| function | frame |
+|---|---|
+| `kbox_run_image` (with `run_trap_launch` inlined) | 5 682 992 B |
+| `kbox_run_supervisor_volumes` | 5 143 664 B |
+
+10.3 MiB of frames on an 8 MiB stack. The floor under both is
+`struct kbox_fd_table`, which is an array of `struct kbox_fd_entry`
+(`KBOX_FD_TABLE_MAX + KBOX_MID_FD_MAX + KBOX_LOW_FD_MAX` of them, 120 bytes
+each, 4 718 616 B total) plus `struct kbox_supervisor_ctx` (424 776 B). Both were
+locals; both live for the life of the process, so they now come from `calloc()`
+in `kbox_run_supervisor_volumes`, `run_trap_launch` and `run_rewrite_launch`.
+
+After the change the largest frame of the three is 963 584 B
+(`kbox_run_image`), and the release build runs with the default stack:
+
+```
+$ ulimit -s; ./kbox --syscall-mode=seccomp --net -r py312f.ext4 -- /bin/echo hi
+8192
+hi
+kbox: net: cleaned up
+```
+
+| check | result |
+|---|---|
+| `make check-unit` | 298 C tests, 26 python tests, all pass |
+| local `test_socket` `test_ssl` `test_epoll` `test_io` `test_logging` `test_largefile` | 1 850 tests, 163 skipped, 1 failure |
+| local `test_asyncio` | 2 577 tests, SUCCESS |
+
+The one failure is `test_ssl.test_get_server_certificate_timeout`:
+`ssl.get_server_certificate()` reached `getpeercert()` → `getpeername()` and got
+`OSError: [Errno 107] Socket not connected` on a socket it had just connected.
+Run alone the test passes 5 of 5, so it is the known `getpeername` /
+`sock_established` area, not the stack change: the fix only moved two
+allocations from the stack to the heap.
+
+The daemon path still keeps the same pair on its container thread's stack
+(`launch_and_supervise_proc`, 5 154 272 B). It fits today because it calls
+`kbox_supervise_ctx` rather than the supervisor launcher, and it is left alone
+because no failure has been observed there.
+
 ### The merged branch and the current LKL in the pod (`v71`)
 
 `v71` is the first image built from the merged tree: kbox `84f2e09` (the local
@@ -389,6 +467,12 @@ this session). In the guest three of the four now pass.
 
 ### Where the pod-only wedge sits
 
+**Current state.** On `v71` the wedge does not reproduce: `test_ssl` (188
+tests), `test_socket` (732) and `test_asyncio` (2 577) all complete in the pod,
+most runs in under a minute and a half (see the `v71` section). What is left is
+the low-rate `test_asyncio` flake recorded there. The two causes below are kept
+as the record of the wedge as it was.
+
 The three modules that wedge the guest in the pod (`test_ssl`, `test_asyncio`,
 `test_socket`) do not wedge it locally, in the same image and on the same
 binary. `test_ssl` is the shortest reproduction.
@@ -689,6 +773,7 @@ names the test that failed before the fix and passes after it.
 
 | Fix | Evidence |
 |---|---|
+| The FD table (4.5 MiB) and the supervisor context (0.4 MiB) are heap-allocated in the three launchers instead of being locals, so the release build no longer runs its 8 MiB stack out before the supervisor's first statement | local `--net -r <image>` printed `Segmentation fault` before and `hi` after; frames 5 682 992 B → 963 584 B |
 | `exit_group` deregisters writeback shadows; a plain thread `exit` only flushes them, so a threaded writer's buffered data survives | `test_io.test_threads_write` |
 | `O_APPEND` opens share an active writeback shadow, so appended bytes survive the other descriptor's `close` | `test_io`, `test_cmd_line` |
 | Writeback uses `pread` (never disturbs the shared file-description offset), copies sparse files by extent (`SEEK_DATA`/`SEEK_HOLE`), caps at 16 MiB | `test_largefile`, `test_io` |

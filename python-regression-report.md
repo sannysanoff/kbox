@@ -83,6 +83,35 @@ Modules that fail in either environment:
 | `test_zipfile64` | FAIL | FAIL | PASS |
 
 
+### Writeback ordering and the stale copy size (`v70`)
+
+The older open defect `test_io.test_threads_write` (a file 10 bytes short while
+every write returned its full length, sizes seen by the readers going
+190, 130, 130, 190, 30) does **not** reproduce on the current binary: 60 of 60
+single-test runs and 20 of 20 full `test_io` runs pass. The later writeback
+changes (pread instead of read, copy by extent, retry on EINTR, flush on thread
+exit, copy on its own thread) had already removed the symptom.
+
+The mechanism behind it was still in the code, and a trace shows it is live:
+
+```
+kbox: writeback size lkl_fd=1 queued=40 now=60
+```
+
+A copy-back is queued with the size the shadow had at that moment and runs on a
+thread. A thread exit and a `close` of the same file each queue one, so two jobs
+can overlap with different sizes, and the older job finishing last called
+`ftruncate(lkl_fd, 40)` on a shadow that now holds 60 bytes. Fix: the copy takes
+the shadow's current size when it starts. The shadow is the authority and only
+the guest can shrink it, so its current size is the size the guest expects.
+
+| check | result |
+|---|---|
+| `test_io` (whole module) | 644 tests, SUCCESS |
+| `test_largefile` + `test_zipfile` | 360 tests, SUCCESS |
+| `make check-unit` | 298 C tests and 12 python tests pass |
+| stale sizes observed in one `test_io` run | 1 (`queued=40 now=60`) |
+
 ### Re-check in the pod after the readiness wait and the peer record (`v68`/`v69`)
 
 `v66` left `test_epoll` as the only failing module. Two fixes closed it and the
@@ -637,7 +666,7 @@ names the test that failed before the fix and passes after it.
 | `test_concurrent_futures` spawn-class `SIGSEGV` | Isolated to `ProcessPoolSpawnProcessPoolExecutorTest`; fork and forkserver classes pass. The crash is in the parent during `popen_spawn_posix._launch` → `reduction.dump` → `DupFd` → `list.append`, and disappears under `PYTHONMALLOC=debug` and `PYTHONMALLOC=malloc`, which points at a small out-of-bounds write into pymalloc-managed memory. The writing syscall is not yet identified. |
 | `test_asyncio` under cumulative load in the pod | One test exceeds the 120 s budget inside `socket_helper.bind_port` after ~2,000 tests have run in the same process. The same module completes locally (2,577 tests). The whole-module run in the pod is the only place it reproduces; a single test extracted from it passes. |
 | `test_epoll.test_control_and_wait` | Intermittent without the pod: 4 of 8 repeats of the module fail locally with `[(11, 4), (12, 5)] != [(11, 5), (12, 5)]`. Measured inside the running test: `epoll` reports `EPOLLIN` only for that descriptor, `select.poll()` reports `POLLIN` only (`{11: 4, 12: 5}`), the socket inode is unchanged since registration (no descriptor replacement), and `os.write(fd, b"Z")` on that very descriptor returns 1, so the socket is writable while readiness says it is not. A native AF_UNIX socket whose peer closed reports `POLLIN|POLLOUT|POLLERR|POLLHUP` (21), so a dead peer does not explain the mask either. The divergence is in kbox's readiness translation for shadow sockets, not in edge-triggered delivery. |
-| `test_io.test_threads_write` on the guest's own filesystem | Reproducible with raw `os.write` as well as with Python's buffered layer: 4 of 40 repeats end 10 bytes short, and every write returned its full 10 bytes (`short_writes=0`). The descriptor itself is short, not just the file: after the threads join, `fstat(fd)`, `fstat(dup(fd))`, `pread(dup(fd), …)` and `stat(path)` all report 190 bytes, and one line is absent. The size recorded per writer is non-monotonic (for example 190, 130, 130, 190, 30 …), so the shared description is truncated while the writers run, and `test_io` also drives 20 thread exits, each of which runs a writeback of that shadow. Plain Docker passes 40 of 40. |
+| ~~`test_io.test_threads_write` on the guest's own filesystem~~ | Closed: not reproducible (60 single-test and 20 module runs pass); the copy-back ordering defect behind it is fixed in `v70` (see the `v70` section) Historical evidence: with raw `os.write` as well as with Python's buffered layer: 4 of 40 repeats end 10 bytes short, and every write returned its full 10 bytes (`short_writes=0`). The descriptor itself is short, not just the file: after the threads join, `fstat(fd)`, `fstat(dup(fd))`, `pread(dup(fd), …)` and `stat(path)` all report 190 bytes, and one line is absent. The size recorded per writer is non-monotonic (for example 190, 130, 130, 190, 30 …), so the shared description is truncated while the writers run, and `test_io` also drives 20 thread exits, each of which runs a writeback of that shadow. Plain Docker passes 40 of 40. |
 | `test_import.test_unwritable_directory`, `test_netrc` on the mounted volume only | Both pass on the guest's internal filesystem and fail on the bind mount. `netrc` reports `~/.netrc file owner (nobody, root) does not match current user`: the pod runs kboxd as uid 65534, so files the guest creates on the mount are owned by 65534 while the guest believes it is root, and the guest's own permission checks see the host identity. `test_import` creates a bytecode file in a mode-0555 directory, because the write lands in a shadow memfd that ignores the mount directory's mode. |
 | `test_largefile` on the pod's own rootfs (8 of 16 tests) | The cause is now named: writeback answers `EFBIG`. The daemon log repeats `kbox: writeback failed: ftruncate lkl_fd=11 size=2500000001: -27` sixteen times per run, and the file therefore keeps size 0, so `os.stat(...).st_size`, `f.tell()` and `os.lseek(fd, 0, SEEK_END)` all read 0 and `f.read(1)` is empty. The guest filesystem accepts the same size from a direct `ftruncate`: inside the pod a guest truncating `/tmp/big`, `/data/tmp/big` and `/big` to 2,500,000,001 bytes succeeds (`size=2500000001`, `blocks=0`). The limit therefore applies to the descriptor writeback uses, not to the filesystem. The same module passes on the pod's bind-mounted btrfs volume and on the local ext4 guest image, so the trigger is the container `overlay` rootfs. |
 | `test_zipfile.test_append_to_concatenated_zip_file` on the pod's own rootfs (1 of 344) | After writing a 20 MB prefix plus a zip file and reopening it for append, `ZipFile(...).namelist()` returns `[]` where the local ext4 guest and the pod's btrfs volume both return `['@test_6394_tmpæ']`. No writeback error is logged, so the read-back sees a file whose content does not match what was written. |

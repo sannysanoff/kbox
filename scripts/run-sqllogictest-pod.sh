@@ -14,6 +14,7 @@
 #   NS        namespace (default: kbox-sqlite)
 #   IMAGE     pod image (default: the tag in deploy/sqlite/kbox.yaml)
 #   SLT_DIR   corpus directory on this machine (default: build/sqllogictest)
+#   RESULTS   pod results directory (default: /data/slt/results)
 #   CMD       kubectl command prefix (default: kubectl)
 
 set -eu
@@ -25,6 +26,7 @@ SLT_DIR="${SLT_DIR:-build/sqllogictest}"
 CMD="${CMD:-kubectl}"
 MANIFEST="deploy/sqlite/kbox.yaml"
 POD_ROOT="/data/slt"
+RESULTS="${RESULTS:-${POD_ROOT}/results}"
 
 IMAGE="${IMAGE:-$(awk '/image: kbox-sqlite/ {print $2; exit}' "$MANIFEST")}"
 
@@ -67,7 +69,7 @@ push)
     # source, which doubles the corpus file count in the pod.
     COPYFILE_DISABLE=1 tar -C "$SLT_DIR" -czf - sqllogictest test |
         $CMD -n "$NS" exec -i deploy/kbox -c shim -- \
-            sh -c "mkdir -p ${POD_ROOT} ${POD_ROOT}/results && tar -C ${POD_ROOT} -xzf - && \
+            sh -c "mkdir -p ${POD_ROOT} ${RESULTS} && tar -C ${POD_ROOT} -xzf - && \
                 find ${POD_ROOT} -name '._*' -delete"
     pod_exec find "${POD_ROOT}/test" -name '*.test' | wc -l | tr -d ' '
     echo "  files in pod"
@@ -81,21 +83,21 @@ run)
 start)
     shift
     pod_exec sh -c "nohup python3 /usr/local/bin/slt-pod-driver.py $* \
-        >> ${POD_ROOT}/results/driver.log 2>&1 & echo started"
+        >> ${RESULTS}/driver.log 2>&1 & echo started"
     ;;
 
 status)
-    pod_exec sh -c "cat ${POD_ROOT}/results/progress.txt 2>/dev/null; \
+    pod_exec sh -c "cat ${RESULTS}/progress.txt 2>/dev/null; \
         echo '--- last results ---'; \
-        tail -n 8 ${POD_ROOT}/results/summary.tsv 2>/dev/null; \
-        echo '--- driver ---'; tail -n 5 ${POD_ROOT}/results/driver.log 2>/dev/null"
+        tail -n 8 ${RESULTS}/summary.tsv 2>/dev/null; \
+        echo '--- driver ---'; tail -n 5 ${RESULTS}/driver.log 2>/dev/null"
     ;;
 
 collect)
     outdir="${2:-slt-results}"
     mkdir -p "$outdir"
     $CMD -n "$NS" exec deploy/kbox -c shim -- \
-        tar -C "${POD_ROOT}/results" -czf - . | tar -C "$outdir" -xzf -
+        tar -C "${RESULTS}" -czf - . | tar -C "$outdir" -xzf -
     echo "results in $outdir"
     ;;
 

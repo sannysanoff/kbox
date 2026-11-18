@@ -44,7 +44,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kboxd
-          image: kbox-python/kbox:v71
+          image: kbox-python/kbox:v72
           imagePullPolicy: IfNotPresent
           args:
             - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=6144M loglevel=4"
@@ -83,7 +83,7 @@ spec:
             limits:
               memory: 12Gi
         - name: shim
-          image: kbox-python/kbox:v71
+          image: kbox-python/kbox:v72
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

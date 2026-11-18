@@ -252,6 +252,63 @@ kbox: answer lost pid=13277 nr=59 (pipe2): No such file or directory
   invalidated the notification. The loop continues in both cases.
 - `getrandom` stalled for 6 s once and then returned.
 
+### Re-check of every previously failing module (`v71`)
+
+One container per module on `v71`, `python3 -m test -q --timeout 180`, then a
+plain `python:3.12-alpine` run of the same module with the same suite for
+classification. Plain Docker is the baseline: a module that fails there is the
+environment, not kbox.
+
+| module | `v71` (tests / failed) | plain Docker | verdict |
+|---|---|---|---|
+| `test_epoll` | 10 / 0 | PASS | fixed |
+| `test_import` | 104 / 0 | PASS | fixed |
+| `test_io` | 644 / 0 | PASS | fixed |
+| `test_largefile` | 16 / 0 | PASS | fixed |
+| `test_logging` | 260 / 0 | PASS | fixed |
+| `test_netrc` | 22 / 0 | PASS | fixed |
+| `test_socket` | 732 / 0 | PASS | fixed |
+| `test_ssl` | 188 / 0 | PASS | fixed |
+| `test_tarfile` | 633 / 0 | PASS | fixed |
+| `test_zipfile` | 344 / 0 | PASS | fixed |
+| `test_asyncio` | 2 577 / 0 (rerun) | PASS | fixed at this rate, see the flake row |
+| `test_time` | 62 / 1 | PASS | fixed afterwards, see below |
+| `test__locale` | 6 / 86 | FAIL, 86 | environment: musl locale data |
+| `test_posix` | 167 / 1 | FAIL, 1 | environment: musl `os.major(-1)` |
+| `test_strptime` | 56 / 8 | FAIL, 8 | environment |
+| `test_pathlib` | 609 / 3 | PASS | kbox: `Path.is_mount()` |
+| `test_subprocess` | 341 / 5 | PASS | kbox: stdio redirection |
+| `test_multiprocessing_fork` | 395 / 2 | PASS | kbox: fd transfer |
+| `test_multiprocessing_spawn` | aborted | PASS | kbox: `dup()` answered `EBUSY`, then `SIGSEGV` |
+| `test_multiprocessing_forkserver` | RUNBLOCKED, twice | PASS | kbox: wedges the shim |
+| `test_sqlite3` | 474 / 1 | PASS | known: advisory locks are always granted |
+| `test_concurrent_futures` | aborted | PASS | kbox: `SIGSEGV` in the parent |
+| `test_socketserver` | 0, NO TESTS RAN | PASS | environment: no terminal |
+| `test_zipfile64` | 0, NO TESTS RAN | PASS | environment: needs big memory |
+
+`test__locale`, `test_posix` and `test_strptime` were listed as kbox defects in
+the older tables; the baseline run says they fail without kbox too. They are
+moved to the deviations section.
+
+Two results need repeating rather than reading: `test_asyncio` was RUNBLOCKED in
+the sweep and passed in 82 s when re-run alone, and
+`test_multiprocessing_forkserver` was RUNBLOCKED twice. RUNBLOCKED means the
+shim refused to start the container for 90 s, which is a wedged daemon, and the
+forkserver module is the module that wedges it: after it runs, `docker run` does
+not return until the pod is restarted.
+
+The remaining kbox failures group into three areas, each with its own evidence:
+
+- **Stdio redirection into a child.** `subprocess.Popen(..., stdout=filedes)`
+  and the five related tests raise `OSError: [Errno 9] Bad file descriptor`
+  from `_execute_child`.
+- **Passing a descriptor to another process.** `test_fd_transfer` writes `b"foo"`
+  through a descriptor received over SCM_RIGHTS and the file stays empty
+  (`AssertionError: b'' != b'foo'`); the same shape fails for the >256 case.
+  `test_multiprocessing_spawn` additionally answered `dup()` with `EBUSY`
+  (`socket.fromfd` → `dup` in `resource_sharer.send`).
+- **`Path.is_mount()`** returns false for `/`, three times.
+
 ### Writeback ordering and the stale copy size (`v70`)
 
 The older open defect `test_io.test_threads_write` (a file 10 bytes short while
@@ -820,6 +877,12 @@ names the test that failed before the fix and passes after it.
 | Files created on a bind mount get the guest's umask applied, not the supervisor's | `test_pathlib.test_open_mode`, `test_pathlib.test_touch_mode` |
 | A trailing slash survives path normalization, so `open("missing/", O_CREAT)` fails the way Linux fails it instead of creating a file named `missing` | `test_shutil.test_copyfile_nonexistent_dir` |
 
+### Time
+
+| Fix | Evidence |
+|---|---|
+| `clock_gettime`/`clock_getres` with an encoded CPU clock id (`time.pthread_getcpuclockid`) continue to the kernel instead of running in the supervisor, which is not the process that owns the thread and answered `EINVAL` | `test_time.test_pthread_getcpuclockid`; `test_time` 62 tests SUCCESS |
+
 ## Deviations that are not kbox defects
 
 | Item | Why |
@@ -834,11 +897,18 @@ names the test that failed before the fix and passes after it.
 | `test_import.test_unencodable_filename` on a Mac-hosted bind mount | the Mac host filesystem (APFS) rewrites a name with an invalid UTF-8 byte to U+FFFD, so the name the guest created is not the name the listing returns. Verified outside kbox: the same directory read from macOS shows `\xef\xbf\xbd`. The pod's `/data` is btrfs, which stores arbitrary bytes. |
 | `test_capi` | `test_run_fileexflags` dies with `Fatal Python error: Segmentation fault` in plain Docker on the same image, at the same test and line (`test_run/test_run.py:78`), so the crash is CPython 3.12.16 on musl, not kbox |
 | `test_c_locale_coercion`, `test_ctypes`, `test_locale`, `test_ossaudiodev`, `test_os`, `test_re` | fail in plain Docker with the same image (baseline) |
+| `test__locale`, `test_strptime` | fail in plain `python:3.12-alpine` with the same suite (86 subtest failures and 8 respectively), so the cause is musl's locale data, not kbox. `test__locale` was listed as a kbox defect before the `v71` baseline run. |
+| `test_posix.test_makedev` | `os.major(-1)` raises `OverflowError: can't convert negative int to unsigned` in plain `python:3.12-alpine` too: the musl build of CPython does not special-case `NODEV`. |
+| `test_zipfile64` | NO TESTS RAN: the module needs more memory than the guest gives it, and plain Docker skips it as well. |
 
 ## Open defects
 
 | Defect | Status |
 |---|---|
+| `test_subprocess` stdio redirection (5 of 341) | `subprocess.Popen(..., stdout=<filedes>)` and its siblings (`stdin=`, `stderr=`, `stdout=<fileobj>`, `check_output(input=...)`, `remapping_std_fds`) raise `OSError: [Errno 9] Bad file descriptor` from `_execute_child`. Plain `python:3.12-alpine` passes all 341, so the descriptor the child is told to `dup2` is not valid there. |
+| `test_pathlib.test_is_mount` (3 of 609) | `Path('/').is_mount()` is false in all three path classes, so `stat("/")` and `stat("/..")` disagree in `st_dev`/`st_ino`. Plain Docker passes. |
+| `test_multiprocessing_*` fd passing (2 in fork, aborted in spawn) | `test_fd_transfer` writes `b"foo"` through a descriptor received over SCM_RIGHTS and the file stays empty (`AssertionError: b'' != b'foo'`); the same shape fails for the >256 case. `test_multiprocessing_spawn` also answered `dup()` with `EBUSY` (`resource_sharer.send` → `socket.fromfd` → `dup`). Plain Docker passes both modules. |
+| `test_multiprocessing_forkserver` wedges the shim | After the module runs, `docker run` does not return for 90 s (RUNBLOCKED in two separate runs) and only a pod restart clears it. Plain Docker passes. |
 | `test_concurrent_futures` spawn-class `SIGSEGV` | Isolated to `ProcessPoolSpawnProcessPoolExecutorTest`; fork and forkserver classes pass. The crash is in the parent during `popen_spawn_posix._launch` → `reduction.dump` → `DupFd` → `list.append`, and disappears under `PYTHONMALLOC=debug` and `PYTHONMALLOC=malloc`, which points at a small out-of-bounds write into pymalloc-managed memory. The writing syscall is not yet identified. |
 | `test_asyncio` in the pod | Rate dropped from "2 of 3 runs spend the whole budget in one test" to 3 of 21 full-module runs ending at the 180 s per-test timeout, with two different stacks: `cleanup` → `proto.wait_closed()` waiting for `connection_lost`, and the synchronous `os.sendfile` inside `test_sock_sendfile_cancel1` (`_sock_sendfile_native_impl` line 397) not returning. Eight further full-module runs and 300 repetitions of `SelectorEventLoopUnixSockSendfileTests` alone did not reproduce either, so the trigger is load in the pod, not the class. See the `v71` section. |
 | `test_epoll.test_control_and_wait` | Intermittent without the pod: 4 of 8 repeats of the module fail locally with `[(11, 4), (12, 5)] != [(11, 5), (12, 5)]`. Measured inside the running test: `epoll` reports `EPOLLIN` only for that descriptor, `select.poll()` reports `POLLIN` only (`{11: 4, 12: 5}`), the socket inode is unchanged since registration (no descriptor replacement), and `os.write(fd, b"Z")` on that very descriptor returns 1, so the socket is writable while readiness says it is not. A native AF_UNIX socket whose peer closed reports `POLLIN|POLLOUT|POLLERR|POLLHUP` (21), so a dead peer does not explain the mask either. The divergence is in kbox's readiness translation for shadow sockets, not in edge-triggered delivery. |

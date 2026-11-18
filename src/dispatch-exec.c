@@ -338,8 +338,14 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
              */
             int mmap_flags = (int) kbox_syscall_request_arg(req, 3);
             int mmap_prot = (int) kbox_syscall_request_arg(req, 2);
-            if ((mmap_flags & MAP_SHARED) && (mmap_prot & PROT_WRITE))
+            if ((mmap_flags & MAP_SHARED) && (mmap_prot & PROT_WRITE)) {
+                if (ctx->verbose)
+                    fprintf(stderr,
+                            "kbox: mmap ENODEV: writable shared fd=%ld lkl=%ld "
+                            "prot=0x%x flags=0x%x\n",
+                            fd, lkl_fd, mmap_prot, mmap_flags);
                 return kbox_dispatch_errno(ENODEV);
+            }
 
             struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
             int memfd = -1;
@@ -351,13 +357,23 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
                 own_memfd = 1;
             } else {
                 memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
-                if (memfd < 0)
+                if (memfd < 0) {
+                    if (ctx->verbose)
+                        fprintf(stderr,
+                                "kbox: mmap ENODEV: shadow fd=%ld lkl=%ld "
+                                "ret=%d\n",
+                                fd, lkl_fd, memfd);
                     return kbox_dispatch_errno(ENODEV);
+                }
                 kbox_shadow_seal(memfd);
                 own_memfd = 1;
             }
             int injected = request_addfd_at(ctx, req, memfd, (int) fd, 0);
             if (injected < 0) {
+                if (ctx->verbose)
+                    fprintf(stderr,
+                            "kbox: mmap ENODEV: addfd fd=%ld memfd=%d ret=%d\n",
+                            fd, memfd, injected);
                 if (own_memfd)
                     close(memfd);
                 return kbox_dispatch_errno(ENODEV);

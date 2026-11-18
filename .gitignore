@@ -26,3 +26,5 @@ src/web-assets.c
 
 tests/lkl/hostfs-test
 .deploy-image
+
+build/sqllogictest

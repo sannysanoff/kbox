@@ -306,8 +306,15 @@ The remaining kbox failures group into three areas, each with its own evidence:
   through a descriptor received over SCM_RIGHTS and the file stays empty
   (`AssertionError: b'' != b'foo'`); the same shape fails for the >256 case.
   `test_multiprocessing_spawn` additionally answered `dup()` with `EBUSY`
-  (`socket.fromfd` → `dup` in `resource_sharer.send`).
-- **`Path.is_mount()`** returns false for `/`, three times.
+  (`socket.fromfd` → `dup` in `resource_sharer.send`). The forkserver module
+  stops in `multiprocessing.heap.Arena.__init__` with `OSError: [Errno 9] Bad
+  file descriptor` from `mmap.mmap(self.fd, self.size)`; the arena's descriptor
+  comes from `mkstemp` and `os.unlink`, so it is a kbox shadow file that is
+  mapped after it lost its name.
+- **`Path.is_mount()`** answers true for a regular file
+  (`assertFalse((P / 'fileA').is_mount())` fails), three times: kbox resolves
+  `lstat("fileA/..")` instead of failing with `ENOTDIR`, so the parent's inode
+  differs from the file's and the path looks like a mount point.
 
 ### Writeback ordering and the stale copy size (`v70`)
 
@@ -908,7 +915,7 @@ names the test that failed before the fix and passes after it.
 | `test_subprocess` stdio redirection (5 of 341) | `subprocess.Popen(..., stdout=<filedes>)` and its siblings (`stdin=`, `stderr=`, `stdout=<fileobj>`, `check_output(input=...)`, `remapping_std_fds`) raise `OSError: [Errno 9] Bad file descriptor` from `_execute_child`. Plain `python:3.12-alpine` passes all 341, so the descriptor the child is told to `dup2` is not valid there. |
 | `test_pathlib.test_is_mount` (3 of 609) | `Path('/').is_mount()` is false in all three path classes, so `stat("/")` and `stat("/..")` disagree in `st_dev`/`st_ino`. Plain Docker passes. |
 | `test_multiprocessing_*` fd passing (2 in fork, aborted in spawn) | `test_fd_transfer` writes `b"foo"` through a descriptor received over SCM_RIGHTS and the file stays empty (`AssertionError: b'' != b'foo'`); the same shape fails for the >256 case. `test_multiprocessing_spawn` also answered `dup()` with `EBUSY` (`resource_sharer.send` → `socket.fromfd` → `dup`). Plain Docker passes both modules. |
-| `test_multiprocessing_forkserver` wedges the shim | After the module runs, `docker run` does not return for 90 s (RUNBLOCKED in two separate runs) and only a pod restart clears it. Plain Docker passes. |
+| `test_multiprocessing_forkserver` hangs the module | The module never finishes: the container stays `Up` past the driver's 300 s limit, and that is what the later RUNBLOCKED entries mean -- the daemon starts one container at a time, so a hung guest blocks the queue. `docker rm -f` does clear it. The guest's own log names the stop: `multiprocessing.heap.Arena.__init__` -> `mmap.mmap(self.fd, self.size)` raises `OSError: [Errno 9] Bad file descriptor`. Plain Docker passes. |
 | `test_concurrent_futures` spawn-class `SIGSEGV` | Isolated to `ProcessPoolSpawnProcessPoolExecutorTest`; fork and forkserver classes pass. The crash is in the parent during `popen_spawn_posix._launch` → `reduction.dump` → `DupFd` → `list.append`, and disappears under `PYTHONMALLOC=debug` and `PYTHONMALLOC=malloc`, which points at a small out-of-bounds write into pymalloc-managed memory. The writing syscall is not yet identified. |
 | `test_asyncio` in the pod | Rate dropped from "2 of 3 runs spend the whole budget in one test" to 3 of 21 full-module runs ending at the 180 s per-test timeout, with two different stacks: `cleanup` → `proto.wait_closed()` waiting for `connection_lost`, and the synchronous `os.sendfile` inside `test_sock_sendfile_cancel1` (`_sock_sendfile_native_impl` line 397) not returning. Eight further full-module runs and 300 repetitions of `SelectorEventLoopUnixSockSendfileTests` alone did not reproduce either, so the trigger is load in the pod, not the class. See the `v71` section. |
 | `test_epoll.test_control_and_wait` | Intermittent without the pod: 4 of 8 repeats of the module fail locally with `[(11, 4), (12, 5)] != [(11, 5), (12, 5)]`. Measured inside the running test: `epoll` reports `EPOLLIN` only for that descriptor, `select.poll()` reports `POLLIN` only (`{11: 4, 12: 5}`), the socket inode is unchanged since registration (no descriptor replacement), and `os.write(fd, b"Z")` on that very descriptor returns 1, so the socket is writable while readiness says it is not. A native AF_UNIX socket whose peer closed reports `POLLIN|POLLOUT|POLLERR|POLLHUP` (21), so a dead peer does not explain the mask either. The divergence is in kbox's readiness translation for shadow sockets, not in edge-triggered delivery. |

@@ -370,6 +370,22 @@ static const struct kbox_fd_inject_ops local_fd_inject_ops = {
     .addfd_at = local_request_addfd_at,
 };
 
+static int find_available_tracee_fd(const struct kbox_supervisor_ctx *ctx,
+                                    pid_t pid,
+                                    int minfd);
+
+/* True when a redirect onto stdin/stdout/stderr lives only in kbox's table. */
+static int virtual_stdio_redirect_active(const struct kbox_supervisor_ctx *ctx)
+{
+    if (!ctx || !ctx->fd_table)
+        return 0;
+    for (long fd = 0; fd < 3; fd++) {
+        if (kbox_fd_table_get_lkl(ctx->fd_table, fd) >= 0)
+            return 1;
+    }
+    return 0;
+}
+
 int request_addfd(const struct kbox_supervisor_ctx *ctx,
                   const struct kbox_syscall_request *req,
                   int srcfd,
@@ -377,6 +393,22 @@ int request_addfd(const struct kbox_supervisor_ctx *ctx,
 {
     if (!ctx || !ctx->fd_inject_ops || !ctx->fd_inject_ops->addfd || !req)
         return -EINVAL;
+
+    /* The kernel hands out the lowest free number. A shell redirect onto fd
+     * 0-2 is purely virtual here -- dash closes the real descriptor first --
+     * so that number looks free to the kernel and the injected descriptor
+     * (the dynamic loader's memfd at exec) landed on it. Its later close then
+     * erased the redirect, and the program's output failed with EBADF
+     * (ls, id, stat, cp -v >> file). Pick a number the table is not using.
+     */
+    if (virtual_stdio_redirect_active(ctx) && ctx->fd_inject_ops->addfd_at) {
+        int target =
+            find_available_tracee_fd(ctx, kbox_syscall_request_pid(req), 0);
+        if (target >= 0)
+            return ctx->fd_inject_ops->addfd_at(
+                ctx, kbox_syscall_request_cookie(req), srcfd, target,
+                newfd_flags);
+    }
     return ctx->fd_inject_ops->addfd(ctx, kbox_syscall_request_cookie(req),
                                      srcfd, newfd_flags);
 }
@@ -622,6 +654,8 @@ static void reap_dead_proc_fds(struct kbox_supervisor_ctx *ctx)
         }
 
         struct kbox_fd_table *dead_tab = ctx->proc_fds[i].table;
+        /* A process killed by a signal never reaches exit_group. */
+        sync_table_writebacks(ctx, dead_tab, 0);
         if (ctx->fd_table == dead_tab)
             ctx->fd_table = ctx->root_fd_table;
         ctx->active_proc = NULL;
@@ -3434,6 +3468,107 @@ static void translate_proc_self_at(int sv_dirfd,
  * supervisor_dirfd: AT_FDCWD for absolute paths, or a supervisor-owned copy
  *                   of the tracee's dirfd (caller must close after return).
  */
+/* Resident memory of one process, from /proc/<pid>/statm (2nd field, pages). */
+static long long process_rss_bytes(pid_t pid)
+{
+    char path[48], buf[128];
+    ssize_t n;
+    int fd;
+    char *p, *end;
+    unsigned long long pages;
+
+    snprintf(path, sizeof(path), "/proc/%d/statm", (int) pid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    p = strchr(buf, ' ');
+    if (!p)
+        return 0;
+    pages = strtoull(p + 1, &end, 10);
+    if (end == p + 1)
+        return 0;
+    return (long long) (pages * (unsigned long long) sysconf(_SC_PAGESIZE));
+}
+
+/* What a per-container cgroup would report as its memory usage: the resident
+ * memory of the processes this supervisor serves. */
+static long long container_rss_bytes(const struct kbox_supervisor_ctx *ctx)
+{
+    long long total = 0;
+    int root_seen = 0;
+
+    for (size_t i = 0; i < ctx->proc_fd_count; i++) {
+        pid_t tgid = ctx->proc_fds[i].tgid;
+        if (tgid <= 0)
+            continue;
+        if (tgid == ctx->child_pid)
+            root_seen = 1;
+        total += process_rss_bytes(tgid);
+    }
+    if (!root_seen && ctx->child_pid > 0)
+        total += process_rss_bytes(ctx->child_pid);
+    return total;
+}
+
+/* A container reads its memory limit and usage from the cgroup files, and the
+ * JVM, the JIT and ClickHouse size their heaps and caches from them. The files
+ * show the whole pod, so every container believed it owned all of it (a stack
+ * of JVMs grew past the pod's limit) and ClickHouse, comparing the pod's usage
+ * with its own limit, refused every query. Give a container that has a limit of
+ * its own (compose mem_limit, a Kubernetes resources limit) its own limit and
+ * its own usage, as a real per-container cgroup would. The value is a snapshot
+ * taken when the file is opened. */
+static int try_cgroup_limit_open(struct kbox_supervisor_ctx *ctx,
+                                 const struct kbox_syscall_request *req,
+                                 const char *path,
+                                 int host_flags,
+                                 struct kbox_dispatch *out)
+{
+    char text[32];
+    long long value;
+    int len, memfd, tracee_fd;
+
+    if (!ctx || ctx->mem_limit <= 0 || !path ||
+        (host_flags & O_ACCMODE) != O_RDONLY)
+        return 0;
+    if (strcmp(path, "/sys/fs/cgroup/memory.max") == 0 ||
+        strcmp(path, "/sys/fs/cgroup/memory/memory.limit_in_bytes") == 0)
+        value = ctx->mem_limit;
+    else if (strcmp(path, "/sys/fs/cgroup/memory.current") == 0 ||
+             strcmp(path, "/sys/fs/cgroup/memory/memory.usage_in_bytes") == 0)
+        value = container_rss_bytes(ctx);
+    else
+        return 0;
+
+    len = snprintf(text, sizeof(text), "%lld\n", value);
+    memfd = memfd_create("kbox-cgroup-file", MFD_CLOEXEC);
+    if (memfd < 0)
+        return 0;
+    if (write(memfd, text, (size_t) len) != len) {
+        close(memfd);
+        return 0;
+    }
+    if (lseek(memfd, 0, SEEK_SET) < 0) {
+        close(memfd);
+        return 0;
+    }
+    tracee_fd = request_addfd(ctx, req, memfd,
+                              (host_flags & O_CLOEXEC) ? O_CLOEXEC : 0);
+    close(memfd);
+    if (tracee_fd < 0)
+        return 0;
+    track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+    if (host_flags & O_CLOEXEC)
+        kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
+    *out = kbox_dispatch_value(tracee_fd);
+    return 1;
+}
+
 static struct kbox_dispatch emulate_host_open_tracked(
     struct kbox_supervisor_ctx *ctx,
     const struct kbox_syscall_request *req,
@@ -3442,6 +3577,10 @@ static struct kbox_dispatch emulate_host_open_tracked(
     int host_flags,
     mode_t mode)
 {
+    struct kbox_dispatch limit_dispatch;
+    if (try_cgroup_limit_open(ctx, req, path, host_flags, &limit_dispatch))
+        return limit_dispatch;
+
     char sv_path[KBOX_MAX_PATH];
     pid_t pid = kbox_syscall_request_pid(req);
     translate_proc_self_at(supervisor_dirfd, path, pid, sv_path,
@@ -4448,6 +4587,24 @@ static struct kbox_dispatch forward_read_like(
     return kbox_dispatch_value((int64_t) total);
 }
 
+/* forward_exit_group. */
+
+/* Copy writable shadows back to LKL before the process goes away. A process
+ * that writes through a "> file" redirect and exits (ls, tr, sed) never closes
+ * the descriptor, so without this its parent reads the file back empty. The
+ * host kernel still performs the exit. */
+static struct kbox_dispatch forward_exit_group(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    sync_table_writebacks(ctx, ctx->fd_table, 1);
+    if (ctx->verbose)
+        fprintf(stderr, "kbox: exit_group pid=%u code=%lld\n",
+                kbox_syscall_request_pid(req),
+                (long long) kbox_syscall_request_arg(req, 0));
+    return kbox_dispatch_continue();
+}
+
 /* forward_write. */
 
 static struct kbox_dispatch forward_write(
@@ -4779,6 +4936,9 @@ static struct kbox_dispatch forward_sendfile(
         if (kbox_lkl_fstat(ctx->sysnrs, out_lkl, &out_st) < 0 ||
             (out_st.st_mode & S_IFMT) != S_IFSOCK)
             return kbox_dispatch_errno(ENOSYS);
+        /* Header bytes the guest already wrote sit in the shadow socket's
+         * host queue. Push them into LKL first, or the body overtakes them. */
+        kbox_net_flush_socket((int) out_lkl);
     }
 
     if (count_raw <= 0)
@@ -5220,7 +5380,7 @@ static struct kbox_dispatch forward_fcntl(
                 return kbox_dispatch_value(0);
             }
         }
-        if (!fd_should_deny_io(fd, lkl_fd))
+        if (!fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))
             goto fcntl_shadow_continue;
         return kbox_dispatch_errno(EBADF);
     fcntl_shadow_continue:
@@ -5676,7 +5836,7 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
         /* Check for shadow socket (tracee holds host_fd from ADDFD). */
         long orig_vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
         if (orig_vfd < 0) {
-            if (!fd_should_deny_io(fd, lkl_fd))
+            if (!fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))
                 return kbox_dispatch_continue();
             return kbox_dispatch_errno(EBADF);
         }
@@ -5844,7 +6004,7 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
                     return finish_shadow_dup_at(ctx, orig, newfd, new_host, 0);
             }
         }
-        if (!fd_should_deny_io(oldfd, lkl_old)) {
+        if (!fd_should_deny_io_ctx(ctx->fd_table, oldfd, lkl_old)) {
             cleanup_replaced_fd_tracking(ctx, newfd);
             return kbox_dispatch_continue();
         }
@@ -5997,7 +6157,7 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
                                                 (flags & O_CLOEXEC) != 0);
             }
         }
-        if (!fd_should_deny_io(oldfd, lkl_old)) {
+        if (!fd_should_deny_io_ctx(ctx->fd_table, oldfd, lkl_old)) {
             cleanup_replaced_fd_tracking(ctx, newfd);
             return kbox_dispatch_continue();
         }
@@ -7717,6 +7877,7 @@ static struct kbox_dispatch forward_chown_legacy(
     _(dup, forward_dup)                                                       \
     _(dup2, forward_dup2)                                                     \
     _(dup3, forward_dup3)                                                     \
+    _(exit_group, forward_exit_group)                                         \
     /* I/O. */                                                                \
     _(write, forward_write)                                                   \
     _(lseek, forward_lseek)                                                   \
@@ -7808,7 +7969,7 @@ static struct kbox_dispatch forward_chown_legacy(
 /* clang-format off */
 #define DISPATCH_CONTINUE_TABLE(_)                                             \
     _(setpgid) _(getpgid) _(getsid) _(setsid) _(brk) _(wait4) _(waitid)        \
-    _(exit) _(exit_group) _(rt_sigreturn) _(rt_sigaltstack) _(rt_sigsuspend)  \
+    _(exit) _(rt_sigreturn) _(rt_sigaltstack) _(rt_sigsuspend)                 \
     _(setitimer)                                                               \
     _(getitimer) _(set_tid_address) _(set_robust_list) _(futex) _(rseq)        \
     _(membarrier) _(madvise) _(getrlimit) _(getrusage)                         \
@@ -7916,6 +8077,28 @@ static void verbose_monitor_pids(pid_t seen)
     }
 }
 
+__thread pid_t kbox_cur_tracee_pid;
+
+int kbox_fd_adopt_host_object(struct kbox_fd_table *t, pid_t pid, long fd)
+{
+    char link[64], target[128];
+
+    if (pid <= 0)
+        return 0;
+    snprintf(link, sizeof(link), "/proc/%d/fd/%ld", (int) pid, fd);
+    ssize_t n = readlink(link, target, sizeof(target) - 1);
+    if (n <= 0)
+        return 0;
+    target[n] = '\0';
+    if (strncmp(target, "socket:", 7) != 0 &&
+        strncmp(target, "pipe:", 5) != 0 &&
+        strncmp(target, "anon_inode:", 11) != 0 &&
+        strncmp(target, "/memfd:", 7) != 0)
+        return 0;
+    track_host_passthrough_fd(t, (int) fd);
+    return 1;
+}
+
 static struct kbox_dispatch dispatch_request_impl(
     struct kbox_supervisor_ctx *ctx,
     const struct kbox_syscall_request *req)
@@ -7926,6 +8109,7 @@ static struct kbox_dispatch dispatch_request_impl(
     if (!ctx || !req)
         return kbox_dispatch_errno(EINVAL);
     h = ctx->host_nrs;
+    kbox_cur_tracee_pid = kbox_syscall_request_pid(req);
 
     /* A vfork parent is suspended until its child execs, so its first syscall
      * afterwards is the moment the exec rewrite can be undone. Doing it here,

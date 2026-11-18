@@ -306,7 +306,7 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
 
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -1302,6 +1302,33 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
     if (interp_memfd < 0)
         return interp_memfd;
 
+    /* The interpreter may itself be a script: Oracle Linux ships /usr/bin/env
+     * as "#!/usr/bin/coreutils --coreutils-prog-shebang=env". Its shebang names
+     * a guest path as well, so rewrite it the same way. The kernel then follows
+     * two shebang levels, both pointing at injected descriptors. */
+    static __thread int nested_depth;
+    int interp_is_script = 0;
+    {
+        char magic[2];
+
+        if (pread(interp_memfd, magic, sizeof(magic), 0) ==
+                (ssize_t) sizeof(magic) &&
+            magic[0] == '#' && magic[1] == '!') {
+            if (nested_depth >= 4) {
+                close(interp_memfd);
+                return -ELOOP;
+            }
+            nested_depth++;
+            int nrc = rewrite_script_shebang(ctx, req, &interp_memfd, interp);
+            nested_depth--;
+            if (nrc < 0) {
+                close(interp_memfd);
+                return nrc;
+            }
+            interp_is_script = 1;
+        }
+    }
+
     /* The interpreter is a program in its own right: when it is dynamically
      * linked its PT_INTERP names the guest loader, which the host kernel
      * cannot open either. Patch it to an injected memfd of the loader, the
@@ -1353,7 +1380,10 @@ static int rewrite_script_shebang(struct kbox_supervisor_ctx *ctx,
         }
     }
 
-    int tracee_interp_fd = request_addfd(ctx, req, interp_memfd, O_CLOEXEC);
+    /* A script interpreter stays open across exec: the interpreter that runs it
+     * can still be handed its path as an argument. */
+    int tracee_interp_fd =
+        request_addfd(ctx, req, interp_memfd, interp_is_script ? 0 : O_CLOEXEC);
     close(interp_memfd);
     if (tracee_interp_fd < 0)
         return tracee_interp_fd;

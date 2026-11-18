@@ -18,6 +18,7 @@
 #define KBOX_DAEMON_DNS_PORT 53
 #define KBOX_DAEMON_MAX_HOSTS 512
 #define KBOX_DAEMON_MAX_ALIAS 128
+#define KBOX_DAEMON_DEFAULT_EPHEMERAL_ROOT "/tmp/.kboxd/ephemeral"
 
 /* NFS-backed volumes (src/daemon-nfs.c). */
 #define KBOX_NFS_MAX_MOUNTS 8
@@ -39,6 +40,16 @@ struct kbox_daemon_config {
     char gateway_ip[32];
     struct kbox_nfs_mount nfs[KBOX_NFS_MAX_MOUNTS];
     size_t nfs_count;
+    /* Storage. Defaults keep the legacy behaviour: images are copied into the
+     * guest tmpfs and container scratch space lives in guest RAM.
+     *
+     * images_hostfs mounts each image rootfs directly from the host instead of
+     * copying it, so the image is not duplicated in guest memory.
+     * ephemeral_hostfs backs each container's upper/work dirs with a host
+     * directory, so writes land on the pod filesystem. */
+    int images_hostfs;
+    int ephemeral_hostfs;
+    char ephemeral_root[256];
 };
 
 int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg);

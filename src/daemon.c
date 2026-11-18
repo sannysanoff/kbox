@@ -93,6 +93,7 @@ struct daemon_proc_env {
      * the host forwarder and deadlocks against itself. */
     const char *own_ip;
     int host_net;
+    long mem_limit; /* bytes, 0 = none */
 };
 
 struct daemon_container {
@@ -105,6 +106,7 @@ struct daemon_container {
     char workdir[PATH_MAX];
     char ip[32];
     int host_net;
+    long mem_limit; /* bytes, 0 = none */
     char host_if[16];
     char log_path[160];
 
@@ -137,6 +139,7 @@ struct daemon_container {
     pthread_t worker_thread;
     int worker_started;
     pthread_mutex_t lock;
+    int setup_held; /* this container holds the start-up gate */
     pthread_cond_t cv;
 };
 
@@ -206,6 +209,234 @@ void kbox_daemon_set_config_path(const char *path)
 
 static pthread_mutex_t g_reap_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_image_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Hostfs-backed image store: when storage.images=hostfs the daemon records the
+ * host path of each image tree and mounts it instead of copying it into the
+ * guest tmpfs, so an image occupies disk on the node and only page cache in
+ * guest memory. */
+#define MAX_IMAGE_RECS 64
+#define MAX_IMAGE_LAYERS 48
+#define IMAGE_LAYER_PATH_MAX 512
+
+struct image_layer {
+    char path[IMAGE_LAYER_PATH_MAX]; /* host directory of the unpacked layer */
+    char guest[64];                  /* where it is mounted in the guest */
+    int mounted;
+};
+
+struct image_record {
+    char id[128];
+    char src[PATH_MAX];
+    int mounted;
+    struct image_layer layers[MAX_IMAGE_LAYERS];
+    int layer_count;
+};
+
+static struct image_record g_image_recs[MAX_IMAGE_RECS];
+static size_t g_image_rec_count;
+static pthread_mutex_t g_image_recs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A layer directory is shared by every image that contains it, so its hostfs
+ * mount must happen once per guest path, not once per image record. */
+#define MAX_MOUNTED_LAYERS 256
+static char g_mounted_layers[MAX_MOUNTED_LAYERS][64];
+static int g_mounted_layer_count;
+
+static int layer_guest_mounted(const char *guest)
+{
+    int i;
+
+    for (i = 0; i < g_mounted_layer_count; i++)
+        if (strcmp(g_mounted_layers[i], guest) == 0)
+            return 1;
+    return 0;
+}
+
+static void layer_guest_mark(const char *guest)
+{
+    if (g_mounted_layer_count < MAX_MOUNTED_LAYERS)
+        snprintf(g_mounted_layers[g_mounted_layer_count++], 64, "%s", guest);
+}
+
+/* Guest mount point for one layer: /layers/<first 16 hex of the digest>. Kept
+ * short because all of them end up in the overlay mount option string. */
+static void image_layer_guest_path(const char *host_path, char *out, size_t cap)
+{
+    const char *base = strrchr(host_path, '/');
+
+    base = base ? base + 1 : host_path;
+    snprintf(out, cap, "/layers/%.16s", base);
+}
+
+static int image_record_add(const char *id,
+                            const char *src,
+                            char **layers,
+                            int layer_count)
+{
+    struct image_record *rec = NULL;
+    size_t i;
+    int l;
+
+    if (layer_count > MAX_IMAGE_LAYERS)
+        layer_count = MAX_IMAGE_LAYERS;
+
+    pthread_mutex_lock(&g_image_recs_lock);
+    for (i = 0; i < g_image_rec_count; i++) {
+        if (strcmp(g_image_recs[i].id, id) == 0) {
+            rec = &g_image_recs[i];
+            break;
+        }
+    }
+    if (!rec && g_image_rec_count < MAX_IMAGE_RECS)
+        rec = &g_image_recs[g_image_rec_count++];
+    if (rec) {
+        snprintf(rec->id, sizeof(rec->id), "%s", id);
+        snprintf(rec->src, sizeof(rec->src), "%s", src ? src : "");
+        rec->layer_count = 0;
+        for (l = 0; l < layer_count; l++) {
+            struct image_layer *ly = &rec->layers[rec->layer_count];
+
+            if (!layers[l] || !layers[l][0])
+                continue;
+            if (strlen(layers[l]) >= sizeof(ly->path))
+                continue;
+            snprintf(ly->path, sizeof(ly->path), "%s", layers[l]);
+            image_layer_guest_path(ly->path, ly->guest, sizeof(ly->guest));
+            ly->mounted = 0;
+            rec->layer_count++;
+        }
+    }
+    pthread_mutex_unlock(&g_image_recs_lock);
+    return rec ? 0 : -ENOSPC;
+}
+
+/* Number of layers recorded for an image (0 for a merged-tree import). */
+static int image_layer_count(const char *id)
+{
+    size_t i;
+    int n = 0;
+
+    pthread_mutex_lock(&g_image_recs_lock);
+    for (i = 0; i < g_image_rec_count; i++) {
+        if (strcmp(g_image_recs[i].id, id) == 0) {
+            n = g_image_recs[i].layer_count;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_image_recs_lock);
+    return n;
+}
+
+/* Fill the overlay lowerdir list from the image's layers (top first, which is
+ * the order the shim sends). Returns 1 when the image has layers. */
+static int image_lowerdir(const char *id, char *out, size_t cap)
+{
+    struct image_record *rec = NULL;
+    size_t i, used = 0;
+    int l, any = 0;
+
+    out[0] = '\0';
+    pthread_mutex_lock(&g_image_recs_lock);
+    for (i = 0; i < g_image_rec_count; i++) {
+        if (strcmp(g_image_recs[i].id, id) == 0) {
+            rec = &g_image_recs[i];
+            break;
+        }
+    }
+    if (rec) {
+        for (l = 0; l < rec->layer_count; l++) {
+            int n, j, seen = 0;
+
+            /* An image may list one digest twice (identical empty layers).
+             * overlayfs refuses the same directory twice in lowerdir with
+             * ELOOP, and the upper copy already supplies the same files. */
+            for (j = 0; j < l; j++) {
+                if (strcmp(rec->layers[j].guest, rec->layers[l].guest) == 0) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (seen)
+                continue;
+            n = snprintf(out + used, cap - used, "%s%s", used ? ":" : "",
+                         rec->layers[l].guest);
+
+            if (n < 0 || (size_t) n >= cap - used)
+                break;
+            used += (size_t) n;
+            any = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_image_recs_lock);
+    return any;
+}
+
+/* Mount /images/<id> from the image's host directory. Mount option strings are
+ * copied a full page at a time by copy_mount_options(), so the buffer is larger
+ * than any path we pass. */
+static int image_mount_hostfs(const struct kbox_sysnrs *sysnrs, const char *id)
+{
+    static char opts[8192];
+    char guest[160];
+    struct image_record *rec = NULL;
+    size_t i;
+    long err = 0;
+
+    if (!g_config.images_hostfs)
+        return 0;
+
+    pthread_mutex_lock(&g_image_recs_lock);
+    for (i = 0; i < g_image_rec_count; i++) {
+        if (strcmp(g_image_recs[i].id, id) == 0) {
+            rec = &g_image_recs[i];
+            break;
+        }
+    }
+    if (!rec) {
+        pthread_mutex_unlock(&g_image_recs_lock);
+        return -ENOENT;
+    }
+
+    for (i = 0; i < (size_t) rec->layer_count; i++) {
+        struct image_layer *ly = &rec->layers[i];
+        struct stat hst;
+
+        if (ly->mounted || layer_guest_mounted(ly->guest)) {
+            ly->mounted = 1;
+            continue;
+        }
+        if (stat(ly->path, &hst) < 0 || !S_ISDIR(hst.st_mode))
+            continue;
+        snprintf(opts, sizeof(opts), "hostfs=%s", ly->path);
+        lkl_mkdir_p_daemon(sysnrs, ly->guest, 0755);
+        err = kbox_lkl_mount(sysnrs, "none", ly->guest, "hostfs", 0, opts);
+        if (err < 0) {
+            pthread_mutex_unlock(&g_image_recs_lock);
+            return err;
+        }
+        ly->mounted = 1;
+        layer_guest_mark(ly->guest);
+    }
+
+    /* Legacy path: an image imported as a merged tree (storage.images=copy) or
+     * through docker import has no layers, only src. */
+    if (!rec->mounted && rec->src[0]) {
+        struct stat hst;
+
+        if (stat(rec->src, &hst) == 0 && S_ISDIR(hst.st_mode)) {
+            snprintf(guest, sizeof(guest), "/images/%s", id);
+            snprintf(opts, sizeof(opts), "hostfs=%s", rec->src);
+            lkl_mkdir_p_daemon(sysnrs, guest, 0755);
+            err = kbox_lkl_mount(sysnrs, "none", guest, "hostfs", 0, opts);
+            if (err == 0)
+                rec->mounted = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_image_recs_lock);
+    if (err < 0 && g_verbose)
+        fprintf(stderr, "kboxd: hostfs mount of image %s failed: %ld\n", id,
+                err);
+    return (int) err;
+}
 static pthread_mutex_t g_cont_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_exec_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct daemon_container g_containers[MAX_CONTAINERS];
@@ -1221,8 +1452,44 @@ static void *sigchld_reaper_thread(void *arg)
     return NULL;
 }
 
+/* Container start-up gate.
+ *
+ * Starting a container unshares namespaces, builds an overlay mount, creates a
+ * veth and spawns the process, all against the one LKL kernel. Compose starts
+ * several containers at once, and when those set-ups overlapped they tripped
+ * over each other: mkdir ENOENT in a directory that exists in the image
+ * (nginx, maven), EEXIST creating a veth, and containers that "started" with a
+ * half-built root. Only one container runs its set-up at a time; the gate is
+ * released as soon as the process is running or the start has failed.
+ */
+static pthread_mutex_t g_setup_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_setup_cv = PTHREAD_COND_INITIALIZER;
+static int g_setup_busy;
+
+static void setup_gate_acquire(struct daemon_container *c)
+{
+    pthread_mutex_lock(&g_setup_mu);
+    while (g_setup_busy)
+        pthread_cond_wait(&g_setup_cv, &g_setup_mu);
+    g_setup_busy = 1;
+    c->setup_held = 1;
+    pthread_mutex_unlock(&g_setup_mu);
+}
+
+static void setup_gate_release(struct daemon_container *c)
+{
+    pthread_mutex_lock(&g_setup_mu);
+    if (c->setup_held) {
+        c->setup_held = 0;
+        g_setup_busy = 0;
+        pthread_cond_signal(&g_setup_cv);
+    }
+    pthread_mutex_unlock(&g_setup_mu);
+}
+
 static void fail_container_start(struct daemon_container *c, const char *msg)
 {
+    setup_gate_release(c);
     pthread_mutex_lock(&c->lock);
     snprintf(c->start_err, sizeof(c->start_err), "%s", msg);
     c->state = CONT_EXITED;
@@ -1448,6 +1715,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     ctx.root_identity = 1;
     ctx.private_proc = pe->private_proc;
     ctx.host_net = pe->host_net;
+    ctx.mem_limit = pe->mem_limit;
     snprintf(ctx.own_ip, sizeof(ctx.own_ip), "%s",
              (pe->own_ip && pe->own_ip[0]) ? pe->own_ip : "");
     ctx.override_uid = (uid_t) -1;
@@ -1506,6 +1774,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
 static void cont_on_running(void *opaque)
 {
     struct daemon_container *c = opaque;
+    setup_gate_release(c);
     pthread_mutex_lock(&c->lock);
     c->state = CONT_RUNNING;
     c->started_at = time(NULL);
@@ -1543,6 +1812,57 @@ static void close_container_ns_fds(struct daemon_container *c,
     }
 }
 
+/* Host-side directory helpers for the ephemeral storage backend. The daemon
+ * runs on the pod filesystem here, not inside LKL: these calls create and
+ * remove the directories that later appear in the container through hostfs. */
+static int host_mkdir_p(const char *path, mode_t mode)
+{
+    char buf[PATH_MAX];
+    size_t i;
+
+    if (snprintf(buf, sizeof(buf), "%s", path) >= (int) sizeof(buf))
+        return -ENAMETOOLONG;
+    for (i = 1; buf[i]; i++) {
+        if (buf[i] != '/')
+            continue;
+        buf[i] = '\0';
+        if (mkdir(buf, mode) < 0 && errno != EEXIST)
+            return -errno;
+        buf[i] = '/';
+    }
+    if (mkdir(buf, mode) < 0 && errno != EEXIST)
+        return -errno;
+    return 0;
+}
+
+static int host_rm_rf(const char *path)
+{
+    DIR *d = opendir(path);
+    struct dirent *de;
+
+    if (!d)
+        return (errno == ENOENT) ? 0 : -errno;
+    while ((de = readdir(d)) != NULL) {
+        char child[PATH_MAX];
+        struct stat st;
+
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >=
+            (int) sizeof(child))
+            continue;
+        if (lstat(child, &st) < 0)
+            continue;
+        if (S_ISDIR(st.st_mode))
+            host_rm_rf(child);
+        else
+            unlink(child);
+    }
+    closedir(d);
+    rmdir(path);
+    return 0;
+}
+
 /* Per-container worker thread: sets up LKL namespaces (NET_NS, MNT_NS,
  * UTS_NS), overlayfs rootfs, veth pair, host bind stubs, forks tracee with
  * seccomp listener, and runs kbox_supervise_ctx until exit.
@@ -1555,6 +1875,7 @@ static void *container_worker_thread(void *arg)
     char img_dir[160];
     char err_msg[256] = {0};
 
+    setup_gate_acquire(c);
     if (kbox_lkl_new_thread_group_leader(sysnrs) < 0) {
         fail_container_start(c, "lkl_new_thread_group_leader failed");
         return NULL;
@@ -1591,6 +1912,41 @@ static void *container_worker_thread(void *arg)
     snprintf(rootfs, sizeof(rootfs), "/containers/%s/rootfs", c->id);
     snprintf(img_dir, sizeof(img_dir), "/images/%s", c->image_id);
 
+    /* Ephemeral storage on the host: create <ephemeral_root>/<id>/{upper,work}
+     * and mount the tree at /containers/<id> inside the container's mount
+     * namespace. One mount serves both overlay directories, which overlayfs
+     * requires to live on the same filesystem. */
+    if (g_config.ephemeral_hostfs) {
+        static char eopts[8192];
+        char host_dir[PATH_MAX];
+        long dr, mr;
+
+        snprintf(host_dir, sizeof(host_dir), "%s/%s/upper",
+                 g_config.ephemeral_root, c->id);
+        dr = host_mkdir_p(host_dir, 0777);
+        if (dr < 0) {
+            snprintf(err_msg, sizeof(err_msg), "ephemeral mkdir %s: %s",
+                     host_dir, strerror(-dr));
+            fail_container_start(c, err_msg);
+            return NULL;
+        }
+        snprintf(host_dir, sizeof(host_dir), "%s/%s/work",
+                 g_config.ephemeral_root, c->id);
+        (void) host_mkdir_p(host_dir, 0777);
+
+        snprintf(host_dir, sizeof(host_dir), "%s/%s", g_config.ephemeral_root,
+                 c->id);
+        snprintf(eopts, sizeof(eopts), "hostfs=%s", host_dir);
+        lkl_mkdir_p(sysnrs, cdir, 0755);
+        mr = kbox_lkl_mount(sysnrs, "none", cdir, "hostfs", 0, eopts);
+        if (mr < 0) {
+            snprintf(err_msg, sizeof(err_msg), "hostfs mount %s: %s", cdir,
+                     kbox_err_text(mr));
+            fail_container_start(c, err_msg);
+            return NULL;
+        }
+    }
+
     /* World-writable upper/work: a container that drops privileges writes as
      * a non-root uid, and the check that matters is against the overlay inode
      * the guest sees (1777 for /tmp), after which the real write lands in the
@@ -1607,8 +1963,21 @@ static void *container_worker_thread(void *arg)
 
     char ovl_opts[4096];
     memset(ovl_opts, 0, sizeof(ovl_opts));
-    snprintf(ovl_opts, sizeof(ovl_opts), "lowerdir=%s,upperdir=%s,workdir=%s",
-             img_dir, upper, work);
+    /* Lower layers: one hostfs mount per image layer when the shim provided a
+     * layer list, otherwise the merged tree. Upper layers are host-backed when
+     * ephemeral_hostfs is on, which also means trusted.overlay.* is refused
+     * (no CAP_SYS_ADMIN on the host), so overlay is told to use
+     * user.overlay.*. Layers carry their whiteouts in that namespace too. */
+    {
+        char lower[2048];
+        int has_layers = image_lowerdir(c->image_id, lower, sizeof(lower));
+
+        if (!has_layers)
+            snprintf(lower, sizeof(lower), "%s", img_dir);
+        snprintf(ovl_opts, sizeof(ovl_opts),
+                 "lowerdir=%s,upperdir=%s,workdir=%s%s", lower, upper, work,
+                 (g_config.ephemeral_hostfs || has_layers) ? ",userxattr" : "");
+    }
     long mr = kbox_lkl_mount(sysnrs, "overlay", rootfs, "overlay", 0, ovl_opts);
     if (mr < 0) {
         if (g_verbose)
@@ -1660,6 +2029,12 @@ static void *container_worker_thread(void *arg)
         (void) kbox_lkl_fchmodat(sysnrs, AT_FDCWD_LINUX, tmp_p, 01777, 0);
     }
 
+    /* A fresh interface name for every start. A start that failed after the
+     * veth was created leaves it behind, and starting the same container again
+     * (compose retries one that is still "Created") asked for the same name and
+     * got EEXIST, failing every container that followed. */
+    snprintf(c->host_if, sizeof(c->host_if), "veth%d",
+             __atomic_add_fetch(&g_veth_seq, 1, __ATOMIC_SEQ_CST));
     int vrc =
         kbox_daemon_net_create_veth(sysnrs, c->host_if, "eth0", net_fd, c->ip);
     if (vrc < 0) {
@@ -1698,9 +2073,22 @@ static void *container_worker_thread(void *arg)
     long rfd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, resolv_p,
                                0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
     if (rfd >= 0) {
-        char res[64];
-        snprintf(res, sizeof(res), "nameserver %s\n", gw_ip);
-        kbox_lkl_write(sysnrs, rfd, res, (long) strlen(res));
+        char res[2048];
+        size_t rlen = 0;
+        if (c->host_net) {
+            /* Host networking: the container resolves through the pod's own
+             * sockets, so it needs the pod's nameservers, not the LKL
+             * gateway. */
+            FILE *hf = fopen("/etc/resolv.conf", "r");
+            if (hf) {
+                rlen = fread(res, 1, sizeof(res) - 1, hf);
+                fclose(hf);
+            }
+        }
+        if (rlen == 0)
+            rlen =
+                (size_t) snprintf(res, sizeof(res), "nameserver %s\n", gw_ip);
+        kbox_lkl_write(sysnrs, rfd, res, (long) rlen);
         kbox_lkl_close(sysnrs, rfd);
     }
 
@@ -1798,6 +2186,7 @@ static void *container_worker_thread(void *arg)
         .env_count = c->env_count,
         .own_ip = c->ip,
         .host_net = c->host_net,
+        .mem_limit = c->mem_limit,
     };
     struct supervised_proc_hooks hooks = {
         .opaque = c,
@@ -1808,6 +2197,7 @@ static void *container_worker_thread(void *arg)
         .on_failed = cont_on_failed,
     };
     int exit_code = launch_and_supervise_proc(sysnrs, &pe, c->log_path, &hooks);
+    setup_gate_release(c);
 
     pthread_mutex_lock(&c->lock);
     c->state = CONT_EXITED;
@@ -1926,6 +2316,7 @@ static void *exec_worker_thread(void *arg)
         .env_count = e->env_count,
         .own_ip = c->ip,
         .host_net = c->host_net,
+        .mem_limit = c->mem_limit,
     };
     struct supervised_proc_hooks hooks = {
         .opaque = e,
@@ -2108,7 +2499,41 @@ static void handle_rpc_line(int client_fd, const char *req)
             send_rpc_err(client_fd, "image_import requires id and src");
             return;
         }
-        int rc = import_image_rootfs(g_sysnrs, img_id, src);
+        int rc;
+        /* One slot more than the record can hold, so an image with too many
+         * layers is rejected instead of silently losing its base layers. */
+        char *layer_list[MAX_IMAGE_LAYERS + 1];
+        int layer_count =
+            json_get_str_array(req, "layers", layer_list, MAX_IMAGE_LAYERS + 1);
+        int li;
+
+        if (layer_count > MAX_IMAGE_LAYERS) {
+            for (li = 0; li < layer_count; li++)
+                free(layer_list[li]);
+            send_rpc_err(client_fd, "image has too many layers");
+            return;
+        }
+
+        if (g_config.images_hostfs) {
+            rc = image_record_add(img_id, src, layer_list, layer_count);
+            if (rc == 0)
+                rc = image_mount_hostfs(g_sysnrs, img_id);
+            if (rc == 0 && g_verbose) {
+                int lc = image_layer_count(img_id);
+
+                if (lc > 0)
+                    fprintf(stderr,
+                            "kboxd: image %s mounted from %d layer(s)\n",
+                            img_id, lc);
+                else
+                    fprintf(stderr, "kboxd: image %s mounted from %s\n", img_id,
+                            src);
+            }
+        } else {
+            rc = import_image_rootfs(g_sysnrs, img_id, src);
+        }
+        for (li = 0; li < layer_count; li++)
+            free(layer_list[li]);
         if (rc < 0) {
             char msg[128];
             snprintf(msg, sizeof(msg), "import failed: %d", rc);
@@ -2215,7 +2640,7 @@ static void handle_rpc_line(int client_fd, const char *req)
             !slot->ip[0])
             kbox_daemon_net_alloc_ip(slot->ip, sizeof(slot->ip));
 
-        int vseq = ++g_veth_seq;
+        int vseq = __atomic_add_fetch(&g_veth_seq, 1, __ATOMIC_SEQ_CST);
         snprintf(slot->host_if, sizeof(slot->host_if), "veth%d", vseq);
         snprintf(slot->log_path, sizeof(slot->log_path), "%s/%s.log",
                  DAEMON_LOG_DIR, cid);
@@ -2251,6 +2676,11 @@ static void handle_rpc_line(int client_fd, const char *req)
         kbox_daemon_dns_register(short_id, slot->ip);
 
         slot->host_net = json_get_bool(req, "host_net", 0);
+        {
+            long ml = 0;
+            if (json_get_int(req, "mem_limit", &ml) == 0 && ml > 0)
+                slot->mem_limit = ml;
+        }
         char *port_strs[16];
         memset(port_strs, 0, sizeof(port_strs));
         int np = json_get_str_array(req, "ports", port_strs, 16);
@@ -2613,6 +3043,12 @@ static void handle_rpc_line(int client_fd, const char *req)
         char cdir[128];
         snprintf(cdir, sizeof(cdir), "/containers/%s", c->id);
         rm_lkl_tree_rec(g_sysnrs, cdir);
+        if (g_config.ephemeral_hostfs) {
+            char host_dir[PATH_MAX];
+            snprintf(host_dir, sizeof(host_dir), "%s/%s",
+                     g_config.ephemeral_root, c->id);
+            host_rm_rf(host_dir);
+        }
 
         kbox_daemon_port_remove_ip(c->ip);
         kbox_daemon_dns_unregister_ip(c->ip);
@@ -2725,6 +3161,17 @@ int kbox_daemon_run(const char *sock_path, const char *cmdline, int verbose)
 
     /* Setup base LKL root filesystem hierarchy for daemon control plane. */
     lkl_mkdir_p(g_sysnrs, "/proc", 0755);
+    /* Every guest file and socket is an LKL descriptor, and LKL starts with a
+     * soft limit of 1024 for the whole daemon. A broker or JVM exhausts that
+     * within minutes (EMFILE from open, from socket, from veth creation). Raise
+     * it for this task and for init, which new tasks inherit from. */
+    {
+        struct {
+            unsigned long long cur, max;
+        } nofile = {1048576ULL, 1048576ULL};
+        kbox_lkl_prlimit64(g_sysnrs, 0, 7 /* RLIMIT_NOFILE */, &nofile);
+        kbox_lkl_prlimit64(g_sysnrs, 1, 7, &nofile);
+    }
     kbox_lkl_mount(g_sysnrs, "proc", "/proc", "proc", 0, NULL);
     lkl_mkdir_p(g_sysnrs, "/sys", 0755);
     kbox_lkl_mount(g_sysnrs, "sysfs", "/sys", "sysfs", 0, NULL);

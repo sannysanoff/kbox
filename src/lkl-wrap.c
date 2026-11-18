@@ -770,6 +770,14 @@ long kbox_lkl_unshare(const struct kbox_sysnrs *s, long flags)
     return lkl_syscall6(s->unshare, flags, 0, 0, 0, 0, 0);
 }
 
+long kbox_lkl_prlimit64(const struct kbox_sysnrs *s,
+                        long pid,
+                        long resource,
+                        const void *new_limit)
+{
+    return lkl_syscall6(s->prlimit64, pid, resource, (long) new_limit, 0, 0, 0);
+}
+
 long kbox_lkl_setns(const struct kbox_sysnrs *s, long fd, long nstype)
 {
     return lkl_syscall6(s->setns, fd, nstype, 0, 0, 0, 0);

@@ -258,6 +258,7 @@ struct kbox_sysnrs {
     long getpriority;
     long listxattr, llistxattr, flistxattr;
     long syslog;
+    long prlimit64;
 };
 
 extern const struct kbox_sysnrs SYSNRS_X86_64;

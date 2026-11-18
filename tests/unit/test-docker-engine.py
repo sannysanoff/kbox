@@ -2,10 +2,14 @@
 # SPDX-License-Identifier: MIT
 """Unit tests for the kbox Docker Engine HTTP API frontend."""
 
+import hashlib
 import importlib.util
+import io
 import json
 import os
+import shutil
 import struct
+import tarfile
 import tempfile
 import threading
 import time
@@ -129,6 +133,46 @@ class TestDockerEngine(unittest.TestCase):
         self.assertIn("web", create_rpc["aliases"])
         self.assertIn("web-alias", create_rpc["aliases"])
         self.assertIn("0.0.0.0:18080:8080", create_rpc["ports"])
+
+    def test_create_container_sets_home_and_hostname(self):
+        # Docker gives the container process HOME and HOSTNAME when the image and the
+        # request do not; entrypoints write $HOME/.aws/credentials and the like.
+        self.engine.create_container(
+            "env-1", {"Image": "alpine:latest", "Cmd": ["true"]}
+        )
+        env = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]["env"]
+        self.assertIn("HOME=/root", env)
+        self.assertIn("HOSTNAME=env-1", env)
+
+        # ...but an explicit value wins
+        self.engine.create_container(
+            "env-2",
+            {"Image": "alpine:latest", "Cmd": ["true"], "Env": ["HOME=/srv/app"]},
+        )
+        env = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]["env"]
+        self.assertIn("HOME=/srv/app", env)
+        self.assertNotIn("HOME=/root", env)
+
+    def test_create_container_passes_memory_limit(self):
+        # compose mem_limit / a Kubernetes resources limit arrives as HostConfig
+        # Memory. The daemon shows it to the guest as the cgroup memory limit,
+        # which is what a JVM or ClickHouse sizes its heap and caches from.
+        self.engine.create_container(
+            "limited-1",
+            {
+                "Image": "alpine:latest",
+                "Cmd": ["true"],
+                "HostConfig": {"Memory": 1073741824},
+            },
+        )
+        rpc = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]
+        self.assertEqual(rpc["mem_limit"], 1073741824)
+
+        self.engine.create_container(
+            "unlimited-1", {"Image": "alpine:latest", "Cmd": ["true"]}
+        )
+        rpc = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]
+        self.assertEqual(rpc["mem_limit"], 0)
 
     def test_exec_lifecycle_and_http_endpoints(self):
         rec = self.engine.create_container("svc", {"Image": "alpine:latest"})
@@ -460,6 +504,12 @@ class TestDockerEngine(unittest.TestCase):
         self.assertEqual(insp["Name"], "/new-name")
 
 
+    def test_start_signals_run_event(self):
+        rec = self.engine.create_container("ev-1", {"Image": "alpine:latest"})
+        self.assertFalse(rec["run_ev"].is_set())
+        self.engine.start_container(rec)
+        self.assertTrue(rec["run_ev"].is_set())
+
     def test_image_tag_adds_reference(self):
         norm = self.engine.images.tag("alpine:latest", "tardis", "v1")
         self.assertEqual(norm, "tardis:v1")
@@ -468,6 +518,300 @@ class TestDockerEngine(unittest.TestCase):
         self.engine.images.tag("alpine", "localhost:5000/x")
         self.assertEqual(self.engine.images.resolve("localhost:5000/x"), self.img_id)
         self.assertIsNone(self.engine.images.tag("nosuch:1", "y"))
+
+
+class TestLayerCache(unittest.TestCase):
+    """Layer store: streaming download, dedup, whiteouts, manifests, sweep."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.rpc = FakeRpc(self.tmpdir.name)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _store(self, **cfg):
+        state = os.path.join(self.tmpdir.name, "state")
+        return kbox_dockerd.ImageStore(state, self.rpc, config=cfg)
+
+    def _layer_tar(self, name, files=None, symlinks=None, dirs=None,
+                   whiteouts=None, opaque=None):
+        path = os.path.join(self.tmpdir.name, name)
+        with tarfile.open(path, mode="w") as tf:
+            for d in dirs or []:
+                info = tarfile.TarInfo(d)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                tf.addfile(info)
+            for fname, (mode, data) in (files or {}).items():
+                info = tarfile.TarInfo(fname)
+                info.size = len(data)
+                info.mode = mode
+                tf.addfile(info, io.BytesIO(data))
+            for link, target in (symlinks or {}).items():
+                info = tarfile.TarInfo(link)
+                info.type = tarfile.SYMTYPE
+                info.linkname = target
+                info.mode = 0o777
+                tf.addfile(info)
+            for wh in whiteouts or []:
+                info = tarfile.TarInfo(wh)
+                info.size = 0
+                tf.addfile(info, io.BytesIO(b""))
+            for marker in opaque or []:
+                info = tarfile.TarInfo(marker)
+                info.size = 0
+                tf.addfile(info, io.BytesIO(b""))
+        with open(path, "rb") as f:
+            digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+        return path, digest
+
+    @staticmethod
+    def _entries(path):
+        try:
+            return os.listdir(path)
+        except OSError:
+            return []
+
+    def test_ensure_layer_downloads_once_and_leaves_no_partials(self):
+        store = self._store()
+        tar_path, digest = self._layer_tar(
+            "base.tar",
+            files={"bin/sh": (0o755, b"#!/bin/sh\necho base\n")},
+            dirs=["bin"],
+        )
+        url = "file://" + tar_path
+
+        layer_dir, size = store.ensure_layer(digest, url, {})
+        self.assertEqual(size, os.path.getsize(tar_path))
+        self.assertEqual(layer_dir, store.layer_path(digest))
+        with open(os.path.join(layer_dir, "bin", "sh"), "rb") as f:
+            self.assertEqual(f.read(), b"#!/bin/sh\necho base\n")
+        # The blob is kept on disk exactly as pulled.
+        blob = store.blob_path(digest)
+        self.assertEqual(os.path.getsize(blob), os.path.getsize(tar_path))
+        blob_mtime = os.stat(blob).st_mtime_ns
+
+        # A second pull of the same digest downloads and unpacks nothing.
+        layer_dir2, size2 = store.ensure_layer(digest, url, {})
+        self.assertEqual(layer_dir2, layer_dir)
+        self.assertEqual(size2, size)
+        self.assertEqual(os.stat(blob).st_mtime_ns, blob_mtime)
+
+        for d in (store.blobs_dir, store.layers_dir):
+            for name in self._entries(d):
+                self.assertNotIn(".part", name)
+                self.assertNotIn(".stage-", name)
+
+    def test_ensure_layer_reextracts_from_cached_blob(self):
+        store = self._store()
+        tar_path, digest = self._layer_tar("base.tar",
+                                           files={"bin/sh": (0o755, b"x")})
+        store.ensure_layer(digest, "file://" + tar_path, {})
+        blob_mtime = os.stat(store.blob_path(digest)).st_mtime_ns
+
+        # A wiped layers_dir must be repaired from the blob, not re-downloaded.
+        shutil.rmtree(store.layer_path(digest))
+        layer_dir, _ = store.ensure_layer(digest, "file://does-not-exist", {})
+        self.assertTrue(os.path.isfile(os.path.join(layer_dir, "bin", "sh")))
+        self.assertEqual(os.stat(store.blob_path(digest)).st_mtime_ns, blob_mtime)
+
+    def test_ensure_layer_rejects_corrupt_blob(self):
+        store = self._store()
+        tar_path, _ = self._layer_tar("bad.tar", files={"a": (0o644, b"x")})
+        wrong = "sha256:" + "0" * 64
+
+        with self.assertRaises(RuntimeError):
+            store.ensure_layer(wrong, "file://" + tar_path, {})
+
+        self.assertFalse(os.path.exists(store.layer_path(wrong)))
+        self.assertTrue(all(".part" not in n for n in self._entries(store.blobs_dir)))
+
+    def test_extract_fills_read_only_directory(self):
+        # ca-certificates style layer: a 0555 directory that still receives
+        # symlinks and files after its own entry. Extraction runs unprivileged.
+        store = self._store()
+        path = os.path.join(self.tmpdir.name, "ro.tar")
+        with tarfile.open(path, "w") as tf:
+            info = tarfile.TarInfo("etc/certs")
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o555
+            tf.addfile(info)
+            link = tarfile.TarInfo("etc/certs/hash.0")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "root.pem"
+            tf.addfile(link)
+            data = tarfile.TarInfo("etc/certs/root.pem")
+            data.size = 2
+            data.mode = 0o444
+            tf.addfile(data, io.BytesIO(b"ok"))
+        with open(path, "rb") as f:
+            digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+
+        layer_dir, _ = store.ensure_layer(digest, "file://" + path, {})
+
+        certs = os.path.join(layer_dir, "etc", "certs")
+        self.assertTrue(os.path.islink(os.path.join(certs, "hash.0")))
+        self.assertEqual(os.stat(certs).st_mode & 0o777, 0o555)
+        os.chmod(certs, 0o755)  # let the test cleanup remove it
+
+    def test_extract_records_non_root_owner_as_xattr(self):
+        if not hasattr(os, "setxattr"):
+            self.skipTest("python without os.setxattr")
+        store = self._store()
+        path = os.path.join(self.tmpdir.name, "own.tar")
+        with tarfile.open(path, "w") as tf:
+            data = tarfile.TarInfo("var/db/data")
+            data.size = 1
+            data.uid = 999
+            data.gid = 998
+            tf.addfile(data, io.BytesIO(b"x"))
+            root = tarfile.TarInfo("var/db/rootfile")
+            root.size = 1
+            tf.addfile(root, io.BytesIO(b"y"))
+        with open(path, "rb") as f:
+            digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+
+        layer_dir, _ = store.ensure_layer(digest, "file://" + path, {})
+
+        owned = os.path.join(layer_dir, "var", "db", "data")
+        try:
+            self.assertEqual(os.getxattr(owned, "user.kbox.owner"), b"999:998")
+        except OSError:
+            self.skipTest("filesystem without user xattr")
+        with self.assertRaises(OSError):
+            os.getxattr(os.path.join(layer_dir, "var", "db", "rootfile"),
+                        "user.kbox.owner")
+
+    def test_extract_keeps_whiteouts_as_overlay_markers(self):
+        if not hasattr(os, "setxattr"):
+            self.skipTest("python without os.setxattr")
+        store = self._store()
+        tar_path, digest = self._layer_tar(
+            "top.tar",
+            files={"usr/bin/tool": (0o755, b"tool\n")},
+            dirs=["etc", "var"],
+            whiteouts=["etc/.wh.hostname", "var/.wh..wh..opq"],
+        )
+        layer_dir, _ = store.ensure_layer(digest, "file://" + tar_path, {})
+
+        marker = os.path.join(layer_dir, "etc", "hostname")
+        self.assertTrue(os.path.isfile(marker))
+        self.assertEqual(os.path.getsize(marker), 0)
+        self.assertFalse(os.path.exists(os.path.join(layer_dir, "etc",
+                                                      ".wh.hostname")))
+        self.assertEqual(os.getxattr(marker, "user.overlay.whiteout"), b"y")
+        # The .wh..wh..opq entry itself is consumed: the marker moves to the
+        # directory xattr, which is what overlayfs reads.
+        opaque = os.path.join(layer_dir, "var")
+        self.assertFalse(os.path.exists(os.path.join(opaque, ".wh..wh..opq")))
+        self.assertEqual(os.getxattr(opaque, "user.overlay.opaque"), b"y")
+
+    def test_manifest_supplies_layers_on_every_import(self):
+        store = self._store()
+        base_tar, base = self._layer_tar("base.tar", files={"a": (0o644, b"a")})
+        top_tar, top = self._layer_tar("top.tar", files={"b": (0o644, b"b")})
+        store.ensure_layer(base, "file://" + base_tar, {})
+        store.ensure_layer(top, "file://" + top_tar, {})
+
+        img_id = "sha256:" + "ab" * 32
+        store.save_manifest(img_id, {"id": img_id, "layers": [base, top]})
+        self.assertEqual(store.load_manifest(img_id)["layers"], [base, top])
+
+        store.ensure_imported(img_id, [base, top])
+        # Overlay wants the top layer first, the manifest is base first.
+        self.assertEqual(
+            self.rpc.calls[-1]["layers"],
+            [store.layer_path(top), store.layer_path(base)],
+        )
+
+        # Container create imports without an explicit list: the manifest is
+        # the source of truth, otherwise the layers would be forgotten.
+        store.ensure_imported(img_id)
+        self.assertEqual(
+            self.rpc.calls[-1]["layers"],
+            [store.layer_path(top), store.layer_path(base)],
+        )
+
+    def test_sweep_partials_removes_interrupted_pull_state(self):
+        state = os.path.join(self.tmpdir.name, "state")
+        first = kbox_dockerd.ImageStore(state, self.rpc, config={})
+
+        open(os.path.join(first.blobs_dir, "deadbeef.tar.part"), "wb").close()
+        os.makedirs(os.path.join(first.layers_dir, ".stage-deadbeef"))
+        os.makedirs(os.path.join(first.images_dir, "img.tmp.1a2b"))
+        open(os.path.join(first.manifests_dir, "img.json.tmp"), "w").close()
+        os.makedirs(os.path.join(first.layers_dir, "live-layer"))
+        open(os.path.join(first.blobs_dir, "live-layer.tar"), "wb").close()
+
+        second = kbox_dockerd.ImageStore(state, self.rpc, config={})
+        self.assertEqual(self._entries(second.blobs_dir), ["live-layer.tar"])
+        self.assertEqual(self._entries(second.layers_dir), ["live-layer"])
+        self.assertEqual(self._entries(second.images_dir), [])
+        self.assertEqual(self._entries(second.manifests_dir), [])
+
+    def test_storage_directories_are_configurable(self):
+        blobs = os.path.join(self.tmpdir.name, "b")
+        layers = os.path.join(self.tmpdir.name, "l")
+        images = os.path.join(self.tmpdir.name, "i")
+        manifests = os.path.join(self.tmpdir.name, "m")
+        store = self._store(
+            blobs_dir=blobs,
+            layers_dir=layers,
+            images_dir=images,
+            manifests_dir=manifests,
+            images_driver="hostfs",
+        )
+        for d in (blobs, layers, images, manifests):
+            self.assertTrue(os.path.isdir(d))
+        digest = "sha256:" + "cd" * 32
+        self.assertTrue(store.layer_path(digest).startswith(layers + os.sep))
+        self.assertTrue(store.blob_path(digest).startswith(blobs + os.sep))
+        self.assertTrue(store.manifest_path(digest).startswith(manifests + os.sep))
+        self.assertEqual(store.images_driver, "hostfs")
+
+    def test_config_file_sets_storage_paths(self):
+        cfg_path = os.path.join(self.tmpdir.name, "kbox-config.yaml")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write(
+                "storage:\n"
+                "  images: hostfs\n"
+                "  blobs_dir: /var/cache/kbox/blobs\n"
+                "  layers_dir: /var/cache/kbox/layers\n"
+                "  images_dir: /var/cache/kbox/images\n"
+                "  manifests_dir: /var/cache/kbox/manifests\n"
+            )
+        cfg = kbox_dockerd.load_kbox_config(cfg_path)
+        self.assertEqual(cfg["images_driver"], "hostfs")
+        self.assertEqual(cfg["blobs_dir"], "/var/cache/kbox/blobs")
+        self.assertEqual(cfg["layers_dir"], "/var/cache/kbox/layers")
+        self.assertEqual(cfg["images_dir"], "/var/cache/kbox/images")
+        self.assertEqual(cfg["manifests_dir"], "/var/cache/kbox/manifests")
+
+    def test_merged_tree_applies_whiteouts_for_copy_mode(self):
+        if not hasattr(os, "setxattr"):
+            self.skipTest("python without os.setxattr")
+        store = self._store()
+        base_tar, base = self._layer_tar(
+            "base.tar",
+            files={"keep": (0o644, b"keep"), "gone": (0o644, b"gone"),
+                   "dir/old": (0o644, b"old")},
+            dirs=["dir"],
+        )
+        top_tar, top = self._layer_tar(
+            "top.tar",
+            files={"new": (0o644, b"new")},
+            whiteouts=["dir/.wh..wh..opq", ".wh.gone"],
+        )
+        store.ensure_layer(base, "file://" + base_tar, {})
+        store.ensure_layer(top, "file://" + top_tar, {})
+        rootfs = os.path.join(self.tmpdir.name, "rootfs")
+        store._assemble_merged([base, top], rootfs)
+        self.assertTrue(os.path.exists(os.path.join(rootfs, "keep")))
+        self.assertTrue(os.path.exists(os.path.join(rootfs, "new")))
+        # Whiteout deleted the lower file, the opaque dir cleared the lower dir.
+        self.assertFalse(os.path.exists(os.path.join(rootfs, "gone")))
+        self.assertFalse(os.path.exists(os.path.join(rootfs, "dir", "old")))
 
 
 if __name__ == "__main__":

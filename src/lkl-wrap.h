@@ -326,6 +326,10 @@ long kbox_lkl_ppoll(const struct kbox_sysnrs *s,
                     unsigned long sigsetsize);
 long kbox_lkl_unshare(const struct kbox_sysnrs *s, long flags);
 long kbox_lkl_setns(const struct kbox_sysnrs *s, long fd, long nstype);
+long kbox_lkl_prlimit64(const struct kbox_sysnrs *s,
+                        long pid,
+                        long resource,
+                        const void *new_limit);
 long kbox_lkl_sethostname(const struct kbox_sysnrs *s,
                           const char *name,
                           long len);

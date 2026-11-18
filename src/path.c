@@ -153,6 +153,8 @@ bool kbox_is_lkl_virtual_path(const char *path)
 
 bool kbox_is_tty_like_path(const char *path)
 {
+    if (!path)
+        return false;
     if (strcmp(path, "/dev/tty") == 0)
         return true;
     if (starts_with(path, "/dev/tty"))
@@ -248,9 +250,16 @@ int kbox_normalize_join(const char *base,
     char work[KBOX_MAX_PATH];
     size_t wlen;
     const char *p;
+    int input_trailing_slash;
 
     if (out_size == 0)
         return -1;
+
+    {
+        size_t ilen = strlen(input);
+
+        input_trailing_slash = ilen > 0 && input[ilen - 1] == '/';
+    }
 
     /* Start with base or "/" depending on whether input is absolute. */
     if (input[0] == '/') {
@@ -325,6 +334,19 @@ int kbox_normalize_join(const char *base,
         work[0] = '/';
         work[1] = '\0';
         wlen = 1;
+    }
+
+    /* A trailing slash is significant: it asserts that the path names a
+     * directory. Dropping it let open("missing/", O_CREAT) create a regular
+     * file called "missing", where Linux answers ENOENT
+     * (test_shutil.test_copyfile_nonexistent_dir), and made stat("file/")
+     * succeed.
+     */
+    if (input_trailing_slash && wlen > 1 && work[wlen - 1] != '/') {
+        if (wlen + 1 >= sizeof(work))
+            return -1;
+        work[wlen++] = '/';
+        work[wlen] = '\0';
     }
 
     if (wlen + 1 > out_size)

@@ -3,6 +3,7 @@
 #ifndef KBOX_FD_TABLE_H
 #define KBOX_FD_TABLE_H
 
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -45,16 +46,46 @@ struct kbox_sysnrs; /* forward declaration */
 #define KBOX_LKL_FD_SHADOW_ONLY (-2)
 
 struct kbox_fd_entry {
-    long lkl_fd;   /* LKL-internal FD, -1 if slot is free */
-    long host_fd;  /* host memfd shadow / tracee FD number, -1 if none */
-    int host_sv_fd; /* supervisor-side FD sharing host-passthrough struct file */
-    int shadow_sp; /* supervisor's dup of shadow socket sp[1], -1 if none.
-                    * Kept alive so dup/dup2/dup3 can inject new copies into
-                    * the tracee via ADDFD.
-                    */
-    int shadow_writeback; /* 1 if shadow_sp must be synced back to lkl_fd */
-    int mirror_tty;       /* 1 if this FD mirrors a host TTY */
-    int cloexec;          /* O_CLOEXEC tracking */
+    long lkl_fd;    /* LKL-internal FD, -1 if slot is free */
+    long host_fd;   /* host memfd shadow / tracee FD number, -1 if none */
+    int host_sv_fd; /* supervisor-side FD sharing host-passthrough struct file
+                     */
+    int shadow_sp;  /* supervisor's dup of shadow socket sp[1], -1 if none.
+                     * Kept alive so dup/dup2/dup3 can inject new copies into
+                     * the tracee via ADDFD.
+                     */
+    int shadow_writeback;   /* 1 if shadow_sp must be synced back to lkl_fd */
+    long shadow_mtime_sec;  /* shadow_sp timestamp when it was filled; */
+    long shadow_mtime_nsec; /* unchanged means nothing wrote to it, so */
+    long shadow_size;       /* the writeback at close can be skipped */
+    int mirror_tty;         /* 1 if this FD mirrors a host TTY */
+    int cloexec;            /* O_CLOEXEC tracking */
+    int opath;              /* 1 if the guest opened it with O_PATH */
+    int sock_type;          /* SOCK_STREAM / SOCK_DGRAM for shadow sockets */
+    int sock_connected;     /* 1 once connect() or accept() produced a peer */
+    /* The peer address the guest connected to, recorded at connect()/accept().
+     *
+     * A bridged socket's guest descriptor is a socketpair end, so the host's
+     * getpeername() would name the socketpair. The connection's real peer is
+     * the sockaddr the guest passed to connect(): Linux returns it for any
+     * connected socket, and it stays true after the LKL twin has been retired
+     * and its descriptor number reused.
+     */
+    int sock_peer_family; /* 0, AF_INET or AF_INET6 when recorded */
+    union {
+        struct sockaddr_in in;
+        struct sockaddr_in6 in6;
+    } sock_peer;
+    /* 1 once the connection is known to be established: connect() returned 0,
+     * or the guest's SO_ERROR read came back 0, or LKL answered getpeername()
+     * for it. A peer that is gone after that (a reset) must be reported as
+     * ENOTCONN, so the recorded peer is only a substitute while the connection
+     * is still coming up. */
+    int sock_established;
+    int shadow_mmap; /* 1 once a writable shared mapping covers the
+                      * shadow: such writes change neither its size nor
+                      * reliably its mtime, so the copy back at close can
+                      * never be skipped. */
 };
 
 struct kbox_fd_table {
@@ -91,6 +122,8 @@ long kbox_fd_table_remove(struct kbox_fd_table *t, long fd);
 bool kbox_fd_table_mirror_tty(const struct kbox_fd_table *t, long fd);
 void kbox_fd_table_set_cloexec(struct kbox_fd_table *t, long fd, int val);
 int kbox_fd_table_get_cloexec(const struct kbox_fd_table *t, long fd);
+void kbox_fd_table_set_opath(struct kbox_fd_table *t, long fd, int val);
+int kbox_fd_table_get_opath(const struct kbox_fd_table *t, long fd);
 void kbox_fd_table_close_cloexec(struct kbox_fd_table *t,
                                  const struct kbox_sysnrs *s);
 void kbox_fd_table_set_host_fd(struct kbox_fd_table *t, long fd, long host_fd);

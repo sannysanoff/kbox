@@ -13,6 +13,7 @@
 #include <errno.h>
 /* seccomp types via seccomp.h -> seccomp-defs.h */
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,8 @@
 #include <unistd.h>
 
 #include "fd-table.h"
+#include "lkl-wrap.h"
+#include "net.h"
 #include "seccomp.h"
 #include "syscall-nr.h"
 #ifdef KBOX_HAS_WEB
@@ -246,10 +249,20 @@ static int check_ctx_child(struct kbox_supervisor_ctx *ctx, int *exit_code)
  *
  * Returns the child exit code, or -1 on fatal error.
  */
+/* Defined below the loop: see "Stuck-syscall reporter". */
+struct kbox_slow_slot;
+static struct kbox_slow_slot *slow_begin(
+    struct kbox_supervisor_ctx *ctx,
+    const struct kbox_syscall_request *req);
+static void slow_end(struct kbox_slow_slot *slot);
+static void kbox_dump_handler(int sig);
+
 static int supervise_loop(struct kbox_supervisor_ctx *ctx)
 {
     struct kbox_seccomp_notif notif;
     struct kbox_seccomp_notif_resp resp;
+
+    signal(SIGUSR1, kbox_dump_handler);
     struct kbox_syscall_request req;
     struct kbox_dispatch d;
     struct pollfd pfds[2];
@@ -274,10 +287,15 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
     }
 
     for (;;) {
-        if (ctx->pending_accept_count > 0)
+        if (ctx->pending_accept_count > 0 || ctx->pending_recv_count > 0 ||
+            ctx->pending_recvmsg_count > 0)
             kbox_dispatch_poll_pending(ctx);
 
-        poll_timeout = ctx->pending_accept_count > 0 ? 10 : -1;
+        poll_timeout =
+            (ctx->pending_accept_count > 0 || ctx->pending_recv_count > 0 ||
+             ctx->pending_recvmsg_count > 0)
+                ? 10
+                : -1;
 #ifdef KBOX_HAS_WEB
         if (ctx->web && (poll_timeout < 0 || poll_timeout > 100))
             poll_timeout = 100;
@@ -423,7 +441,9 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
             ctx->inherited_fds_tracked = 1;
         }
 
+        struct kbox_slow_slot *slow = slow_begin(ctx, &req);
         d = kbox_dispatch_request(ctx, &req);
+        slow_end(slow);
 
         if (d.kind == KBOX_DISPATCH_DEFERRED)
             continue;
@@ -461,6 +481,15 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
              * up the exit.
              */
             if (e == ENOENT || e == EBADF) {
+                static int reported;
+                if (reported < 20) {
+                    reported++;
+                    const char *sname =
+                        syscall_name_from_nr(ctx->host_nrs, req.nr);
+                    fprintf(stderr, "kbox: answer lost pid=%u nr=%d (%s): %s\n",
+                            (unsigned int) req.pid, (int) req.nr,
+                            sname ? sname : "unknown", strerror(e));
+                }
 #ifdef KBOX_HAS_WEB
                 if (e == ENOENT && ctx->web)
                     kbox_web_counters(ctx->web)->send_enoent++;
@@ -483,6 +512,182 @@ out:
     if (sigchld_fd >= 0)
         close(sigchld_fd);
     return exit_code;
+}
+
+/* Stuck-syscall reporter.
+ *
+ * A guest that never advances looks the same whether its own syscall blocks or
+ * the supervisor is stuck inside an LKL call that never returns; from outside
+ * the process both show up as a thread in futex_wait. When the pod run of
+ * test_ssl froze, the stack of the guest named bind(), the supervisor showed no
+ * spinning thread, and nothing said which LKL call the supervisor had entered.
+ *
+ * Each supervised dispatch marks its request here. A reporter thread names any
+ * request that has been running for longer than a few seconds, and names it
+ * again when it finally returns, so a stuck engine is visible without turning
+ * on per-syscall verbose output.
+ */
+#define KBOX_SLOW_SLOTS 16
+#define KBOX_SLOW_SECONDS 5
+
+struct kbox_slow_slot {
+    int busy;
+    long nr;
+    const char *name;
+    pid_t pid;
+    uint64_t start_ns;
+    int reported;
+};
+
+static pthread_mutex_t g_slow_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_slow_cond = PTHREAD_COND_INITIALIZER;
+static struct kbox_slow_slot g_slow[KBOX_SLOW_SLOTS];
+static int g_slow_started;
+
+/* A guest that waits for a socket that never becomes readable leaves the pump
+ * ticking and nothing in the log. SIGUSR1 asks for the bridge state, printed by
+ * the reporter thread so no LKL call happens inside a signal handler.
+ */
+static volatile sig_atomic_t g_dump_requested;
+
+static void kbox_dump_handler(int sig)
+{
+    (void) sig;
+    g_dump_requested = 1;
+}
+
+static uint64_t slow_now_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
+static void *kbox_slow_main(void *arg)
+{
+    (void) arg;
+    int pump_reported = 0;
+
+    for (;;) {
+        struct timespec wake;
+
+        clock_gettime(CLOCK_REALTIME, &wake);
+        wake.tv_sec += 1;
+
+        pthread_mutex_lock(&g_slow_lock);
+        (void) pthread_cond_timedwait(&g_slow_cond, &g_slow_lock, &wake);
+
+        uint64_t now = slow_now_ns();
+        for (int i = 0; i < KBOX_SLOW_SLOTS; i++) {
+            struct kbox_slow_slot *slot = &g_slow[i];
+
+            if (!slot->busy || slot->reported)
+                continue;
+            if (now - slot->start_ns <
+                (uint64_t) KBOX_SLOW_SECONDS * 1000000000ull)
+                continue;
+            slot->reported = 1;
+            /* format-ok: a literal, split only because the call
+             * does not fit on one line. */
+            fprintf(/* format-ok */
+                    stderr,
+                    "kbox: syscall pid=%d nr=%ld (%s) not returned "
+                    "after %llus; the guest waits\n",
+                    (int) slot->pid, slot->nr,
+                    slot->name ? slot->name : "unknown",
+                    (unsigned long long) ((now - slot->start_ns) /
+                                          1000000000ull));
+        }
+        pthread_mutex_unlock(&g_slow_lock);
+
+        /* A guest that spins on a poll that keeps reporting ready looks exactly
+         * like a busy program. The pump behind those descriptors is a single
+         * thread holding the bridge lock; when it stops, every container's
+         * sockets stop with it and nothing else in the log says so. Report the
+         * step it is stuck in, once per stall: the flag clears as soon as the
+         * pump moves again.
+         */
+        {
+            int stage = 0;
+            int pslot = -1;
+            uint64_t age_ms = kbox_net_pump_stage_age_ms(&stage, &pslot);
+
+            if (age_ms >= 2000) {
+                if (!pump_reported) {
+                    pump_reported = 1;
+                    fprintf(stderr,
+                            "kbox: net: pump stuck in stage=%d slot=%d for "
+                            "%llums\n",
+                            stage, pslot, (unsigned long long) age_ms);
+                }
+            } else if (age_ms == 0 && pump_reported) {
+                pump_reported = 0;
+            }
+        }
+
+        /* LKL runs every Linux syscall under one CPU lock. A single call that
+         * never returns freezes all file and socket work, for every container,
+         * and the guest's only symptom is a syscall without an answer. */
+        kbox_lkl_report_stalls(2000);
+
+        if (g_dump_requested) {
+            g_dump_requested = 0;
+            kbox_net_dump_state();
+        }
+    }
+    return NULL;
+}
+
+static struct kbox_slow_slot *slow_begin(struct kbox_supervisor_ctx *ctx,
+                                         const struct kbox_syscall_request *req)
+{
+    struct kbox_slow_slot *slot = NULL;
+
+    pthread_mutex_lock(&g_slow_lock);
+    if (!g_slow_started) {
+        pthread_t thread;
+        pthread_attr_t attr;
+
+        if (pthread_attr_init(&attr) == 0) {
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            if (pthread_create(&thread, &attr, kbox_slow_main, NULL) == 0)
+                g_slow_started = 1;
+            pthread_attr_destroy(&attr);
+        }
+    }
+    for (int i = 0; i < KBOX_SLOW_SLOTS; i++) {
+        if (g_slow[i].busy)
+            continue;
+        slot = &g_slow[i];
+        slot->busy = 1;
+        slot->nr = (long) req->nr;
+        slot->name = syscall_name_from_nr(ctx->host_nrs, req->nr);
+        slot->pid = kbox_syscall_request_pid(req);
+        slot->start_ns = slow_now_ns();
+        slot->reported = 0;
+        break;
+    }
+    pthread_mutex_unlock(&g_slow_lock);
+    return slot;
+}
+
+static void slow_end(struct kbox_slow_slot *slot)
+{
+    if (!slot)
+        return;
+    pthread_mutex_lock(&g_slow_lock);
+    if (slot->reported) {
+        uint64_t ns = slow_now_ns() - slot->start_ns;
+
+        fprintf(stderr,
+                "kbox: syscall pid=%d nr=%ld (%s) returned after %llus\n",
+                (int) slot->pid, slot->nr, slot->name ? slot->name : "unknown",
+                (unsigned long long) (ns / 1000000000ull));
+    }
+    slot->busy = 0;
+    slot->reported = 0;
+    pthread_mutex_unlock(&g_slow_lock);
 }
 
 int kbox_supervise_ctx(struct kbox_supervisor_ctx *ctx)
@@ -598,10 +803,23 @@ int kbox_run_supervisor_volumes(const struct kbox_sysnrs *sysnrs,
         close(sp[1]);
         close(listener_fd);
 
-        /* 3e. Restore the inherited signal mask before exec. */
-        if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0) {
-            fprintf(stderr, "sigprocmask(SIG_SETMASK): %s\n", strerror(errno));
-            _exit(127);
+        /* 3e. Restore the inherited signal mask before exec, minus SIGCHLD.
+         *
+         * LKL blocks SIGCHLD for the whole process before booting its kernel
+         * threads, so old_mask already has it blocked. Restoring that mask
+         * verbatim gives the guest a SIGCHLD it can never receive: every child
+         * it reaps leaves SIGCHLD pending forever, and signal.sigpending()
+         * reports a signal that no guest code ever raised. The child has not
+         * inherited any LKL kernel threads, so it has no reason to block it.
+         */
+        {
+            sigset_t exec_mask = old_mask;
+            sigdelset(&exec_mask, SIGCHLD);
+            if (sigprocmask(SIG_SETMASK, &exec_mask, NULL) < 0) {
+                fprintf(stderr, "sigprocmask(SIG_SETMASK): %s\n",
+                        strerror(errno));
+                _exit(127);
+            }
         }
 
         /* 3f. Build argv and exec.

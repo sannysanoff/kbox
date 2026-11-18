@@ -25,6 +25,7 @@
     X(getdents64)              \
     X(getdents)                \
     X(mkdirat)                 \
+    X(mknodat)                 \
     X(unlinkat)                \
     X(renameat)                \
     X(renameat2)               \
@@ -191,6 +192,7 @@
     X(eventfd2)                \
     X(memfd_create)            \
     X(setpriority)             \
+    X(getpriority)             \
     X(statfs)                  \
     X(fstatfs)                 \
     X(sysinfo)                 \
@@ -222,10 +224,14 @@ struct kbox_sysnrs {
     long setgid, setregid, setresgid;
     long getgroups, setgroups, setfsgid;
     long chroot, mknodat;
+    /* LKL never dequeues signals from its own tasks; kbox drops a stale
+     * pending signal so file I/O stops failing with EINTR. */
+    long rt_sigtimedwait;
+    long rt_sigprocmask;
     long mkdir_no;
     bool mkdirat_style;
     long mount, umount2;
-    long openat, openat2, fcntl, socket, connect;
+    long openat, openat2, fcntl, ioctl, socket, connect;
     long bind, listen, accept, accept4, sendto, recvfrom, sendmsg, recvmsg;
     long getsockopt, setsockopt, getsockname, getpeername, shutdown;
     long ppoll, unshare, setns, sethostname, new_thread_group_leader;
@@ -248,6 +254,9 @@ struct kbox_sysnrs {
     long uname;
     long getrandom;
     long prctl;
+    long clock_settime;
+    long getpriority;
+    long listxattr, llistxattr, flistxattr;
     long syslog;
 };
 

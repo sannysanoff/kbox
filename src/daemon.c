@@ -2719,6 +2719,10 @@ int kbox_daemon_run(const char *sock_path, const char *cmdline, int verbose)
         return -1;
     }
 
+    /* Make the guest wall clock match the host before any container stamps a
+     * file with "now". */
+    kbox_sync_guest_realtime();
+
     /* Setup base LKL root filesystem hierarchy for daemon control plane. */
     lkl_mkdir_p(g_sysnrs, "/proc", 0755);
     kbox_lkl_mount(g_sysnrs, "proc", "/proc", "proc", 0, NULL);

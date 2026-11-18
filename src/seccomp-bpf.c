@@ -300,6 +300,22 @@ static void emit_host_fd_band_allow(struct kbox_sock_filter *filter,
         KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
 }
 
+static void emit_self_pid_allow(struct kbox_sock_filter *filter,
+                                int *idx,
+                                int nr,
+                                unsigned int pid)
+{
+    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
+        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, (unsigned int) nr, 0, 3);
+    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
+        KBOX_SECCOMP_DATA_ARG0_LO_OFFSET);
+    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
+        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, pid, 0, 1);
+    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
+}
+
 static int emit_ip_range_allow(struct kbox_sock_filter *filter,
                                int *idx,
                                const struct kbox_syscall_trap_ip_range *range)
@@ -450,7 +466,17 @@ static int install_seccomp_filter(
         KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
     filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
         KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS, KBOX_SECCOMP_DATA_NR_OFFSET);
-    EMIT_ALLOW(h->exit);
+    /* getpid/gettid return the real PID and TID in seccomp-notify mode, which
+     * is exactly what the kernel returns for the call itself. Leaving them for
+     * the supervisor put them behind the notification window, where a signal
+     * with a handler aborts the wait: libc's getpid() then returns -EINTR,
+     * musl's __syscall hands that up as -errno without an error check, and
+     * os.kill(os.getpid(), sig) asked the kernel to signal PID -4 (EPERM).
+     */
+    if (h->getpid >= 0)
+        EMIT_ALLOW(h->getpid);
+    if (h->gettid >= 0)
+        EMIT_ALLOW(h->gettid);
     EMIT_ALLOW(h->rt_sigreturn);
 #undef EMIT_ALLOW
 
@@ -463,6 +489,19 @@ static int install_seccomp_filter(
     emit_host_fd_band_allow(filter, &idx, h->lseek, KBOX_FD_HOSTONLY_BASE);
     emit_host_fd_band_allow(filter, &idx, h->fstat, KBOX_FD_HOSTONLY_BASE);
     emit_host_fd_band_allow(filter, &idx, h->close, KBOX_FD_HOSTONLY_BASE);
+
+    /* kill(getpid(), sig) runs in the kernel, not through the supervisor.
+     *
+     * Every notified syscall can come back as EINTR: while the tracee waits
+     * for the supervisor's answer, a signal with a handler aborts that wait,
+     * and the kernel returns -ERESTARTSYS for the blocked syscall. kill(2) is
+     * not restarted, so a self-signal under signal load (test_signal's stress
+     * tests fire SIGALRM through setitimer in a tight loop) failed with
+     * InterruptedError instead of returning 0. A self-signal already carries
+     * the real PID as its target, so the kernel can run the call natively.
+     */
+    if (h->kill >= 0)
+        emit_self_pid_allow(filter, &idx, h->kill, (unsigned int) getpid());
 
     /* The arg0-based fast-fd checks above overwrite A with the file
      * descriptor. Reload the syscall number before the deny list so low FDs
@@ -483,6 +522,91 @@ static int install_seccomp_filter(
             (unsigned int) deny_nrs[i], 0, 1);
         filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
             KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ERRNO(EPERM));
+    }
+
+    /* Notify only what the supervisor would not simply continue.
+     *
+     * The dispatcher's CONTINUE table is a list of syscalls whose answer is
+     * "let the host kernel do it". Sending them through the notification first
+     * buys nothing and costs correctness: a signal with a handler aborts the
+     * tracee's wait for the answer, so the call comes back as -ERESTARTSYS.
+     * For a call the kernel would never interrupt on its own (mmap, setitimer,
+     * rt_sigaction, ...) that EINTR is fabricated, and CPython surfaces it:
+     * pymalloc reports MemoryError when its mmap is interrupted, and
+     * os.setitimer raises InterruptedError. test_signal's stress tests drive
+     * exactly that. Allowing these syscalls in the filter gives every caller
+     * the plain kernel behaviour.
+     *
+     * exit/exit_group stay notified: the supervisor flushes writable shadows
+     * there. see dispatch_request_impl().
+     */
+#define EMIT_ALLOW(nr)                                             \
+    do {                                                           \
+        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(   \
+            KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, (nr), 0, 1); \
+        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(   \
+            KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);    \
+    } while (0)
+#define EMIT_CONTINUE_ALLOW(field) \
+    do {                           \
+        if ((h->field) >= 0)       \
+            EMIT_ALLOW(h->field);  \
+    } while (0)
+    EMIT_CONTINUE_ALLOW(setpgid);
+    EMIT_CONTINUE_ALLOW(getpgid);
+    EMIT_CONTINUE_ALLOW(getsid);
+    EMIT_CONTINUE_ALLOW(setsid);
+    EMIT_CONTINUE_ALLOW(brk);
+    EMIT_CONTINUE_ALLOW(rt_sigaltstack);
+    EMIT_CONTINUE_ALLOW(rt_sigsuspend);
+    EMIT_CONTINUE_ALLOW(setitimer);
+    EMIT_CONTINUE_ALLOW(getitimer);
+    EMIT_CONTINUE_ALLOW(set_tid_address);
+    EMIT_CONTINUE_ALLOW(set_robust_list);
+    EMIT_CONTINUE_ALLOW(futex);
+    EMIT_CONTINUE_ALLOW(rseq);
+    EMIT_CONTINUE_ALLOW(membarrier);
+    EMIT_CONTINUE_ALLOW(madvise);
+    EMIT_CONTINUE_ALLOW(getrlimit);
+    EMIT_CONTINUE_ALLOW(getrusage);
+    EMIT_CONTINUE_ALLOW(sched_yield);
+    EMIT_CONTINUE_ALLOW(sched_setparam);
+    EMIT_CONTINUE_ALLOW(sched_getparam);
+    EMIT_CONTINUE_ALLOW(sched_setscheduler);
+    EMIT_CONTINUE_ALLOW(sched_getscheduler);
+    EMIT_CONTINUE_ALLOW(sched_get_priority_max);
+    EMIT_CONTINUE_ALLOW(sched_get_priority_min);
+    EMIT_CONTINUE_ALLOW(sched_setaffinity);
+    EMIT_CONTINUE_ALLOW(sched_getaffinity);
+    EMIT_CONTINUE_ALLOW(nanosleep);
+    EMIT_CONTINUE_ALLOW(clock_nanosleep);
+    EMIT_CONTINUE_ALLOW(timer_create);
+    EMIT_CONTINUE_ALLOW(timer_gettime);
+    EMIT_CONTINUE_ALLOW(timer_getoverrun);
+    EMIT_CONTINUE_ALLOW(timer_settime);
+    EMIT_CONTINUE_ALLOW(timer_delete);
+    EMIT_CONTINUE_ALLOW(sysinfo);
+    EMIT_CONTINUE_ALLOW(getcpu);
+#undef EMIT_ALLOW
+#undef EMIT_CONTINUE_ALLOW
+
+    /* mmap: the supervisor only invalidates a path cache for the fd-backed
+     * case. Anonymous mappings need no supervisor at all.
+     */
+    if (h->mmap >= 0) {
+        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
+            KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, (unsigned int) h->mmap, 0,
+            3);
+        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+            KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
+            KBOX_SECCOMP_DATA_ARG4_LO_OFFSET);
+        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
+            KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, 0xffffffffU, 0, 1);
+        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+            KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
+        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+            KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
+            KBOX_SECCOMP_DATA_NR_OFFSET);
     }
 
     /* Default: everything else goes to the supervisor. */

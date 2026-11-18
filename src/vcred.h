@@ -17,6 +17,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+/* Largest supplementary group list kbox models. Linux allows NGROUPS_MAX
+ * (65536); a container process realistically holds a handful, and the guest
+ * gets EINVAL above this, the same answer an oversized list gets from the
+ * kernel when the buffer is too small. */
+#define KBOX_VCRED_MAX_GROUPS 32
+
 struct kbox_vcred {
     uint32_t ruid, euid, suid;
     uint32_t rgid, egid, sgid;
@@ -25,6 +31,14 @@ struct kbox_vcred {
      * rely on capabilities kept across setresuid(), which kbox does not model.
      */
     int had_root;
+    /* Supplementary groups as last replaced by setgroups(2). Until a process
+     * calls setgroups, the list is the effective gid alone, which is what a
+     * container process starts with; `groups_set` tells the two cases apart,
+     * because setgroups([]) is a legal empty list.
+     */
+    int groups_set;
+    uint32_t ngroups;
+    uint32_t groups[KBOX_VCRED_MAX_GROUPS];
 };
 
 /* True when pid may change group ids / supplementary groups. */
@@ -38,6 +52,18 @@ void kbox_vcred_get(pid_t pid, struct kbox_vcred *out);
  * with Linux semantics: euid 0 may set anything, others only values already in
  * {real, effective, saved}. The gid variants follow the same rule keyed on
  * euid == 0 (stand-in for CAP_SETGID). */
+/* setgroups(2): replace the supplementary group list. Returns 0, -EPERM when
+ * pid may not change groups, or -EINVAL above KBOX_VCRED_MAX_GROUPS. */
+int kbox_vcred_setgroups(pid_t pid, size_t n, const uint32_t *list);
+
+/* Number of supplementary groups pid holds: the stored list after setgroups, or
+ * one entry (the effective gid) for a process that never called it. */
+int kbox_vcred_group_count(pid_t pid);
+
+/* getgroups(2): copy the group list into out, at most size entries. Returns the
+ * number of groups, or -EINVAL when size is smaller than the count. */
+int kbox_vcred_getgroups(pid_t pid, size_t size, uint32_t *out);
+
 int kbox_vcred_setresuid(pid_t pid, int64_t r, int64_t e, int64_t s);
 int kbox_vcred_setresgid(pid_t pid, int64_t r, int64_t e, int64_t s);
 int kbox_vcred_setuid(pid_t pid, int64_t u);

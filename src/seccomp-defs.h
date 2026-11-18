@@ -30,6 +30,7 @@
 #define KBOX_SECCOMP_DATA_IP_HI_OFFSET 12
 #define KBOX_SECCOMP_DATA_ARG0_LO_OFFSET 16
 #define KBOX_SECCOMP_DATA_ARG2_LO_OFFSET 32
+#define KBOX_SECCOMP_DATA_ARG4_LO_OFFSET 48
 
 /* flags value of the one sendmsg that bypasses the supervisor: the child's
  * listener-fd handoff, sent before the supervisor loop exists. It is

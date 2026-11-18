@@ -10,6 +10,8 @@
  */
 
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "fd-table.h"
 #include "lkl-wrap.h"
@@ -83,6 +85,85 @@ static inline int fd_should_deny_io_ctx(const struct kbox_fd_table *t,
     return 1;
 }
 
+/* Does the tracee really hold this descriptor open? The supervisor tracks the
+ * FDs it created, but a number can also arrive that it never created and that
+ * the process never opened. Answering fcntl(F_GETFL) with a made-up success
+ * for such a number hides EBADF: CPython's os.get_blocking() and
+ * os.set_blocking() probe a closed descriptor and must see the error.
+ */
+static inline int tracee_fd_is_open(pid_t pid, long fd)
+{
+    char path[64];
+    char target[8];
+    int n;
+
+    if (fd < 0 || fd > (1 << 24))
+        return 0;
+    n = snprintf(path, sizeof(path), "/proc/%d/fd/%ld", (int) pid, fd);
+    if (n < 0 || (size_t) n >= sizeof(path))
+        return 0;
+    return readlink(path, target, sizeof(target)) >= 0;
+}
+
+/* Descriptor policy for I/O handlers, including sockets the kernel owns.
+ *
+ * fd_should_deny_io_ctx() refuses every descriptor the supervisor did not
+ * create. That is right for leaked host files (the openat TOCTOU window), but
+ * wrong for sockets: an AF_UNIX connection accepted by a host listener, or a
+ * socket inherited from the runtime, is a real descriptor the tracee holds and
+ * the host kernel created. Refusing read(2) on it made an accepted connection
+ * unusable -- CPython's ssl wraps the accepted socket and the first record read
+ * came back EBADF. A descriptor that is not a socket still keeps the strict
+ * answer, so the leak protection is unchanged.
+ */
+static inline int tracee_fd_is_socket(pid_t pid, long fd)
+{
+    char path[64];
+    char target[64];
+    int n;
+    ssize_t len;
+
+    if (fd < 0 || fd > (1 << 24))
+        return 0;
+    n = snprintf(path, sizeof(path), "/proc/%d/fd/%ld", (int) pid, fd);
+    if (n < 0 || (size_t) n >= sizeof(path))
+        return 0;
+    len = readlink(path, target, sizeof(target) - 1);
+    if (len <= 0)
+        return 0;
+    target[len] = '\0';
+    return strncmp(target, "socket:[", 8) == 0;
+}
+
+static inline int io_should_deny_fd(struct kbox_supervisor_ctx *ctx,
+                                    const struct kbox_syscall_request *req,
+                                    long fd,
+                                    long lkl_fd)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+
+    if (!fd_should_deny_io(fd, lkl_fd))
+        return 0;
+    if (ctx && ctx->fd_table &&
+        kbox_fd_table_find_by_host_fd(ctx->fd_table, fd) >= 0)
+        return 0;
+
+    /* A descriptor the tracee really holds open is the guest's own, even when
+     * the supervisor never created it. kbox learns about most FDs at open(2)
+     * time, but two paths install descriptors behind its back: an accepted
+     * connection, and any descriptor received over SCM_RIGHTS.
+     * multiprocessing's forkserver gets the client's pipe that way, then writes
+     * the child pid into it; the strict answer was EBADF, so every
+     * ProcessPoolExecutor, every forkserver Pool and test_compileall's worker
+     * test failed.
+     *
+     * The leak this rule guards against is a *number* the guest guesses: a
+     * supervisor FD is not open in the tracee process, so /proc/<pid>/fd/<n>
+     * does not resolve and the answer stays EBADF.
+     */
+    return !tracee_fd_is_open(pid, fd);
+}
+
 static inline void track_host_passthrough_fd(struct kbox_fd_table *t, int fd)
 {
     if (kbox_fd_table_insert_at(t, fd, KBOX_LKL_FD_SHADOW_ONLY, 0) < 0)
@@ -131,6 +212,11 @@ static inline long lkl_close_and_invalidate(struct kbox_supervisor_ctx *ctx,
                                             long lkl_fd)
 {
     invalidate_stat_cache_fd(ctx, lkl_fd);
+    /* A writeback that was abandoned still has a thread inside an LKL call on
+     * this descriptor. Closing it would let the number be reused by another
+     * file while that call is in flight, so the number is retired instead. */
+    if (kbox_lkl_fd_is_abandoned(lkl_fd))
+        return 0;
     return kbox_lkl_close(ctx->sysnrs, lkl_fd);
 }
 
@@ -291,6 +377,11 @@ int guest_range_has_shared_file_write_mapping(pid_t pid,
                                               uint64_t addr,
                                               uint64_t len);
 int dup_tracee_fd(pid_t pid, int tracee_fd);
+int kbox_path_is_host_passthrough(const struct kbox_supervisor_ctx *ctx,
+                                  const struct kbox_syscall_request *req,
+                                  size_t path_idx,
+                                  const char *translated);
+
 void translate_proc_self(const char *path,
                          pid_t pid,
                          char *sv_path,
@@ -360,6 +451,9 @@ struct kbox_dispatch forward_bind(const struct kbox_syscall_request *req,
                                   struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_listen(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx);
+/* Drop per-FD AF_UNIX bookkeeping when the descriptor goes away. */
+void kbox_net_forget_fd(long fd);
+
 struct kbox_dispatch forward_accept(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_accept4(const struct kbox_syscall_request *req,
@@ -475,9 +569,6 @@ struct kbox_dispatch forward_pipe2(const struct kbox_syscall_request *req,
 struct kbox_dispatch forward_socketpair(const struct kbox_syscall_request *req,
                                         struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_xattr_nodata(
-    const struct kbox_syscall_request *req,
-    struct kbox_supervisor_ctx *ctx);
-struct kbox_dispatch forward_xattr_empty_list(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,

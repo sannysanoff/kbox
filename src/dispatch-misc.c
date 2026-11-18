@@ -15,12 +15,14 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/utsname.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -142,6 +144,21 @@ static int synthesize_proc_magic_link(const struct kbox_syscall_request *req,
         tail = path + 18;
     if (!tail)
         return 0;
+
+    /* /proc/self/fd/N: the tracee's own descriptor table is the host's, so the
+     * supervisor can read the link from /proc/<pid>/fd/N. ttyname() and pty
+     * setup answer through this link; without it openpty() created a pty and
+     * then failed to name or open the slave.
+     */
+    if (strncmp(tail, "fd/", 3) == 0 && tail[3] != '\0') {
+        char link[64];
+        ssize_t n;
+        snprintf(link, sizeof(link), "/proc/%d/fd/%s", (int) pid, tail + 3);
+        n = readlink(link, out, out_size);
+        if (n <= 0)
+            return 0;
+        return (int) n;
+    }
 
     const char *target = NULL;
     if (strcmp(tail, "exe") == 0) {
@@ -323,15 +340,6 @@ struct kbox_dispatch forward_xattr_nodata(
     (void) req;
     (void) ctx;
     return kbox_dispatch_errno(ENODATA);
-}
-
-struct kbox_dispatch forward_xattr_empty_list(
-    const struct kbox_syscall_request *req,
-    struct kbox_supervisor_ctx *ctx)
-{
-    (void) req;
-    (void) ctx;
-    return kbox_dispatch_value(0);
 }
 
 struct kbox_dispatch forward_uname(const struct kbox_syscall_request *req,
@@ -679,12 +687,19 @@ struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
-    if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
+    if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW) {
+        if (getenv("KBOX_FD_TRACE"))
+            fprintf(stderr, "kbofdt: pwrite64 continue fd=%ld lkl=%ld\n", fd,
+                    lkl_fd);
         return kbox_dispatch_continue();
+    }
+    if (getenv("KBOX_FD_TRACE"))
+        fprintf(stderr, "kbofdt: pwrite64 lkl fd=%ld lkl=%ld host_fd=%ld\n", fd,
+                lkl_fd, entry ? entry->host_fd : -99L);
 
     invalidate_stat_cache_fd(ctx, lkl_fd);
 
@@ -780,7 +795,7 @@ static struct kbox_dispatch dispatch_iov_transfer(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -892,6 +907,10 @@ static struct kbox_dispatch dispatch_iov_transfer(
 done:
     if (is_write && total > 0)
         invalidate_path_shadow_cache(ctx);
+    if (getenv("KBOX_FD_TRACE") && fd >= KBOX_FD_BASE)
+        fprintf(stderr,
+                "kbofdt: iov done fd=%ld lkl=%ld write=%d total=%zu err=%d\n",
+                fd, lkl_fd, is_write, total, err);
     if (total == 0 && err)
         return kbox_dispatch_errno(err);
     return kbox_dispatch_value((int64_t) total);
@@ -921,9 +940,14 @@ static struct kbox_dispatch dispatch_iov_at_offset(
     int has_flags)
 {
     if (has_flags) {
-        long flags = to_c_long_arg(kbox_syscall_request_arg(req, 4));
-        if (flags != 0)
-            return kbox_dispatch_errno(ENOSYS);
+        /* RWF_HIPRI, RWF_NOWAIT and friends are advisory: Linux completes the
+         * transfer and ignores them for a file that does not support them.
+         * Answering ENOSYS made os.preadv(fd, buf, n, RWF_HIPRI) fail
+         * (test_posix.test_preadv_flags). The flags are not forwarded because
+         * LKL's preadv2 support depends on the backing file system; the data
+         * transfer is the part the caller depends on.
+         */
+        (void) to_c_long_arg(kbox_syscall_request_arg(req, 4));
     }
     int64_t offset = (int64_t) to_c_long_arg(kbox_syscall_request_arg(req, 3));
     return dispatch_iov_transfer(req, ctx, is_write, 1, offset);
@@ -961,7 +985,7 @@ struct kbox_dispatch forward_ftruncate(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -969,7 +993,7 @@ struct kbox_dispatch forward_ftruncate(const struct kbox_syscall_request *req,
         return kbox_dispatch_continue();
 
     long length = to_c_long_arg(kbox_syscall_request_arg(req, 1));
-    long ret = kbox_lkl_ftruncate(ctx->sysnrs, lkl_fd, length);
+    long ret = kbox_lkl_ftruncate_safe(ctx->sysnrs, lkl_fd, length);
     if (ret >= 0) {
         invalidate_path_shadow_cache(ctx);
         invalidate_stat_cache_fd(ctx, lkl_fd);
@@ -985,7 +1009,7 @@ struct kbox_dispatch forward_fallocate(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -1012,7 +1036,7 @@ struct kbox_dispatch forward_flock(const struct kbox_syscall_request *req,
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -1034,7 +1058,7 @@ struct kbox_dispatch forward_fchmod(const struct kbox_syscall_request *req,
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -1093,7 +1117,7 @@ struct kbox_dispatch forward_fadvise64(const struct kbox_syscall_request *req,
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -1108,7 +1132,7 @@ struct kbox_dispatch forward_fsync(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -1131,7 +1155,7 @@ struct kbox_dispatch forward_fdatasync(const struct kbox_syscall_request *req,
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -1221,6 +1245,28 @@ struct kbox_dispatch forward_linkat(const struct kbox_syscall_request *req,
                                    &newdirfd);
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
+
+    /* A path that belongs to the host -- an absolute /dev, /proc or /sys path
+     * -- has to be linked on the host, exactly as openat handles it. musl's
+     * sem_open creates /dev/shm/tmp-<random>, fills it, and linkat()s it to
+     * the final /dev/shm/<name>; sending that link to LKL answered ENOENT, so
+     * every multiprocessing Lock, Queue and ProcessPoolExecutor failed with
+     * FileNotFoundError (test_compileall.test_workers,
+     * test_concurrent_futures, test_importlib's pool test, test_regrtest).
+     */
+    if (kbox_path_is_host_passthrough(ctx, req, 1, oldtrans) ||
+        kbox_path_is_host_passthrough(ctx, req, 3, newtrans)) {
+        if (!kbox_path_is_host_passthrough(ctx, req, 1, oldtrans) ||
+            !kbox_path_is_host_passthrough(ctx, req, 3, newtrans))
+            return kbox_dispatch_errno(EXDEV);
+        int host_rc =
+            linkat(AT_FDCWD, oldtrans, AT_FDCWD, newtrans, (int) flags);
+        int saved = errno;
+        if (host_rc < 0)
+            return kbox_dispatch_errno(saved);
+        invalidate_path_shadow_cache(ctx);
+        return kbox_dispatch_value(0);
+    }
 
     /* Host dirfd on either side: call host linkat with supervisor copies. */
     if (should_continue_for_dirfd(olddirfd) ||
@@ -1345,6 +1391,14 @@ struct kbox_dispatch forward_utimensat(const struct kbox_syscall_request *req,
         return kbox_dispatch_value(0);
     }
 
+    if (ctx->verbose && times) {
+        const long *t = (const long *) times;
+        fprintf(stderr,
+                "kbox: utimensat lkl path=%s dirfd=%ld flags=%ld "
+                "times=%ld.%09ld/%ld.%09ld\n",
+                translated_path ? translated_path : "(fd)", lkl_dirfd, flags,
+                t[0], t[1], t[2], t[3]);
+    }
     long ret = kbox_lkl_utimensat(ctx->sysnrs, lkl_dirfd, translated_path,
                                   times, flags);
     if (ret >= 0)
@@ -1375,6 +1429,104 @@ struct kbox_dispatch forward_utimensat(const struct kbox_syscall_request *req,
 #define TIOCSCTTY 0x540E
 #endif
 
+/* Resolve a tracee FD to the LKL socket behind it.
+ *
+ * Shadow sockets give the tracee a host socketpair end; the socket itself
+ * lives in LKL. FIONBIO and the other socket ioctls therefore have to reach
+ * the LKL file, not the socketpair end: LKL's accept()/connect() read the
+ * non-blocking bit from the LKL file flags, so a flag set only on the host
+ * shadow leaves accept() blocking forever (CPython's setblocking() and
+ * settimeout() use ioctl(FIONBIO), not fcntl(F_SETFL)).
+ *
+ * Returns the LKL FD and, through entry_out, the FD-table entry that owns the
+ * host shadow, or -1 when the FD is not a shadow socket.
+ */
+static long resolve_shadow_socket_lkl(struct kbox_supervisor_ctx *ctx,
+                                      long fd,
+                                      struct kbox_fd_entry **entry_out)
+{
+    long lkl_fd;
+    struct kbox_fd_entry *entry = NULL;
+
+    if (entry_out)
+        *entry_out = NULL;
+
+    lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (lkl_fd >= 0) {
+        entry = fd_table_entry(ctx->fd_table, fd);
+        if (entry && entry->shadow_sp >= 0) {
+            if (entry_out)
+                *entry_out = entry;
+            return lkl_fd;
+        }
+        return -1;
+    }
+
+    long vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
+    if (vfd < 0)
+        return -1;
+    entry = fd_table_entry(ctx->fd_table, vfd);
+    if (!entry || entry->lkl_fd < 0 || entry->shadow_sp < 0)
+        return -1;
+    if (entry_out)
+        *entry_out = entry;
+    return entry->lkl_fd;
+}
+
+/* ioctl(FIONBIO) on a guest socket: apply the blocking flag to the LKL file
+ * and to the host shadow, and answer 0. Both copies must agree, because the
+ * guest's own F_GETFL goes to the host shadow while LKL makes its blocking
+ * decisions from its own file flags.
+ */
+static struct kbox_dispatch ioctl_fionbio(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    long lkl_fd,
+    struct kbox_fd_entry *entry,
+    uint64_t arg_ptr)
+{
+    int on = 0;
+    int rrc;
+
+    if (arg_ptr == 0)
+        return kbox_dispatch_errno(EFAULT);
+    rrc = guest_mem_read(ctx, kbox_syscall_request_pid(req), arg_ptr, &on,
+                         sizeof(on));
+    if (rrc < 0)
+        return kbox_dispatch_errno(-rrc);
+
+    long lfl = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, F_GETFL, 0);
+    if (lfl < 0)
+        return kbox_dispatch_from_lkl(lfl);
+
+    long nfl = on ? (lfl | O_NONBLOCK) : (lfl & ~O_NONBLOCK);
+    if (nfl != lfl) {
+        long fr = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, F_SETFL, nfl);
+        if (fr < 0)
+            return kbox_dispatch_from_lkl(fr);
+    }
+    if (entry && entry->shadow_sp >= 0) {
+        int hfl = fcntl(entry->shadow_sp, F_GETFL);
+        if (hfl >= 0) {
+            int hnfl = on ? (hfl | O_NONBLOCK) : (hfl & ~O_NONBLOCK);
+            if (hnfl != hfl)
+                (void) fcntl(entry->shadow_sp, F_SETFL, hnfl);
+        }
+    }
+
+    if (ctx->verbose)
+        fprintf(stderr, "kbox: ioctl FIONBIO fd-lkl=%ld on=%d -> 0\n", lkl_fd,
+                on);
+    return kbox_dispatch_value(0);
+}
+
+#ifndef SIOCGIFINDEX
+#define SIOCGIFINDEX 0x8933
+#endif
+#ifndef SIOCGIFNAME
+#define SIOCGIFNAME 0x8910
+#endif
+
 struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx)
 {
@@ -1382,31 +1534,115 @@ struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
     long cmd = to_c_long_arg(kbox_syscall_request_arg(req, 1));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
-    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
-        /* Host-passthrough FD (stdin/stdout/stderr, pipe, eventfd, etc.).
-         * Most ioctls pass through to the host kernel.  Job-control ioctls
-         * fail with EPERM under seccomp-unotify because the supervised child
-         * is not the session leader.  Return ENOTTY so shells fall back to
-         * non-job-control mode instead of aborting.
+    if (cmd == FIONBIO) {
+        struct kbox_fd_entry *entry = NULL;
+        long sock_lkl = resolve_shadow_socket_lkl(ctx, fd, &entry);
+        if (sock_lkl < 0)
+            sock_lkl = lkl_fd; /* vfd-backed LKL socket, no host shadow */
+        if (sock_lkl >= 0)
+            return ioctl_fionbio(req, ctx, sock_lkl, entry,
+                                 kbox_syscall_request_arg(req, 2));
+        /* A host-passthrough socket: an accepted AF_UNIX connection, or one
+         * inherited from the runtime. The host owns its blocking flag, and the
+         * accepted socket's FD is never in the table. asyncio calls
+         * setblocking(False) on every accepted connection, and answering EBADF
+         * there dropped the connection before the first byte.
          */
-        if (cmd == TIOCSPGRP || cmd == TIOCGPGRP || cmd == TIOCSCTTY)
-            return kbox_dispatch_errno(ENOTTY);
-        return kbox_dispatch_continue();
-    }
-    if (lkl_fd < 0) {
-        if (!fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)) {
-            if (cmd == TIOCSPGRP || cmd == TIOCGPGRP || cmd == TIOCSCTTY)
-                return kbox_dispatch_errno(ENOTTY);
+        if (tracee_fd_is_open(kbox_syscall_request_pid(req), fd))
             return kbox_dispatch_continue();
-        }
         return kbox_dispatch_errno(EBADF);
     }
 
-    /* For virtual FDs backed by LKL, terminal ioctls yield -ENOTTY since LKL
-     * file-backed FDs are not terminals. Non-terminal ioctls also yield
-     * -ENOTTY, matching regular-file semantics.
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
+        /* Interface lookups are answered by LKL, not by the host, even when the
+         * descriptor is a host one. musl opens an AF_UNIX socket for
+         * if_nametoindex()/if_indextoname(), and an AF_UNIX socket is a host
+         * passthrough here; the host answered SIOCGIFINDEX about *its* network,
+         * so every interface LKL has and the pod has not -- the sit0 tunnel is
+         * one -- looked missing (test_socket's testInterfaceNameIndex compared
+         * the netlink dump against that answer).
+         */
+        if (cmd == SIOCGIFINDEX || cmd == SIOCGIFNAME) {
+            long lkl_sock = kbox_lkl_socket(ctx->sysnrs, 2 /* AF_INET */,
+                                            2 /* SOCK_DGRAM */, 0);
+            uint8_t ifr[40];
+            pid_t pid = kbox_syscall_request_pid(req);
+            uint64_t arg_ptr = kbox_syscall_request_arg(req, 2);
+
+            if (lkl_sock < 0)
+                return kbox_dispatch_errno((int) (-lkl_sock));
+            if (arg_ptr == 0 ||
+                guest_mem_read(ctx, pid, arg_ptr, ifr, sizeof(ifr)) < 0) {
+                kbox_lkl_close(ctx->sysnrs, lkl_sock);
+                return kbox_dispatch_errno(EFAULT);
+            }
+            long iret = kbox_lkl_ioctl(ctx->sysnrs, lkl_sock, cmd, (long) ifr);
+
+            if (iret == 0 &&
+                guest_mem_write(ctx, pid, arg_ptr, ifr, sizeof(ifr)) < 0)
+                iret = -EFAULT;
+            kbox_lkl_close(ctx->sysnrs, lkl_sock);
+            return kbox_dispatch_from_lkl(iret);
+        }
+
+        /* Host-passthrough FD (stdin/stdout/stderr, pipe, eventfd, a pty from
+         * the container's own /dev, etc.). The host kernel owns it and can
+         * answer every ioctl itself, including the job-control ones. Answering
+         * ENOTTY for TIOCSCTTY here broke pty.fork(): musl's login_tty() runs
+         * setsid() and then TIOCSCTTY on the slave, and the tracee already is a
+         * session leader at that point, so the kernel accepts it.
+         */
+        return kbox_dispatch_continue();
+    }
+    if (lkl_fd < 0) {
+        if (!io_should_deny_fd(ctx, req, fd, lkl_fd))
+            return kbox_dispatch_continue();
+        return kbox_dispatch_errno(EBADF);
+    }
+
+    /* LKL-backed FD: the file lives in the guest kernel, so the ioctl must run
+     * there. Returning ENOTTY for everything made pty.fork() fail: musl's
+     * login_tty() issues TIOCSCTTY on the slave descriptor, got ENOTTY, and the
+     * child exited before it could run any test code -- which showed up as
+     * test_builtin's PtyTests and test_pty hanging forever on the result pipe.
+     * A regular file still answers ENOTTY; that answer now comes from LKL.
+     *
+     * TIOCSCTTY is the one exception. It makes the calling *host* process the
+     * leader of a session with this terminal, state that lives in the tracee's
+     * task_struct and that no LKL syscall can reach. LKL would apply it to its
+     * own worker thread instead. Answer success when LKL confirms the FD is a
+     * terminal, so the guest can finish login_tty(); everything the guest then
+     * does with the terminal (termios, window size, read, write) is real LKL
+     * state.
      */
-    return kbox_dispatch_errno(ENOTTY);
+    if (cmd == TIOCSCTTY) {
+        unsigned char tio[128];
+        if (kbox_lkl_ioctl(ctx->sysnrs, lkl_fd, TCGETS, (long) tio) < 0)
+            return kbox_dispatch_errno(ENOTTY);
+        return kbox_dispatch_value(0);
+    }
+    if (cmd == TIOCGPGRP || cmd == TIOCSPGRP) {
+        /* The process group of the tracee is host state; LKL only knows its own
+         * worker threads. Report the tracee's own group, which is what a guest
+         * expects to read back, and accept any value on write. */
+        if (cmd == TIOCGPGRP) {
+            pid_t pgrp = getpgid(kbox_syscall_request_pid(req));
+            uint64_t remote = kbox_syscall_request_arg(req, 2);
+            if (remote == 0)
+                return kbox_dispatch_errno(EFAULT);
+            if (pgrp < 0)
+                pgrp = kbox_syscall_request_pid(req);
+            if (guest_mem_write(ctx, kbox_syscall_request_pid(req), remote,
+                                &pgrp, sizeof(pgrp)) < 0)
+                return kbox_dispatch_errno(EFAULT);
+            return kbox_dispatch_value(0);
+        }
+        return kbox_dispatch_value(0);
+    }
+
+    long ret = kbox_lkl_ioctl(ctx->sysnrs, lkl_fd, cmd,
+                              (long) kbox_syscall_request_arg(req, 2));
+    return kbox_dispatch_from_lkl(ret);
 }
 
 /* Intercepted FD-creating syscalls: eventfd, timerfd_create, epoll_create1.

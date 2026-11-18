@@ -20,8 +20,8 @@ static void crash_handler(int sig)
     void *frames[64];
     int n = backtrace(frames, 64);
 
-    const char *name = sig == SIGSEGV ? "SIGSEGV"
-                       : sig == SIGBUS ? "SIGBUS"
+    const char *name = sig == SIGSEGV   ? "SIGSEGV"
+                       : sig == SIGBUS  ? "SIGBUS"
                        : sig == SIGABRT ? "SIGABRT"
                                         : "signal";
     write(STDERR_FILENO, "kbox: fatal: ", 13);
@@ -35,6 +35,14 @@ int main(int argc, char *argv[])
 {
     struct sigaction sa;
     struct kbox_image_args args;
+
+    /* A write to a socket whose peer has gone must fail with EPIPE, not kill
+     * the supervisor. The bridge writes into the tracee's socketpair ends and
+     * sendfile writes into them too; the peer closes in ordinary tests (and in
+     * ordinary programs), and the default disposition turned that into exit
+     * status 141 with every container in the daemon frozen.
+     */
+    signal(SIGPIPE, SIG_IGN);
 
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = crash_handler;

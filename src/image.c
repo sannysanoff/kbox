@@ -603,6 +603,8 @@ static void init_launch_ctx(struct kbox_supervisor_ctx *ctx,
     ctx->override_uid = (uid_t) -1;
     ctx->override_gid = (gid_t) -1;
     ctx->normalize = args->normalize;
+    /* Conventional default, matching the value the guest's init inherits. */
+    ctx->guest_umask = 022;
     ctx->guest_mem_ops = &kbox_current_guest_mem_ops;
     ctx->active_guest_mem.ops = &kbox_current_guest_mem_ops;
     ctx->active_guest_mem.opaque = 0;
@@ -919,6 +921,10 @@ int kbox_run_image(const struct kbox_image_args *args)
             kbox_net_cleanup();
         return -1;
     }
+
+    /* Make the guest wall clock match the host before anything stamps a
+     * file with "now". */
+    kbox_sync_guest_realtime();
 
     /* Mount the filesystem. */
     opts = join_mount_opts(args, opts_buf, sizeof(opts_buf));
@@ -1575,10 +1581,15 @@ int kbox_run_image(const struct kbox_image_args *args)
             }
         }
 
-        maybe_apply_virtual_procinfo_fast_path(exec_memfd, command,
-                                               args->verbose);
-        maybe_apply_virtual_procinfo_fast_path(interp_memfd, "PT_INTERP",
-                                               args->verbose);
+        /* Seccomp-notify mode reports real PIDs and TIDs (see the getpid
+         * branch of the dispatcher): /proc/self/task, PID files, setxid and
+         * kernel si_pid all have to agree with what the guest sees. Patching
+         * getpid() in the binary to return the constant 1 contradicted that:
+         * os.kill(os.getpid(), sig) then asked the kernel to signal host PID 1,
+         * which either failed or, worse, targeted the wrong process. The
+         * constant-pid patches stay for trap/rewrite modes, where the whole
+         * PID space is virtual.
+         */
 
         /* Fork, seccomp, exec, supervise. */
         rc = kbox_run_supervisor_volumes(

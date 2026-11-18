@@ -309,6 +309,8 @@ struct kbox_dispatch forward_umask(const struct kbox_syscall_request *req,
 {
     long mask = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long ret = kbox_lkl_umask(ctx->sysnrs, mask);
+    if (ret >= 0)
+        ctx->guest_umask = (unsigned) ((unsigned long) mask & 0777UL);
     return kbox_dispatch_from_lkl(ret);
 }
 
@@ -367,10 +369,46 @@ int dispatch_vcred_identity(const struct kbox_syscall_request *req,
         int rc = kbox_vcred_setresgid(pid, a0, a1, a2);
         *out = rc ? kbox_dispatch_errno(-rc) : kbox_dispatch_value(0);
     } else if (nr == h->setgroups) {
-        *out = kbox_vcred_may_setgid(pid) ? kbox_dispatch_value(0)
-                                          : kbox_dispatch_errno(EPERM);
+        long n = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+        uint64_t list = kbox_syscall_request_arg(req, 1);
+        uint32_t groups[KBOX_VCRED_MAX_GROUPS];
+
+        if (!kbox_vcred_may_setgid(pid)) {
+            *out = kbox_dispatch_errno(EPERM);
+        } else if (n < 0 || n > KBOX_VCRED_MAX_GROUPS) {
+            *out = kbox_dispatch_errno(EINVAL);
+        } else if (n > 0 &&
+                   (list == 0 ||
+                    guest_mem_read(ctx, pid, list, groups,
+                                   (size_t) n * sizeof(uint32_t)) < 0)) {
+            *out = kbox_dispatch_errno(EFAULT);
+        } else {
+            int rc = kbox_vcred_setgroups(pid, (size_t) n, groups);
+            *out = rc ? kbox_dispatch_errno(-rc) : kbox_dispatch_value(0);
+        }
     } else if (nr == h->getgroups) {
-        *out = forward_getgroups_override(req, ctx, c.egid);
+        long size = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+        uint64_t list = kbox_syscall_request_arg(req, 1);
+        uint32_t groups[KBOX_VCRED_MAX_GROUPS];
+
+        if (size < 0) {
+            *out = kbox_dispatch_errno(EINVAL);
+        } else if (size == 0) {
+            *out = kbox_dispatch_value(kbox_vcred_group_count(pid));
+        } else if (list == 0) {
+            *out = kbox_dispatch_errno(EFAULT);
+        } else {
+            int cnt = kbox_vcred_getgroups(pid, (size_t) size, groups);
+            if (cnt < 0) {
+                *out = kbox_dispatch_errno(-cnt);
+            } else if (cnt > 0 &&
+                       guest_mem_write(ctx, pid, list, groups,
+                                       (size_t) cnt * sizeof(uint32_t)) < 0) {
+                *out = kbox_dispatch_errno(EFAULT);
+            } else {
+                *out = kbox_dispatch_value(cnt);
+            }
+        }
     } else {
         return 0;
     }

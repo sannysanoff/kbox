@@ -28,6 +28,8 @@
 #include <errno.h>
 #include <fcntl.h>
 /* seccomp types via seccomp.h -> seccomp-defs.h */
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +43,7 @@
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -74,6 +77,26 @@
 #define __NR_statx 332
 #elif defined(__aarch64__) || (defined(__riscv) && (__riscv_xlen == 64))
 #define __NR_statx 291
+#endif
+#endif
+
+#ifndef __NR_truncate
+#if defined(__x86_64__)
+#define __NR_truncate 76
+#elif defined(__aarch64__) || (defined(__riscv) && (__riscv_xlen == 64))
+#define __NR_truncate 45
+#endif
+#endif
+#ifndef __NR_sched_rr_get_interval
+#define __NR_sched_rr_get_interval 127
+#endif
+#ifndef __NR_preadv2
+#if defined(__x86_64__)
+#define __NR_preadv2 287
+#define __NR_pwritev2 328
+#elif defined(__aarch64__) || (defined(__riscv) && (__riscv_xlen == 64))
+#define __NR_preadv2 287
+#define __NR_pwritev2 288
 #endif
 #endif
 
@@ -403,8 +426,12 @@ static long ctx_close_lkl_if_unreferenced(struct kbox_supervisor_ctx *ctx,
         return 0;
     if (ctx_lkl_fd_ref_count(ctx, lkl_fd) != 0)
         return 0;
-    if (maybe_net_socket)
-        kbox_net_deregister_socket((int) lkl_fd);
+    if (maybe_net_socket && kbox_net_deregister_socket((int) lkl_fd)) {
+        /* The bridge closes it once its last bytes are out. The descriptor is
+         * gone from the tracee, so no cached metadata may survive it. */
+        invalidate_stat_cache_fd(ctx, lkl_fd);
+        return 0;
+    }
     return lkl_close_and_invalidate(ctx, lkl_fd);
 }
 
@@ -560,6 +587,10 @@ static void dup_table_supervisor_fds(struct kbox_fd_table *t)
     }
 }
 
+static void sync_table_writebacks(struct kbox_supervisor_ctx *ctx,
+                                  struct kbox_fd_table *t,
+                                  int deregister);
+
 static void reap_dead_proc_fds(struct kbox_supervisor_ctx *ctx)
 {
     if (!ctx || !ctx->proc_fds)
@@ -573,10 +604,18 @@ static void reap_dead_proc_fds(struct kbox_supervisor_ctx *ctx)
         pid_t tgid = ctx->proc_fds[i].tgid;
         char state = '\0';
         int rc = read_proc_tgid_ppid(tgid, NULL, NULL, &state);
-        int alive = (rc == 0 && state != 'Z' && state != 'X');
-        if (!alive && kill(tgid, 0) == 0 && rc == 0 && state != 'Z' &&
-            state != 'X')
-            alive = 1;
+        int alive;
+
+        /* A failed /proc read is not proof of death. Freeing the FD table of a
+         * live process hands its next syscall a dangling table, which surfaces
+         * as arbitrary memory corruption (CPython crashed inside the pickle
+         * module while a multiprocessing pool churned through workers). Only a
+         * definite zombie, or a tgid the kernel rejects, counts as dead.
+         */
+        if (rc < 0)
+            alive = kill(tgid, 0) == 0 || errno == EPERM;
+        else
+            alive = state != 'Z' && state != 'X';
         if (alive) {
             i++;
             continue;
@@ -595,6 +634,13 @@ static void reap_dead_proc_fds(struct kbox_supervisor_ctx *ctx)
                 ctx->pid_tgid_cache[c].tgid = 0;
             }
         }
+        /* A process killed by a signal never reaches exit_group, so nothing
+         * flushed the writable shadows of its own descriptor table. Reaping it
+         * is the last moment those memfds can be copied back; after free() the
+         * data is gone. faulthandler's crash tests write the traceback from the
+         * dying child and the parent reads it once waitpid returns.
+         */
+        sync_table_writebacks(ctx, dead_tab, 1);
         release_table_entries_close_lkl(ctx, dead_tab);
         free(dead_tab);
     }
@@ -905,6 +951,10 @@ void kbox_dispatch_prepare_request_ctx(struct kbox_supervisor_ctx *ctx,
             ctx->fd_inject_ops = &seccomp_fd_inject_ops;
         }
     }
+    if (ctx->pending_reap) {
+        ctx->pending_reap = 0;
+        reap_dead_proc_fds(ctx);
+    }
     if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP)
         select_proc_fd_table(ctx, req->pid);
 }
@@ -1086,6 +1136,17 @@ static bool should_continue_virtual_path(const struct kbox_supervisor_ctx *ctx,
         return false;
     return kbox_is_lkl_virtual_path(translated) &&
            guest_path_is_absolute(ctx, req, path_idx);
+}
+
+/* Public wrapper: other dispatch units need the same host/LKL decision that
+ * openat makes, so that linkat, renameat and friends stay on the backing the
+ * path belongs to. */
+int kbox_path_is_host_passthrough(const struct kbox_supervisor_ctx *ctx,
+                                  const struct kbox_syscall_request *req,
+                                  size_t path_idx,
+                                  const char *translated)
+{
+    return should_continue_virtual_path(ctx, req, path_idx, translated) ? 1 : 0;
 }
 
 /* Resolve dirfd for *at() syscalls.
@@ -2171,9 +2232,21 @@ static int find_writeback_sp_in_range(const struct kbox_supervisor_ctx *ctx,
 
         if (cand->lkl_fd < 0 || !cand->shadow_writeback || cand->shadow_sp < 0)
             continue;
-        if (cand->lkl_fd == target_lkl_fd)
+        if (cand->lkl_fd == target_lkl_fd) {
+            if (getenv("KBOX_FD_TRACE"))
+                fprintf(stderr,
+                        "kbofdt: shadow match by fd lkl=%ld sp=%d "
+                        "target_dev=%llu target_ino=%llu\n",
+                        target_lkl_fd, cand->shadow_sp,
+                        (unsigned long long) target_st->st_dev,
+                        (unsigned long long) target_st->st_ino);
             return cand->shadow_sp;
+        }
         memset(&cand_st, 0, sizeof(cand_st));
+        if (getenv("KBOX_FD_TRACE"))
+            fprintf(stderr,
+                    "kbofdt: shadow candidate lkl=%ld sp=%d (target lkl=%ld)\n",
+                    cand->lkl_fd, cand->shadow_sp, target_lkl_fd);
         if (kbox_lkl_fstat(ctx->sysnrs, cand->lkl_fd, &cand_st) == 0 &&
             cand_st.st_dev == target_st->st_dev &&
             cand_st.st_ino == target_st->st_ino) {
@@ -2181,6 +2254,52 @@ static int find_writeback_sp_in_range(const struct kbox_supervisor_ctx *ctx,
         }
     }
     return -1;
+}
+
+/* Find the writable shadow of the file a path stat just described.
+ *
+ * A writable open copies the file into a supervisor memfd and copies it back
+ * only when the descriptor is closed, so until then the LKL inode still carries
+ * the old size and timestamps. Reporting those made stat() lie about a file the
+ * guest was writing: gdbm's test_reorganize compares getsize() before and after
+ * a write and saw no change. Matching by device and inode is how the read path
+ * already finds the live copy.
+ */
+static int find_writeback_shadow_for_stat(const struct kbox_supervisor_ctx *ctx,
+                                          const struct kbox_lkl_stat *target_st)
+{
+    int sp;
+
+    if (!ctx || !ctx->fd_table || ctx->active_writeback_shadows == 0 ||
+        !target_st)
+        return -1;
+    sp = find_writeback_sp_in_range(ctx, ctx->fd_table->low_fds,
+                                    KBOX_LOW_FD_MAX, -1, target_st);
+    if (sp >= 0)
+        return sp;
+    sp = find_writeback_sp_in_range(ctx, ctx->fd_table->mid_fds,
+                                    KBOX_MID_FD_MAX, -1, target_st);
+    if (sp >= 0)
+        return sp;
+    return find_writeback_sp_in_range(ctx, ctx->fd_table->entries,
+                                      KBOX_FD_TABLE_MAX, -1, target_st);
+}
+
+/* Overlay the live shadow's size and timestamps on a path stat. */
+static void apply_writeback_shadow_stat(struct kbox_supervisor_ctx *ctx,
+                                        const struct kbox_lkl_stat *kst,
+                                        struct stat *host_stat)
+{
+    struct stat sst;
+    int sp = find_writeback_shadow_for_stat(ctx, kst);
+
+    if (sp < 0 || fstat(sp, &sst) < 0)
+        return;
+    host_stat->st_size = sst.st_size;
+    host_stat->st_blocks = sst.st_blocks;
+    host_stat->st_atim = sst.st_atim;
+    host_stat->st_mtim = sst.st_mtim;
+    host_stat->st_ctim = sst.st_ctim;
 }
 
 int kbox_find_active_writeback_shadow_sp(struct kbox_supervisor_ctx *ctx,
@@ -2245,6 +2364,34 @@ int kbox_reopen_writeback_shadow_ro(struct kbox_supervisor_ctx *ctx,
  *   0  shadow promotion not applicable
  *  -1  promotion attempted but failed
  */
+/* Largest file kbox copies into a shadow memfd.
+ *
+ * A writable open makes a private copy of the file, and a read open does the
+ * same lazily, so that one descriptor's writes and another descriptor's reads
+ * agree while both are open. That copy is linear in file size, and the copy
+ * back at close materializes every hole. A sparse 2 GiB file (test_largefile)
+ * therefore turned into 2 GiB of RAM and 2 GiB of real blocks in the guest --
+ * which the guest filesystem cannot hold, so the copy back failed with ENOSPC
+ * and the last bytes of the file were silently lost.
+ *
+ * Above the cap the file stays a plain LKL file: reads, writes and seeks go
+ * through the guest kernel, which is exactly the semantics a syscall shim
+ * should give. The cap is far above anything the coherency fix was for (small
+ * config, database and log files written by several descriptors).
+ */
+#define KBOX_SHADOW_MAX_BYTES (16LL * 1024 * 1024)
+
+/* 1 when the file is small enough to shadow. */
+static int shadow_size_ok(struct kbox_supervisor_ctx *ctx, long lkl_fd)
+{
+    struct kbox_lkl_stat st;
+
+    memset(&st, 0, sizeof(st));
+    if (kbox_lkl_fstat(ctx->sysnrs, lkl_fd, &st) < 0)
+        return 0;
+    return st.st_size <= KBOX_SHADOW_MAX_BYTES;
+}
+
 int ensure_same_fd_shadow(struct kbox_supervisor_ctx *ctx,
                           const struct kbox_syscall_request *req,
                           long fd,
@@ -2271,6 +2418,8 @@ int ensure_same_fd_shadow(struct kbox_supervisor_ctx *ctx,
 
     flags = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, F_GETFL, 0);
     if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY)
+        return 0;
+    if (!shadow_size_ok(ctx, lkl_fd))
         return 0;
 
     if (!kbox_reopen_writeback_shadow_ro(ctx, lkl_fd, &memfd)) {
@@ -2301,6 +2450,14 @@ int ensure_same_fd_shadow(struct kbox_supervisor_ctx *ctx,
                 fd, lkl_fd,
                 entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW ? "same-fd"
                                                               : "local-only");
+    }
+    if (getenv("KBOX_FD_TRACE")) {
+        struct stat sst;
+
+        memset(&sst, 0, sizeof(sst));
+        (void) fstat(memfd, &sst);
+        fprintf(stderr, "kbofdt: ro_shadow fd=%ld lkl=%ld sp=%d copied=%lld\n",
+                fd, lkl_fd, memfd, (long long) sst.st_size);
     }
     return 1;
 }
@@ -2437,8 +2594,15 @@ static struct kbox_dispatch finish_open_dispatch(
         lkl_close_and_invalidate(ctx, lkl_fd);
         return kbox_dispatch_errno(EMFILE);
     }
-    fprintf(stderr, "kboxdbg: open %s -> vfd=%ld lkl=%ld\n",
-            translated ? translated : "?", vfd, lkl_fd);
+    if (ctx->verbose)
+        fprintf(stderr, "kbox: open %s -> vfd=%ld lkl=%ld\n",
+                translated ? translated : "?", vfd, lkl_fd);
+    if (getenv("KBOX_FD_TRACE"))
+        fprintf(stderr,
+                "kbofdt: guest_open path=%s vfd=%ld lkl=%ld "
+                "flags=%#lx\n",
+                translated ? translated : "?", vfd, lkl_fd,
+                (unsigned long) flags);
     if (flags & O_CLOEXEC)
         kbox_fd_table_set_cloexec(ctx->fd_table, vfd, 1);
     return kbox_dispatch_value((int64_t) vfd);
@@ -2696,6 +2860,10 @@ void note_shadow_writeback_open(struct kbox_supervisor_ctx *ctx,
     entry->shadow_writeback = 1;
     ctx->active_writeback_shadows++;
     invalidate_path_shadow_cache(ctx);
+    if (getenv("KBOX_FD_TRACE"))
+        fprintf(stderr, "kbofdt: note_open entry=%p lkl=%ld sp=%d active=%u\n",
+                (void *) entry, entry->lkl_fd, entry->shadow_sp,
+                (unsigned) ctx->active_writeback_shadows);
 }
 
 void note_shadow_writeback_close(struct kbox_supervisor_ctx *ctx,
@@ -2706,6 +2874,10 @@ void note_shadow_writeback_close(struct kbox_supervisor_ctx *ctx,
     entry->shadow_writeback = 0;
     if (ctx->active_writeback_shadows > 0)
         ctx->active_writeback_shadows--;
+    if (getenv("KBOX_FD_TRACE"))
+        fprintf(stderr, "kbofdt: note_close entry=%p lkl=%ld sp=%d active=%u\n",
+                (void *) entry, entry->lkl_fd, entry->shadow_sp,
+                (unsigned) ctx->active_writeback_shadows);
 }
 
 static void sync_cloexec_writebacks_in_range(struct kbox_supervisor_ctx *ctx,
@@ -2726,6 +2898,34 @@ static void sync_cloexec_writebacks_in_range(struct kbox_supervisor_ctx *ctx,
                 (void) sync_shadow_writeback(ctx, entry);
                 note_shadow_writeback_close(ctx, entry);
             }
+        }
+    }
+}
+
+/* Flush every pending writable shadow in one FD-table range.
+ *
+ * deregister == 0 keeps the entry registered, so a later close still copies
+ * the data it holds. That is what a thread exit needs: the thread goes away,
+ * the process and its descriptors do not.
+ */
+
+static void sync_all_writebacks_in_range(struct kbox_supervisor_ctx *ctx,
+                                         struct kbox_fd_entry *entries,
+                                         long count,
+                                         int deregister)
+{
+    long i;
+
+    if (!ctx || !entries)
+        return;
+    for (i = 0; i < count; i++) {
+        struct kbox_fd_entry *entry = &entries[i];
+
+        if (entry->lkl_fd >= 0 && entry->shadow_writeback) {
+            (void) sync_shadow_writeback(ctx, entry);
+            if (deregister)
+                note_shadow_writeback_close(ctx, entry);
+            invalidate_stat_cache_fd(ctx, entry->lkl_fd);
         }
     }
 }
@@ -2768,6 +2968,35 @@ void close_cloexec_with_writeback(struct kbox_supervisor_ctx *ctx)
                         KBOX_FD_BASE);
 }
 
+/* Flush every writable shadow before a process leaves.
+ *
+ * A shadow writes into a memfd owned by the supervisor, and the memfd is only
+ * copied back to the LKL file on close(2). Process exit closes descriptors
+ * inside the kernel without a close syscall, so `sh -c 'tr ... > file'`
+ * produced an empty file: the child wrote the data, exited, and the copy
+ * stayed in the supervisor's memfd. Nothing else can observe it, and the next
+ * open of that path reads the untouched LKL file. Flushing every pending
+ * shadow is safe: the copy is idempotent, and a shadow that is still being
+ * written is flushed again when its own owner closes it.
+ */
+static void sync_table_writebacks(struct kbox_supervisor_ctx *ctx,
+                                  struct kbox_fd_table *t,
+                                  int deregister)
+{
+    if (!ctx || !t)
+        return;
+
+    sync_all_writebacks_in_range(ctx, t->low_fds, KBOX_LOW_FD_MAX, deregister);
+    sync_all_writebacks_in_range(ctx, t->mid_fds, KBOX_MID_FD_MAX, deregister);
+    sync_all_writebacks_in_range(ctx, t->entries, KBOX_FD_TABLE_MAX,
+                                 deregister);
+}
+
+void sync_all_writeback_shadows(struct kbox_supervisor_ctx *ctx, int deregister)
+{
+    sync_table_writebacks(ctx, ctx->fd_table, deregister);
+}
+
 static long remove_fd_table_entry_with_writeback(
     struct kbox_supervisor_ctx *ctx,
     long fd)
@@ -2801,18 +3030,62 @@ int try_writeback_shadow_open(struct kbox_supervisor_ctx *ctx,
         return 0;
     if ((flags & O_ACCMODE) == O_RDONLY)
         return 0;
-    /* O_APPEND must keep the kernel's append semantics on the real file: the
-     * writable shadow is an independent copy with its own offset, so appending
-     * to it and copying back leaves holes (logs written after truncation get a
-     * NUL prefix the size of the data). Keep O_APPEND writes on the LKL FD.
-     */
-    if (flags & O_APPEND)
+    if (!shadow_size_ok(ctx, lkl_fd))
         return 0;
     if (kbox_is_lkl_virtual_path(translated) ||
         kbox_is_tty_like_path(translated))
         return 0;
 
-    memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
+    /* A second writable open of a file that already has a writeback shadow
+     * has to see the same bytes. Copying the file again would give this FD a
+     * private snapshot: a writer that closes one shadow flushes to LKL, while
+     * the other descriptor keeps reading the copy it made at open time, so a
+     * write followed by a read through a different FD lost the data. Open a
+     * new description of the existing memfd instead: same inode (one copy of
+     * the data), independent file offset.
+     */
+    memfd = -1;
+    {
+        int reuse_sp = kbox_find_active_writeback_shadow_sp(ctx, lkl_fd);
+
+        if (getenv("KBOX_FD_TRACE"))
+            fprintf(stderr,
+                    "kbofdt: wb_open lkl=%ld flags=%#lx path=%s active=%u "
+                    "reuse_sp=%d\n",
+                    lkl_fd, (unsigned long) flags, translated,
+                    ctx->active_writeback_shadows, reuse_sp);
+        if (reuse_sp >= 0) {
+            int dirfd = ensure_proc_self_fd_dir(ctx);
+            if (dirfd >= 0) {
+                char fd_name[32];
+                snprintf(fd_name, sizeof(fd_name), "%d", reuse_sp);
+                memfd = openat(dirfd, fd_name, O_RDWR | O_CLOEXEC);
+            }
+            if (memfd >= 0 && (flags & O_TRUNC) && ftruncate(memfd, 0) < 0) {
+                close(memfd);
+                memfd = -1;
+            }
+        }
+    }
+    /* An O_APPEND open with no shadow to share must keep the kernel's append
+     * semantics on the real file: a fresh shadow is an independent copy with
+     * its own offset, so appending to it and copying back leaves holes (logs
+     * written after truncation get a NUL prefix the size of the data). When a
+     * shadow does exist, sharing it is the only correct answer: keeping the
+     * append on the LKL file let the other shadow's writeback overwrite the
+     * appended bytes, so a write through one descriptor disappeared when the
+     * other was closed (test_io's threaded writers).
+     */
+    if (memfd < 0 && (flags & O_APPEND)) {
+        if (getenv("KBOX_FD_TRACE"))
+            fprintf(stderr,
+                    "kbofdt: wb_open lkl=%ld path=%s: append with no shadow, "
+                    "staying on the LKL file\n",
+                    lkl_fd, translated);
+        return 0;
+    }
+    if (memfd < 0)
+        memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
     if (memfd < 0)
         return 0;
     /* Do NOT seal: this shadow is for a writable FD; the tracee needs
@@ -2884,6 +3157,14 @@ int try_writeback_shadow_open(struct kbox_supervisor_ctx *ctx,
     entry = fd_table_entry(ctx->fd_table, injected);
     entry->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
     entry->shadow_sp = memfd;
+    {
+        struct stat sst;
+        if (fstat(memfd, &sst) == 0) {
+            entry->shadow_mtime_sec = (long) sst.st_mtim.tv_sec;
+            entry->shadow_mtime_nsec = (long) sst.st_mtim.tv_nsec;
+            entry->shadow_size = (long) sst.st_size;
+        }
+    }
     note_shadow_writeback_open(ctx, entry);
     if (ctx->verbose) {
         fprintf(stderr,
@@ -2914,7 +3195,7 @@ static struct kbox_dispatch forward_getdents_common(
     int wrc;
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -2952,14 +3233,81 @@ static int dup_tracee_fd_shared(pid_t pid, int tracee_fd);
 /* Gate a CONTINUE syscall that takes an FD in arg0.  Deny if the FD is
  * untracked and in a blocked range; otherwise let the host kernel handle it.
  */
+/* How long a readiness call waits for the bridge pump to drain. A pass is
+ * microseconds of work; the bound only keeps a wedged pump from hanging the
+ * guest's poll.
+ */
+#define KBOX_READY_WAIT_MS 5
+
 static struct kbox_dispatch forward_fd_gated_continue(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx)
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
-    if (fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))
+    if (io_should_deny_fd(ctx, req, fd, lkl_fd))
         return kbox_dispatch_errno(EBADF);
+    /* epoll_wait/epoll_pwait: a bridged socket's peer bytes only reach the
+     * guest's end of the socketpair when the pump moves them. Let the pump
+     * finish, bounded, before the kernel measures readiness. */
+    kbox_net_wait_until_quiet(KBOX_READY_WAIT_MS);
+    return kbox_dispatch_continue();
+}
+
+/* Does this poll/ppoll ask about readability?
+ *
+ * Only readability justifies waiting for the bridge: the guest's socketpair end
+ * becomes readable when the pump delivers, and a poll that arrives before that
+ * delivery would report the fd as not readable. Writability is the socketpair's
+ * own state and waiting for the bridge to drain would *change* it: a socket
+ * whose peer has stopped reading looked writable for longer, and
+ * test_socket.SendfileUsingSendTest.testWithTimeoutTriggeredSend then never hit
+ * its ten-millisecond send timeout (it ran into the peer's close instead,
+ * BrokenPipeError).
+ */
+static int poll_wants_read(const struct kbox_syscall_request *req,
+                           struct kbox_supervisor_ctx *ctx)
+{
+    uint64_t fds_ptr = kbox_syscall_request_arg(req, 0);
+    long nfds = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+    pid_t pid = kbox_syscall_request_pid(req);
+    uint8_t raw[8 * 32];
+
+    if (!fds_ptr || nfds <= 0 || nfds > 32)
+        return 1;
+    if (guest_mem_read(ctx, pid, fds_ptr, raw, (size_t) nfds * 8) < 0)
+        return 1;
+    for (long i = 0; i < nfds; i++) {
+        short events;
+
+        /* struct pollfd { int fd; short events; short revents; } */
+        memcpy(&events, raw + (size_t) i * 8 + 4, sizeof(events));
+        if (events & (POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND))
+            return 1;
+    }
+    return 0;
+}
+
+/* poll/ppoll/pselect6 wait for readiness on descriptors the host kernel owns.
+ *
+ * A bridged socket is a socketpair end whose peer bytes arrive through the
+ * bridge pump, so a poll that lands between a completed write and the pump's
+ * next pass would report writability alone. An edge-triggered waiter then
+ * collects a stale EPOLLOUT and loses the readable edge
+ * (test_epoll.test_control_and_wait). The wait is delegated to the pump: this
+ * thread holds no bridge lock and runs no LKL code, so the pump keeps making
+ * progress.
+ */
+static struct kbox_dispatch forward_readiness_gated(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    /* pselect6 (and a poll whose array cannot be read) waits unconditionally:
+     * its readiness sets are bitmaps, and it is rare enough not to matter. */
+    long style = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+
+    if (style <= 0 || poll_wants_read(req, ctx))
+        kbox_net_wait_until_quiet(KBOX_READY_WAIT_MS);
     return kbox_dispatch_continue();
 }
 
@@ -2979,8 +3327,8 @@ static struct kbox_dispatch forward_epoll_ctl_gated(
      * inherited from the postmaster, and kbox had no entry for that number, so
      * the backend died before it could serve a single query.
      */
-    if (fd_should_deny_io_ctx(ctx->fd_table, epfd, lkl_ep) ||
-        fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)) {
+    if (io_should_deny_fd(ctx, req, epfd, lkl_ep) ||
+        io_should_deny_fd(ctx, req, fd, lkl_fd)) {
         if (getenv("KBOX_NET_TRACE"))
             fprintf(stderr,
                     "kbox: epoll_ctl untracked epfd=%ld lkl_ep=%ld fd=%ld "
@@ -3099,18 +3447,77 @@ static struct kbox_dispatch emulate_host_open_tracked(
     translate_proc_self_at(supervisor_dirfd, path, pid, sv_path,
                            sizeof(sv_path));
 
+    /* A file created here is created by the supervisor's kernel, which applies
+     * the supervisor's umask. The guest set its own umask, and a program that
+     * asks for 0666 with umask 0 expects 0666 (test_pathlib.test_open_mode,
+     * test_shutil.test_copytree_retains_permissions), so remember whether this
+     * call creates the file and fix the mode afterwards.
+     */
+    int created_here = 0;
+    if ((host_flags & O_CREAT) &&
+        !(host_flags & (O_PATH | O_EXCL | O_TMPFILE))) {
+        struct stat pre_st;
+
+        if (fstatat(supervisor_dirfd, sv_path, &pre_st, AT_SYMLINK_NOFOLLOW) <
+                0 &&
+            errno == ENOENT)
+            created_here = 1;
+    }
+
     int host_fd =
         openat(supervisor_dirfd, sv_path, host_flags & ~O_CLOEXEC, mode);
-    if (host_fd < 0)
+    if (host_fd >= 0 && created_here) {
+        mode_t want = (mode_t) ((unsigned) mode & ~ctx->guest_umask & 07777U);
+
+        (void) fchmod(host_fd, want);
+    }
+    if (host_fd < 0) {
+        if (ctx->verbose)
+            fprintf(stderr,
+                    "kbox: host openat(dirfd=%d, %s, flags=0x%x mode=0%o) "
+                    "-> errno %d\n",
+                    supervisor_dirfd, sv_path, host_flags, (unsigned) mode,
+                    errno);
         return kbox_dispatch_errno(errno);
+    }
 
     uint32_t af = (host_flags & O_CLOEXEC) ? O_CLOEXEC : 0;
     int tracee_fd = request_addfd(ctx, req, host_fd, af);
+    int opath_emulated = 0;
+
+    /* The host kernel since 7.x refuses to install an O_PATH descriptor with
+     * SECCOMP_IOCTL_NOTIF_ADDFD: the ioctl answers EBADF even though the
+     * supervisor's own openat succeeded. Reopen without O_PATH and remember
+     * the flag. The guest still gets a usable descriptor for fstat, fchmod,
+     * fchdir and *at() calls; the one thing it loses is the read/write
+     * refusal that O_PATH implies (Linux answers EBADF there), which nothing
+     * in the Python test suite exercises. O_PATH|O_NOFOLLOW on a symlink is
+     * the other difference: the reopen follows the link and fails with
+     * ELOOP on a dangling one.
+     */
+    if (tracee_fd == -EBADF && (host_flags & O_PATH)) {
+        close(host_fd);
+        int retry_flags =
+            (host_flags & ~(O_PATH | O_ACCMODE)) | O_RDONLY | O_NONBLOCK;
+        host_fd =
+            openat(supervisor_dirfd, sv_path, retry_flags & ~O_CLOEXEC, mode);
+        if (host_fd < 0)
+            return kbox_dispatch_errno(errno);
+        tracee_fd = request_addfd(ctx, req, host_fd, af);
+        opath_emulated = 1;
+    }
+
     close(host_fd);
-    if (tracee_fd < 0)
+    if (tracee_fd < 0) {
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: host openat(%s, flags=0x%x) addfd -> %d\n",
+                    sv_path, host_flags, tracee_fd);
         return kbox_dispatch_errno(-tracee_fd);
+    }
 
     track_host_passthrough_fd(ctx->fd_table, tracee_fd);
+    if (opath_emulated)
+        kbox_fd_table_set_opath(ctx->fd_table, tracee_fd, 1);
     if (host_flags & O_CLOEXEC)
         kbox_fd_table_set_cloexec(ctx->fd_table, tracee_fd, 1);
     return kbox_dispatch_value(tracee_fd);
@@ -3153,6 +3560,13 @@ static struct kbox_dispatch emulate_host_at_open_tracked(
 
 /* forward_openat. */
 
+static int fd_magic_link_fd(const char *path, long *out_fd);
+static int try_open_virtual_fd_link(struct kbox_supervisor_ctx *ctx,
+                                    const struct kbox_syscall_request *req,
+                                    const char *translated,
+                                    long flags,
+                                    struct kbox_dispatch *out);
+
 static struct kbox_dispatch forward_openat(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx)
@@ -3173,6 +3587,13 @@ static struct kbox_dispatch forward_openat(
         return emulate_host_at_open_tracked(ctx, req, raw_dirfd, lkl_dirfd,
                                             translated, host_flags_raw,
                                             (mode_t) mode);
+    }
+
+    {
+        struct kbox_dispatch fd_link_out;
+
+        if (try_open_virtual_fd_link(ctx, req, translated, flags, &fd_link_out))
+            return fd_link_out;
     }
 
     if (should_continue_virtual_path(ctx, req, 1, translated) ||
@@ -3222,6 +3643,14 @@ static struct kbox_dispatch forward_openat2(
         return emulate_host_at_open_tracked(ctx, req, raw_dirfd, lkl_dirfd,
                                             translated, host_flags2_raw,
                                             (mode_t) how.mode);
+    }
+
+    {
+        struct kbox_dispatch fd_link_out;
+
+        if (try_open_virtual_fd_link(ctx, req, translated, (long) how.flags,
+                                     &fd_link_out))
+            return fd_link_out;
     }
 
     if (should_continue_virtual_path(ctx, req, 1, translated) ||
@@ -3278,6 +3707,13 @@ static struct kbox_dispatch forward_open_legacy(
                                             (mode_t) mode);
     }
 
+    {
+        struct kbox_dispatch fd_link_out;
+
+        if (try_open_virtual_fd_link(ctx, req, translated, flags, &fd_link_out))
+            return fd_link_out;
+    }
+
     if (should_continue_virtual_path(ctx, req, 0, translated) ||
         kbox_is_tty_like_path(translated))
         return emulate_host_open_tracked(ctx, req, AT_FDCWD, translated,
@@ -3300,12 +3736,448 @@ static struct kbox_dispatch forward_open_legacy(
     return finish_open_dispatch(ctx, req, ret, flags, translated);
 }
 
+/* Does this translated path name one of the tracee's descriptors? */
+static int fd_magic_link_fd(const char *path, long *out_fd)
+{
+    const char *p = NULL;
+    char *end = NULL;
+    long v;
+
+    if (!path)
+        return 0;
+    if (!strncmp(path, "/proc/", 6)) {
+        const char *q = path + 6;
+
+        if (!strncmp(q, "self/fd/", 8)) {
+            p = q + 8;
+        } else if (!strncmp(q, "thread-self/fd/", 15)) {
+            p = q + 15;
+        } else {
+            while (*q >= '0' && *q <= '9')
+                q++;
+            if (!strncmp(q, "/fd/", 4))
+                p = q + 4;
+        }
+    } else if (!strncmp(path, "/dev/fd/", 8)) {
+        p = path + 8;
+    }
+    if (!p || !*p)
+        return 0;
+    v = strtol(p, &end, 10);
+    if (end == p || (*end && *end != '/'))
+        return 0;
+    *out_fd = v;
+    return 1;
+}
+
+/* open("/proc/self/fd/N") where N is a kbox virtual descriptor.
+ *
+ * A virtual descriptor is not a host descriptor number, so the host's
+ * /proc/<pid>/fd/<N> does not exist and the open failed with ENOENT. CPython's
+ * test_cmd_line_script passes a script to a child as /dev/fd/N and expects the
+ * child to open it; shells and editors do the same with their own descriptors.
+ * Serve the open from the file kbox already holds for that descriptor: opening
+ * a magic link means "a new file description of the same file, at offset 0",
+ * which is exactly a fresh description of the shadow or of a copy of the guest
+ * file.
+ */
+static int try_open_virtual_fd_link(struct kbox_supervisor_ctx *ctx,
+                                    const struct kbox_syscall_request *req,
+                                    const char *translated,
+                                    long flags,
+                                    struct kbox_dispatch *out)
+{
+    long vfd;
+    struct kbox_fd_entry *e;
+    int sp = -1;
+    long target;
+    int injected;
+    struct kbox_fd_entry *ne;
+
+    if (!fd_magic_link_fd(translated, &vfd) || vfd < KBOX_FD_BASE)
+        return 0;
+    e = fd_table_entry(ctx->fd_table, vfd);
+    if (getenv("KBOX_FD_TRACE"))
+        fprintf(stderr,
+                "kbofdt: fdlink path=%s vfd=%ld entry=%p lkl=%ld sp=%d "
+                "flags=0x%lx\n",
+                translated, vfd, (void *) e, e ? e->lkl_fd : -99L,
+                e ? e->shadow_sp : -99, flags);
+    if (!e || e->lkl_fd < 0)
+        return 0;
+    if ((flags & O_ACCMODE) != O_RDONLY)
+        return 0;
+
+    if (e->shadow_sp >= 0) {
+        int dirfd = ensure_proc_self_fd_dir(ctx);
+
+        if (dirfd >= 0) {
+            char name[32];
+
+            snprintf(name, sizeof(name), "%d", e->shadow_sp);
+            sp = openat(dirfd, name, O_RDONLY | O_CLOEXEC);
+        }
+    }
+    if (sp < 0) {
+        sp = kbox_shadow_create(ctx->sysnrs, e->lkl_fd);
+        if (sp < 0)
+            return 0;
+        kbox_shadow_seal(sp);
+    }
+
+    target = allocate_shadow_fd_from(ctx, KBOX_FD_FAST_BASE);
+    if (target < 0) {
+        close(sp);
+        return 0;
+    }
+    injected = request_addfd_at(ctx, req, sp, (int) target,
+                                (flags & O_CLOEXEC) ? O_CLOEXEC : 0);
+    if (injected < 0) {
+        close(sp);
+        return 0;
+    }
+    if (kbox_fd_table_insert_at(ctx->fd_table, injected, e->lkl_fd, 0) < 0) {
+        close(sp);
+        *out = kbox_dispatch_errno(EMFILE);
+        return 1;
+    }
+    ne = fd_table_entry(ctx->fd_table, injected);
+    if (ne) {
+        ne->host_fd = KBOX_FD_HOST_SAME_FD_SHADOW;
+        ne->shadow_sp = sp;
+    } else {
+        close(sp);
+    }
+    *out = kbox_dispatch_value((int64_t) injected);
+    return 1;
+}
+
+/* Writeback of a writable shadow, off the dispatch thread.
+ *
+ * A writable open promotes the file to a memfd copy, and close(2) copies that
+ * copy back into the guest filesystem. The copy runs LKL calls, and in the pod
+ * one such call never returned: the tracee stayed in the kernel waiting for
+ * its close() answer, one daemon thread spun inside LKL, and the guest survived
+ * `docker rm -f` and took test_ssl, test_asyncio and test_socket down with it.
+ *
+ * The copy therefore runs in its own thread while the dispatch thread waits for
+ * it with a budget. A copy that finishes in time reports its result; a copy
+ * that outstays the budget is abandoned, the guest's close(2) reports success,
+ * and the LKL descriptor is retired from reuse so the abandoned call cannot
+ * write into a file that later receives the same number.
+ */
+
+/* Largest number of abandoned copies one supervisor keeps track of. Each one
+ * leaks an LKL descriptor on purpose; a container that wedges more files than
+ * this is beyond saving anyway. */
+#define KBOX_WB_ABANDONED_MAX 64
+#define KBOX_WB_DEFAULT_TIMEOUT 8
+
+static pthread_mutex_t kbox_wb_lock = PTHREAD_MUTEX_INITIALIZER;
+static long kbox_wb_abandoned_fd[KBOX_WB_ABANDONED_MAX];
+static int kbox_wb_abandoned_n;
+
+void kbox_lkl_fd_mark_abandoned(long lkl_fd)
+{
+    pthread_mutex_lock(&kbox_wb_lock);
+    if (kbox_wb_abandoned_n < KBOX_WB_ABANDONED_MAX)
+        kbox_wb_abandoned_fd[kbox_wb_abandoned_n++] = lkl_fd;
+    pthread_mutex_unlock(&kbox_wb_lock);
+}
+
+int kbox_lkl_fd_is_abandoned(long lkl_fd)
+{
+    int found = 0;
+
+    if (lkl_fd < 0)
+        return 0;
+    pthread_mutex_lock(&kbox_wb_lock);
+    for (int i = 0; i < kbox_wb_abandoned_n; i++) {
+        if (kbox_wb_abandoned_fd[i] == lkl_fd) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&kbox_wb_lock);
+    return found;
+}
+
+static int kbox_wb_budget(void)
+{
+    const char *env = getenv("KBOX_WB_TIMEOUT");
+
+    if (env && *env) {
+        char *end = NULL;
+        long sec = strtol(env, &end, 10);
+
+        if (end && *end == '\0' && sec > 0 && sec <= 600)
+            return (int) sec;
+    }
+    return KBOX_WB_DEFAULT_TIMEOUT;
+}
+
+/* One copy-back job. The worker owns everything it needs: the descriptor it
+ * copies from, the LKL descriptor it writes to, and the size. Nothing points
+ * back into the FD table, which is free to drop the entry while the worker
+ * still runs. */
+struct kbox_wb_job {
+    const struct kbox_sysnrs *sysnrs;
+    long lkl_fd;
+    int memfd;
+    off_t size;
+    int verbose;
+    int result;
+    int done;
+    int abandoned;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+};
+
+/* Copy the memfd back into the guest file. Returns 0 or a negative errno. */
+static int writeback_copy(const struct kbox_sysnrs *sysnrs,
+                          long lkl_fd,
+                          int memfd,
+                          off_t size,
+                          int verbose)
+{
+    uint8_t *buf;
+    off_t off = 0;
+    off_t saved;
+    long trunc_ret;
+    int result = 0;
+
+    /* LKL returns -errno. A signal during a multi-gigabyte copy-back is normal,
+     * and giving up on -EINTR left the guest file truncated at whatever had
+     * been copied so far. */
+    if (verbose)
+        fprintf(stderr, "kbox: writeback truncate begin lkl_fd=%ld size=%lld\n",
+                lkl_fd, (long long) size);
+    trunc_ret = kbox_lkl_ftruncate_safe(sysnrs, lkl_fd, (long) size);
+    while (trunc_ret == -EINTR)
+        trunc_ret = kbox_lkl_ftruncate_safe(sysnrs, lkl_fd, (long) size);
+    if (verbose)
+        fprintf(stderr, "kbox: writeback truncate done lkl_fd=%ld ret=%ld\n",
+                lkl_fd, trunc_ret);
+    if (trunc_ret < 0) {
+        fprintf(stderr,
+                "kbox: writeback failed: ftruncate lkl_fd=%ld size=%lld: %ld\n",
+                lkl_fd, (long long) size, trunc_ret);
+        return -EIO;
+    }
+
+    /* The dispatch buffer does not belong to this thread. */
+    buf = malloc(KBOX_IO_CHUNK_LEN);
+    if (!buf)
+        return -ENOMEM;
+
+    /* The shadow is one file description shared with the tracee: ADDFD
+     * installs that same struct file, so a dup of it can already be another
+     * process's stdin. read(2) and lseek(2) here move the offset the guest
+     * sees; pread(2) does not. Leaving the offset at EOF made a child that
+     * inherited the descriptor read nothing at all
+     * (test_cmd_line.test_stdin_readline). Working on a descriptor of its own
+     * makes that moot, and the save/restore keeps the synchronous fallback
+     * honest.
+     */
+    saved = lseek(memfd, 0, SEEK_CUR);
+    if (verbose)
+        fprintf(stderr, "kbox: writeback copy begin lkl_fd=%ld size=%lld\n",
+                lkl_fd, (long long) size);
+
+    while (off < size) {
+        off_t data = off;
+        off_t hole = size;
+
+        /* Large files are copied by extent. A sparse 2 GiB file holds a few
+         * blocks of data; copying the holes would materialize them in the
+         * guest filesystem, which cannot hold that many (test_largefile).
+         * SEEK_DATA moves the offset, so it is restored right after the scan.
+         */
+        if (size > KBOX_SHADOW_MAX_BYTES) {
+            data = lseek(memfd, off, SEEK_DATA);
+            if (data < 0) {
+                if (errno == ENXIO)
+                    break;  /* only holes remain */
+                data = off; /* SEEK_DATA unsupported: copy from here */
+            }
+            hole = lseek(memfd, data, SEEK_HOLE);
+            if (hole <= data)
+                hole = size;
+            if (saved >= 0)
+                (void) lseek(memfd, saved, SEEK_SET);
+        }
+
+        while (data < hole) {
+            size_t chunk = KBOX_IO_CHUNK_LEN;
+            ssize_t rd;
+            long done = 0;
+
+            if ((off_t) chunk > hole - data)
+                chunk = (size_t) (hole - data);
+            rd = pread(memfd, buf, chunk, data);
+            while (rd < 0 && errno == EINTR)
+                rd = pread(memfd, buf, chunk, data);
+            if (rd < 0) {
+                result = -errno;
+                goto out;
+            }
+            if (rd == 0)
+                break;
+            /* A short write leaves the tail of `rd` in the shadow and the
+             * guest file silently shortened, so the chunk is written out
+             * completely; EINTR from either layer is retried in place. */
+            while (done < rd) {
+                long wr =
+                    kbox_lkl_pwrite64(sysnrs, lkl_fd, buf + done,
+                                      (long) (rd - done), (long) (data + done));
+                if (wr == -EINTR)
+                    continue;
+                if (wr <= 0) {
+                    fprintf(stderr,
+                            "kbox: writeback failed: pwrite lkl_fd=%ld "
+                            "off=%lld: %ld\n",
+                            lkl_fd, (long long) (data + done), wr);
+                    result = wr < 0 ? (int) wr : -EIO;
+                    goto out;
+                }
+                done += wr;
+            }
+            data += rd;
+        }
+        off = hole;
+    }
+
+out:
+    if (saved >= 0)
+        (void) lseek(memfd, saved, SEEK_SET);
+    free(buf);
+    if (verbose)
+        fprintf(stderr, "kbox: writeback done lkl_fd=%ld result=%d\n", lkl_fd,
+                result);
+    return result;
+}
+
+static void *kbox_wb_worker(void *arg)
+{
+    struct kbox_wb_job *job = arg;
+    int result = writeback_copy(job->sysnrs, job->lkl_fd, job->memfd, job->size,
+                                job->verbose);
+    int abandoned;
+
+    close(job->memfd);
+    pthread_mutex_lock(&job->lock);
+    job->result = result;
+    job->done = 1;
+    abandoned = job->abandoned;
+    pthread_cond_signal(&job->cond);
+    pthread_mutex_unlock(&job->lock);
+
+    if (abandoned) {
+        pthread_mutex_destroy(&job->lock);
+        pthread_cond_destroy(&job->cond);
+        free(job);
+    }
+    return NULL;
+}
+
+/* A descriptor of the memfd with an offset of its own, so the worker never
+ * moves the offset the guest reads from. Falls back to a shared dup. */
+static int writeback_new_memfd(int shadow_sp)
+{
+    char path[48];
+    int fd;
+
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", shadow_sp);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0)
+        return fd;
+    return dup(shadow_sp);
+}
+
+static int writeback_run(struct kbox_supervisor_ctx *ctx,
+                         long lkl_fd,
+                         int shadow_sp,
+                         off_t size)
+{
+    struct kbox_wb_job *job;
+    struct timespec deadline;
+    pthread_t thread;
+    pthread_attr_t attr;
+    int budget = kbox_wb_budget();
+    int memfd;
+    int result;
+
+    memfd = writeback_new_memfd(shadow_sp);
+    if (memfd < 0)
+        return writeback_copy(ctx->sysnrs, lkl_fd, shadow_sp, size,
+                              ctx->verbose);
+
+    job = calloc(1, sizeof(*job));
+    if (!job) {
+        close(memfd);
+        return writeback_copy(ctx->sysnrs, lkl_fd, shadow_sp, size,
+                              ctx->verbose);
+    }
+    job->sysnrs = ctx->sysnrs;
+    job->lkl_fd = lkl_fd;
+    job->memfd = memfd;
+    job->size = size;
+    job->verbose = ctx->verbose;
+    pthread_mutex_init(&job->lock, NULL);
+    /* The NULL attribute argument selects the default attributes; it is not a
+     * dereference. cppcheck reports nullPointer for it (a fifteen-line
+     * program does the same). */
+    /* cppcheck-suppress nullPointer */
+    pthread_cond_init(&job->cond, NULL);
+
+    if (pthread_attr_init(&attr) != 0)
+        goto synchronous;
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    result = pthread_create(&thread, &attr, kbox_wb_worker, job);
+    pthread_attr_destroy(&attr);
+    if (result != 0)
+        goto synchronous;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += budget;
+
+    pthread_mutex_lock(&job->lock);
+    while (!job->done) {
+        if (pthread_cond_timedwait(&job->cond, &job->lock, &deadline) ==
+            ETIMEDOUT)
+            break;
+    }
+    if (!job->done) {
+        /* The worker is inside an LKL call that will not return. Give the
+         * guest its close() back and retire the descriptor. */
+        job->abandoned = 1;
+        pthread_mutex_unlock(&job->lock);
+        kbox_lkl_fd_mark_abandoned(lkl_fd);
+        fprintf(stderr,
+                "kbox: writeback stalled for %ds; lkl_fd=%ld stays open and "
+                "the guest continues\n",
+                budget, lkl_fd);
+        return 0;
+    }
+    result = job->result;
+    pthread_mutex_unlock(&job->lock);
+    pthread_mutex_destroy(&job->lock);
+    pthread_cond_destroy(&job->cond);
+    free(job);
+    return result;
+
+synchronous:
+    close(memfd);
+    pthread_mutex_destroy(&job->lock);
+    pthread_cond_destroy(&job->cond);
+    free(job);
+    return writeback_copy(ctx->sysnrs, lkl_fd, shadow_sp, size, ctx->verbose);
+}
+
 int sync_shadow_writeback(struct kbox_supervisor_ctx *ctx,
                           struct kbox_fd_entry *entry)
 {
     struct stat st;
-    uint8_t *buf = NULL;
-    off_t off = 0;
 
     if (!ctx || !entry || !entry->shadow_writeback || entry->shadow_sp < 0 ||
         entry->lkl_fd < 0)
@@ -3313,36 +4185,39 @@ int sync_shadow_writeback(struct kbox_supervisor_ctx *ctx,
 
     if (fstat(entry->shadow_sp, &st) < 0)
         return -errno;
+    if (getenv("KBOX_FD_TRACE"))
+        fprintf(stderr,
+                "kbofdt: writeback entry=%p lkl=%ld sp=%d size=%lld "
+                "rec_size=%ld rec_mtime=%ld\n",
+                (void *) entry, entry->lkl_fd, entry->shadow_sp,
+                (long long) st.st_size, entry->shadow_size,
+                entry->shadow_mtime_sec);
+
+    /* A writable open promotes the file to a memfd copy, and closing it copies
+     * the whole memfd back. Nothing wrote to the memfd in the common case, and
+     * an unconditional ftruncate+pwrite restamps mtime and ctime on the real
+     * file: `open(path, "r+b")` followed by close then made a file that utime()
+     * had just given a fixed timestamp look modified again. The memfd carries
+     * the timestamp it had when it was filled, so an unchanged timestamp and
+     * size mean "no writeback needed". */
+    if (!entry->shadow_mmap && entry->shadow_mtime_sec != 0 &&
+        (long) st.st_mtim.tv_sec == entry->shadow_mtime_sec &&
+        (long) st.st_mtim.tv_nsec == entry->shadow_mtime_nsec &&
+        (long) st.st_size == entry->shadow_size) {
+        if (getenv("KBOX_FD_TRACE"))
+            fprintf(stderr,
+                    "kbofdt: writeback skip entry=%p lkl=%ld sp=%d size=%lld\n",
+                    (void *) entry, entry->lkl_fd, entry->shadow_sp,
+                    (long long) st.st_size);
+        return 0;
+    }
+
     if (ctx->verbose)
         fprintf(stderr, "kbox: shadow writeback lkl_fd=%ld shadow_size=%lld\n",
                 entry->lkl_fd, (long long) st.st_size);
-    if (kbox_lkl_ftruncate(ctx->sysnrs, entry->lkl_fd, (long) st.st_size) < 0)
-        return -EIO;
-    if (lseek(entry->shadow_sp, 0, SEEK_SET) < 0)
-        return -errno;
 
-    buf = dispatch_scratch;
-
-    while (off < st.st_size) {
-        size_t chunk = KBOX_IO_CHUNK_LEN;
-        ssize_t rd;
-        long wr;
-
-        if ((off_t) chunk > st.st_size - off)
-            chunk = (size_t) (st.st_size - off);
-        rd = read(entry->shadow_sp, buf, chunk);
-        if (rd < 0)
-            return -errno;
-        if (rd == 0)
-            break;
-        wr = kbox_lkl_pwrite64(ctx->sysnrs, entry->lkl_fd, buf, (long) rd,
-                               (long) off);
-        if (wr < 0)
-            return (int) wr;
-        off += rd;
-    }
-
-    return 0;
+    /* The copy runs on its own thread: see writeback_run(). */
+    return writeback_run(ctx, entry->lkl_fd, entry->shadow_sp, st.st_size);
 }
 
 /* forward_close. */
@@ -3355,8 +4230,9 @@ static struct kbox_dispatch forward_close(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
     int same_fd_shadow = entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW;
-    if (fd <= 2)
-        fprintf(stderr, "kboxdbg: close fd=%ld lkl=%ld pid=%u\n", fd, lkl_fd,
+    kbox_net_forget_fd(fd);
+    if (fd <= 2 && ctx->verbose)
+        fprintf(stderr, "kbox: close fd=%ld lkl=%ld pid=%u\n", fd, lkl_fd,
                 kbox_syscall_request_pid(req));
 
     if (lkl_fd >= 0)
@@ -3378,6 +4254,13 @@ static struct kbox_dispatch forward_close(
     }
 
     if (lkl_fd >= 0) {
+        if ((ctx->verbose || getenv("KBOX_FD_TRACE")) && fd >= KBOX_FD_BASE)
+            fprintf(stderr,
+                    "kbox: close vfd=%ld lkl=%ld host_fd=%ld shadow_sp=%d "
+                    "writeback=%d\n",
+                    fd, lkl_fd, entry ? entry->host_fd : -99L,
+                    entry ? entry->shadow_sp : -99,
+                    entry ? entry->shadow_writeback : -99);
         if (same_fd_shadow) {
             if (entry && entry->shadow_writeback)
                 (void) sync_shadow_writeback(ctx, entry);
@@ -3441,12 +4324,12 @@ static struct kbox_dispatch forward_read_like(
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
-    if (fd <= 2)
-        fprintf(stderr, "kboxdbg: read fd=%ld lkl=%ld n=%ld pid=%u\n", fd,
-                lkl_fd, to_c_long_arg(kbox_syscall_request_arg(req, 2)),
+    if (fd <= 2 && ctx->verbose)
+        fprintf(stderr, "kbox: read fd=%ld lkl=%ld n=%ld pid=%u\n", fd, lkl_fd,
+                to_c_long_arg(kbox_syscall_request_arg(req, 2)),
                 kbox_syscall_request_pid(req));
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -3523,11 +4406,11 @@ static struct kbox_dispatch forward_read_like(
             break;
         }
         if (ctx->verbose) {
-            fprintf(
-                stderr,
-                "kbox: %s fd=%ld lkl_fd=%ld remote=0x%llx chunk=%zu ret=%ld\n",
-                is_pread ? "pread64" : "read", fd, lkl_fd,
-                (unsigned long long) remote, chunk_len, ret);
+            fprintf(stderr,
+                    "kbox: %s fd=%ld lkl_fd=%ld remote=0x%llx chunk=%zu "
+                    "ret=%ld\n",
+                    is_pread ? "pread64" : "read", fd, lkl_fd,
+                    (unsigned long long) remote, chunk_len, ret);
         }
         int wrc = guest_mem_write(ctx, pid, remote, scratch, n);
         if (wrc < 0) {
@@ -3553,12 +4436,29 @@ static struct kbox_dispatch forward_write(
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
-    if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
+    if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW) {
+        if (getenv("KBOX_FD_TRACE") && fd >= KBOX_FD_BASE)
+            /* format-ok: a literal, split only because the call
+             * does not fit on one line. */
+            fprintf(/* format-ok */
+                    stderr,
+                    "kbofdt: write continue fd=%ld lkl=%ld "
+                    "n=%lld\n",
+                    fd, lkl_fd,
+                    (long long) to_c_long_arg(
+                        kbox_syscall_request_arg(req, 2)));
         return kbox_dispatch_continue();
+    }
+    if (getenv("KBOX_FD_TRACE") && fd >= KBOX_FD_BASE)
+        fprintf(stderr,
+                "kbofdt: write fd=%ld lkl=%ld host_fd=%ld sp=%d n=%lld\n", fd,
+                lkl_fd, entry ? entry->host_fd : -99L,
+                entry ? entry->shadow_sp : -99,
+                (long long) to_c_long_arg(kbox_syscall_request_arg(req, 2)));
 
     invalidate_stat_cache_fd(ctx, lkl_fd);
 
@@ -3627,7 +4527,51 @@ static struct kbox_dispatch forward_write(
 
     if (total > 0)
         invalidate_path_shadow_cache(ctx);
+    if (getenv("KBOX_FD_TRACE") && fd >= KBOX_FD_BASE)
+        fprintf(stderr, "kbofdt: write done fd=%ld lkl=%ld n=%lld total=%zu\n",
+                fd, lkl_fd,
+                (long long) to_c_long_arg(kbox_syscall_request_arg(req, 2)),
+                total);
     return kbox_dispatch_value((int64_t) total);
+}
+
+/* Write to a host descriptor without blocking the dispatch thread.
+ *
+ * The dispatch thread answers every notification for the container, so it must
+ * never wait inside a write it cannot finish: while it waits, the pump that
+ * frees space on the peer socket is not served and the write never completes.
+ * test_socket's sendfile into a bridged socket did exactly that and wedged the
+ * guest. A socket therefore writes with MSG_DONTWAIT and reports a short count,
+ * which sendfile(2) is allowed to return.
+ */
+#define KBOX_SENDFILE_WRITE_BUDGET_MS 100
+#define KBOX_SENDFILE_WRITE_STEPS 4
+
+static ssize_t host_write_nonblocking(int fd, const void *buf, size_t len)
+{
+    for (int step = 0;; step++) {
+        ssize_t n = send(fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+        int wait_ms;
+
+        if (n >= 0)
+            return n;
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOTSOCK)
+            return n;
+        if (step >= KBOX_SENDFILE_WRITE_STEPS)
+            return -EAGAIN;
+        /* Wait a little so a peer that is draining normally still gets the
+         * whole transfer in one call, but never long enough to stall the
+         * dispatch thread: a peer that does not drain at all must yield a
+         * short count, which sendfile(2) allows. */
+        wait_ms = KBOX_SENDFILE_WRITE_BUDGET_MS / KBOX_SENDFILE_WRITE_STEPS;
+        if (poll(&pfd, 1, wait_ms) == 0)
+            return -EAGAIN;
+        if (errno == ENOTSOCK) {
+            /* Pipes and regular files. */
+            return write(fd, buf, len);
+        }
+    }
 }
 
 /* forward_sendfile. */
@@ -3641,6 +4585,90 @@ static struct kbox_dispatch forward_write(
  * busybox cat uses sendfile and some builds loop on ENOSYS instead of
  * falling back to read+write, so returning ENOSYS is not viable.
  */
+/* A supervisor-side descriptor for a tracee FD.
+ *
+ * dup_tracee_fd() needs pidfd_getfd; where the runtime denies it the fallback
+ * open("/proc/<pid>/fd/N") fails with ENXIO for a socket, and sendfile into a
+ * bridged socket then failed without sending a byte (test_socket's
+ * SendfileUsingSendfileTest.testCount in the pod). The FD table already holds a
+ * supervisor descriptor that refers to the same file description: the memfd of
+ * a writable shadow, or the supervisor end of a bridged socket (ADDFD installs
+ * the very same struct file, so writes through it are the guest's writes).
+ */
+static int sv_fd_for_tracee(struct kbox_supervisor_ctx *ctx,
+                            pid_t pid,
+                            long fd,
+                            int *close_it)
+{
+    struct kbox_fd_entry *e;
+    int sv;
+
+    *close_it = 0;
+    sv = kbox_fd_table_get_host_sv_fd(ctx->fd_table, fd);
+    if (sv >= 0)
+        return sv;
+
+    sv = dup_tracee_fd(pid, (int) fd);
+    if (sv >= 0) {
+        *close_it = 1;
+        return sv;
+    }
+
+    e = fd_table_entry(ctx->fd_table, fd);
+    if (!e) {
+        long vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
+
+        if (vfd >= 0)
+            e = fd_table_entry(ctx->fd_table, vfd);
+    }
+    if (e && e->shadow_sp >= 0)
+        return e->shadow_sp;
+    if (ctx->verbose)
+        fprintf(stderr,
+                "kbox: sendfile sv_fd fd=%ld dup=%d entry=%p shadow_sp=%d "
+                "host_fd=%d lkl_fd=%ld\n",
+                fd, sv, (void *) e, e ? (int) e->shadow_sp : -99,
+                e ? (int) e->host_fd : -99, e ? e->lkl_fd : -99);
+    return sv;
+}
+
+/* The guest end of the socketpair standing in for a bridged socket, or -1.
+ *
+ * A bridged socket is two objects: the LKL socket that really talks to the
+ * peer, and the AF_UNIX socketpair whose far end the tracee holds. Writing
+ * sendfile's output straight into the LKL socket pushes the bytes past the
+ * bridge pump, so the tracee's own descriptor never becomes unwritable: its
+ * poll(POLLOUT) keeps reporting ready after the peer stopped reading, and a
+ * caller that loops on poll+sendfile (Python's socket.sendfile, asyncio's
+ * sock_sendfile) spins instead of waiting -- it missed SO_SNDTIMEO entirely and
+ * only stopped when the peer's close arrived as ECONNRESET
+ * (test_socket.SendfileUsingSendfileTest.testWithTimeoutTriggeredSend).
+ *
+ * Writing into the tracee's own socketpair end keeps one buffer for both, so
+ * the flow control the tracee sees is the real one. ADDFD installs a duplicate
+ * of this very file, so a write here is the tracee's write.
+ */
+static int bridged_socket_sp(struct kbox_supervisor_ctx *ctx,
+                             long fd,
+                             int want_type)
+{
+    struct kbox_fd_entry *e = NULL;
+    long vfd;
+
+    if (!kbox_net_is_active())
+        return -1;
+    vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
+    if (vfd >= 0)
+        e = fd_table_entry(ctx->fd_table, vfd);
+    if (!e || e->shadow_sp < 0)
+        e = fd_table_entry(ctx->fd_table, fd);
+    if (!e || e->shadow_sp < 0)
+        return -1;
+    if (want_type && e->sock_type != want_type)
+        return -1;
+    return (int) e->shadow_sp;
+}
+
 static struct kbox_dispatch forward_sendfile(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx)
@@ -3652,6 +4680,7 @@ static struct kbox_dispatch forward_sendfile(
 
     long in_lkl = kbox_fd_table_get_lkl(ctx->fd_table, in_fd);
     long out_lkl = kbox_fd_table_get_lkl(ctx->fd_table, out_fd);
+    int out_bridge_sp = -1;
 
     /* Resolve shadow FDs: if in_fd is a host FD injected via ADDFD (shadow
      * memfd), find_by_host_fd locates the virtual entry that holds the LKL
@@ -3668,27 +4697,49 @@ static struct kbox_dispatch forward_sendfile(
             out_lkl = kbox_fd_table_get_lkl(ctx->fd_table, vfd);
     }
 
+    /* A descriptor the tracee really holds on the host -- a shadow memfd, or
+     * the guest end of a bridged socket -- has to be used on the host side.
+     * Resolving it to its LKL twin instead sent the bytes into LKL, past the
+     * bridge pump, and a write that the peer had not started reading blocked
+     * forever: test_asyncio hung in _sock_sendfile_native_impl that way.
+     */
+    if (in_lkl >= 0 && child_fd_is_open(ctx, in_fd))
+        in_lkl = -1;
+
+    /* A stream socket destination always goes through the tracee's own
+     * socketpair end, so that its writability reflects the peer's reading. */
+    {
+        int out_sp = bridged_socket_sp(ctx, out_fd, SOCK_STREAM);
+
+        if (out_sp >= 0) {
+            out_lkl = -1;
+            out_bridge_sp = out_sp;
+        } else if (out_lkl >= 0 && child_fd_is_open(ctx, out_fd)) {
+            out_lkl = -1;
+        }
+    }
+
     if (ctx->verbose)
         fprintf(stderr,
                 "kbox: sendfile in=%ld lkl=%ld out=%ld lkl=%ld deny_in=%d "
                 "deny_out=%d\n",
                 in_fd, in_lkl, out_fd, out_lkl,
-                fd_should_deny_io_ctx(ctx->fd_table, in_fd, in_lkl),
-                fd_should_deny_io_ctx(ctx->fd_table, out_fd, out_lkl));
+                io_should_deny_fd(ctx, req, in_fd, in_lkl),
+                io_should_deny_fd(ctx, req, out_fd, out_lkl));
 
     /* Both FDs have no LKL backing: the host kernel handles sendfile
      * if both are known host FDs. Deny if either is in a denied range.
      */
     if (in_lkl < 0 && out_lkl < 0) {
-        if (fd_should_deny_io_ctx(ctx->fd_table, in_fd, in_lkl) ||
-            fd_should_deny_io_ctx(ctx->fd_table, out_fd, out_lkl))
+        if (io_should_deny_fd(ctx, req, in_fd, in_lkl) ||
+            io_should_deny_fd(ctx, req, out_fd, out_lkl))
             return kbox_dispatch_errno(EBADF);
         return kbox_dispatch_continue();
     }
 
-    if (in_lkl < 0 && fd_should_deny_io_ctx(ctx->fd_table, in_fd, in_lkl))
+    if (in_lkl < 0 && io_should_deny_fd(ctx, req, in_fd, in_lkl))
         return kbox_dispatch_errno(EBADF);
-    if (out_lkl < 0 && fd_should_deny_io_ctx(ctx->fd_table, out_fd, out_lkl))
+    if (out_lkl < 0 && io_should_deny_fd(ctx, req, out_fd, out_lkl))
         return kbox_dispatch_errno(EBADF);
 
     /* Both descriptors live in LKL, and the emulation below moves the bytes
@@ -3728,30 +4779,25 @@ static struct kbox_dispatch forward_sendfile(
     int close_in = 0;
     int close_out = 0;
     if (in_lkl < 0) {
-        sv_in = kbox_fd_table_get_host_sv_fd(ctx->fd_table, in_fd);
-        if (sv_in < 0) {
-            sv_in = dup_tracee_fd(pid, (int) in_fd);
-            if (sv_in < 0)
-                return kbox_dispatch_errno(-sv_in);
-            close_in = 1;
-        }
+        sv_in = sv_fd_for_tracee(ctx, pid, in_fd, &close_in);
+        if (sv_in < 0)
+            return kbox_dispatch_errno(-sv_in);
     }
     if (out_lkl < 0) {
-        sv_out = kbox_fd_table_get_host_sv_fd(ctx->fd_table, out_fd);
+        sv_out = out_bridge_sp >= 0
+                     ? out_bridge_sp
+                     : sv_fd_for_tracee(ctx, pid, out_fd, &close_out);
         if (sv_out < 0) {
-            sv_out = dup_tracee_fd(pid, (int) out_fd);
-            if (sv_out < 0) {
-                if (close_in)
-                    close(sv_in);
-                return kbox_dispatch_errno(-sv_out);
-            }
-            close_out = 1;
+            if (close_in)
+                close(sv_in);
+            return kbox_dispatch_errno(-sv_out);
         }
     }
 
     uint8_t *scratch = dispatch_scratch;
     struct kbox_dispatch result = kbox_dispatch_value(0);
     size_t total = 0;
+    size_t rewind_bytes = 0; /* source bytes read but not written */
 
     while (total < count) {
         size_t chunk = KBOX_IO_CHUNK_LEN;
@@ -3776,6 +4822,11 @@ static struct kbox_dispatch forward_sendfile(
                 nr = kbox_lkl_read(ctx->sysnrs, in_lkl, scratch, (long) chunk);
             }
             if (nr < 0) {
+                if (ctx->verbose)
+                    fprintf(stderr,
+                            "kbox: sendfile read failed in_lkl=%ld ret=%ld "
+                            "off=%lld\n",
+                            in_lkl, nr, (long long) offset);
                 if (total == 0) {
                     result = kbox_dispatch_errno((int) (-nr));
                     goto out_close;
@@ -3815,28 +4866,75 @@ static struct kbox_dispatch forward_sendfile(
         size_t written = 0;
         while (written < n) {
             if (out_lkl >= 0) {
-                long wr =
-                    kbox_lkl_write(ctx->sysnrs, out_lkl, scratch + written,
-                                   (long) (n - written));
+                /* A socket destination must not block the dispatch thread
+                 * either: a full peer buffer is backpressure, and sendfile(2)
+                 * is allowed to return the bytes it managed to copy. */
+                long wr = kbox_lkl_sendto(
+                    ctx->sysnrs, out_lkl, scratch + written,
+                    (long) (n - written), 0x40 /* MSG_DONTWAIT */, NULL, 0);
+
+                if (wr == -ENOTSOCK)
+                    wr = kbox_lkl_write(ctx->sysnrs, out_lkl, scratch + written,
+                                        (long) (n - written));
                 if (wr <= 0) {
+                    if (wr < 0 && (wr == -EAGAIN || wr == -EWOULDBLOCK)) {
+                        /* Nothing copied yet: report EAGAIN so the caller waits
+                         * for writability instead of reading 0 as end of file
+                         * (asyncio's sock_sendfile stops on 0). */
+                        if (total + written == 0) {
+                            result = kbox_dispatch_errno(EAGAIN);
+                            goto out_close;
+                        }
+                        total += written;
+                        rewind_bytes = n - written;
+                        goto done_rewind;
+                    }
                     if (total + written == 0) {
                         result =
                             kbox_dispatch_errno(wr < 0 ? (int) (-wr) : EIO);
                         goto out_close;
                     }
                     total += written;
-                    goto done;
+                    /* The chunk was already consumed from the source. Without
+                     * an explicit offset the file position moved past the
+                     * bytes that could not be written, and the caller's next
+                     * call would start after them: a 10 MB sendfile lost 89 KB
+                     * that way (test_socket.SendfileUsingSendfileTest). */
+                    rewind_bytes = n - written;
+                    goto done_rewind;
                 }
                 written += (size_t) wr;
             } else {
-                ssize_t wr = write(sv_out, scratch + written, n - written);
+                ssize_t wr = host_write_nonblocking(sv_out, scratch + written,
+                                                    n - written);
+
+                if (wr <= 0 && ctx->verbose)
+                    fprintf(stderr,
+                            "kbox: sendfile write failed sv_out=%d ret=%zd "
+                            "errno=%d\n",
+                            sv_out, wr, errno);
                 if (wr <= 0) {
+                    /* A full socket buffer is not an error: report the bytes
+                     * already copied so the guest comes back when the
+                     * descriptor is writable. With nothing copied yet the
+                     * answer is EAGAIN, never 0, which a caller reads as end
+                     * of file. */
+                    if (wr < 0 && errno == EAGAIN) {
+                        if (total + written == 0) {
+                            result = kbox_dispatch_errno(EAGAIN);
+                            goto out_close;
+                        }
+                        total += written;
+                        rewind_bytes = n - written;
+                        goto done_rewind;
+                    }
                     if (total + written == 0) {
                         result = kbox_dispatch_errno(wr < 0 ? errno : EIO);
                         goto out_close;
                     }
                     total += written;
-                    goto done;
+                    rewind_bytes = n - written;
+                    goto done_rewind;
                 }
                 written += (size_t) wr;
             }
@@ -3847,7 +4945,16 @@ static struct kbox_dispatch forward_sendfile(
             break;
     }
 
-done:
+done_rewind:
+    /* Leave the source positioned at the first byte that was not written. */
+    if (!has_offset && rewind_bytes > 0) {
+        if (in_lkl >= 0)
+            (void) lkl_syscall6(ctx->sysnrs->lseek, in_lkl,
+                                -(long) rewind_bytes, 1, 0, 0, 0);
+        else if (sv_in >= 0)
+            (void) lseek(sv_in, -(off_t) rewind_bytes, SEEK_CUR);
+    }
+
     /* The write landed, but the name it landed under is cached: a reader that
      * opens the same path next gets the pre-write shadow and sees an empty
      * file. forward_write drops that cache after every write, and this path
@@ -3887,7 +4994,7 @@ static struct kbox_dispatch forward_lseek(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -3941,6 +5048,11 @@ static struct kbox_dispatch forward_fcntl(
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
         long pt_cmd = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+        if (ctx->verbose && pt_cmd == F_SETFL)
+            fprintf(stderr,
+                    "kbox: fcntl shadow-only fd=%ld cmd=F_SETFL arg=%ld "
+                    "-> continue\n",
+                    fd, to_c_long_arg(kbox_syscall_request_arg(req, 2)));
         if (pt_cmd == F_DUPFD || pt_cmd == F_DUPFD_CLOEXEC) {
             /* Emulate F_DUPFD on host-passthrough FD: get a supervisor copy
              * via pidfd_getfd (or /proc/<pid>/fd fallback), inject at the first
@@ -4038,8 +5150,14 @@ static struct kbox_dispatch forward_fcntl(
             if (scmd == F_SETFL) {
                 long sarg = to_c_long_arg(kbox_syscall_request_arg(req, 2));
                 long slkl = kbox_fd_table_get_lkl(ctx->fd_table, svfd);
-                if (slkl >= 0)
-                    kbox_lkl_fcntl(ctx->sysnrs, slkl, F_SETFL, sarg);
+                if (slkl >= 0) {
+                    long fr = kbox_lkl_fcntl(ctx->sysnrs, slkl, F_SETFL, sarg);
+                    if (ctx->verbose)
+                        fprintf(stderr,
+                                "kbox: fcntl shadow fd=%ld svfd=%ld lkl=%ld "
+                                "setfl=%ld -> %ld\n",
+                                fd, svfd, slkl, sarg, fr);
+                }
             }
             if (scmd == F_SETFD) {
                 /* Keep fd-table cloexec in sync with host kernel. */
@@ -4061,6 +5179,11 @@ static struct kbox_dispatch forward_fcntl(
             long lcmd = to_c_long_arg(kbox_syscall_request_arg(req, 1));
             if (lcmd == F_SETFL || lcmd == F_GETFL || lcmd == F_SETFD) {
                 long larg = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+                /* A number the tracee never opened is not a descriptor. The
+                 * local answers below would turn EBADF into success, which
+                 * hides errors from os.get_blocking()/os.set_blocking(). */
+                if (!tracee_fd_is_open(kbox_syscall_request_pid(req), fd))
+                    return kbox_dispatch_errno(EBADF);
                 if (ctx->verbose)
                     fprintf(stderr,
                             "kbox: fcntl untracked fd=%ld cmd=%ld arg=%ld "
@@ -4098,6 +5221,18 @@ static struct kbox_dispatch forward_fcntl(
             if (pt_cmd == F_SETFD) {
                 kbox_fd_table_set_cloexec(ctx->fd_table, fd,
                                           (pt_arg & FD_CLOEXEC) ? 1 : 0);
+                /* The number the tracee uses here is a real host descriptor
+                 * (the injected memfd of a same-fd shadow, or an accepted
+                 * socket). Emulating the call in the supervisor updated the
+                 * bookkeeping but left the descriptor's own close-on-exec bit
+                 * set, so execve closed it anyway: a child that received the
+                 * fd through subprocess pass_fds -- which clears FD_CLOEXEC
+                 * exactly this way -- then got EBADF on its first write
+                 * (test_faulthandler's fd tests).
+                 */
+                if (he->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW ||
+                    he->host_sv_fd >= 0)
+                    return kbox_dispatch_continue();
                 return kbox_dispatch_value(0);
             }
             if (pt_cmd == F_SETFL) {
@@ -4129,8 +5264,14 @@ static struct kbox_dispatch forward_fcntl(
             long target_fd = allocate_shadow_fd_from(ctx, arg);
             if (target_fd < 0)
                 return kbox_dispatch_errno(EMFILE);
-            return dup_same_fd_shadow_to(req, ctx, orig, target_fd,
-                                         cmd == F_DUPFD_CLOEXEC, 0);
+            struct kbox_dispatch d = dup_same_fd_shadow_to(
+                req, ctx, orig, target_fd, cmd == F_DUPFD_CLOEXEC, 0);
+            if (getenv("KBOX_FD_TRACE"))
+                fprintf(stderr,
+                        "kbofdt: fcntl dupfd fd=%ld arg=%ld target=%ld "
+                        "result=%lld\n",
+                        fd, arg, target_fd, (long long) d.val);
+            return d;
         }
 
         long ret = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, cmd, arg);
@@ -4169,6 +5310,21 @@ static struct kbox_dispatch forward_fcntl(
     if (cmd == F_GETLK || cmd == F_OFD_GETLK || cmd == F_OFD_SETLK ||
         cmd == F_OFD_SETLKW)
         return kbox_dispatch_errno(ENOSYS);
+
+    /* Directory change notification (dnotify) cannot be delivered through this
+     * sandbox: the signals would have to be raised by the host kernel, which
+     * does not know the guest's descriptor. LKL's kernel is built without
+     * CONFIG_DNOTIFY and answers EINVAL, while the host kernel accepts the call
+     * -- so a program that merely enables notification (CPython's
+     * test_fcntl.test_fcntl_64_bit) failed only under kbox. Accept the flag;
+     * nothing in the guest can observe the missing signal in a single-process
+     * sandbox.
+     */
+#ifndef F_NOTIFY
+#define F_NOTIFY 1026
+#endif
+    if (cmd == F_NOTIFY)
+        return kbox_dispatch_value(0);
 
     /* F_SETFL: translate host open flags to LKL before forwarding. */
     if (cmd == F_SETFL)
@@ -4919,7 +6075,7 @@ static struct kbox_dispatch forward_fstat(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -4968,6 +6124,7 @@ static struct kbox_dispatch forward_fstat(
 
     struct stat host_stat;
     kbox_lkl_stat_to_host(&kst, &host_stat);
+    apply_writeback_shadow_stat(ctx, &kst, &host_stat);
 
     if (wb_sp >= 0) {
         struct stat mem_stat;
@@ -4994,6 +6151,82 @@ static struct kbox_dispatch forward_fstat(
     if (wrc < 0)
         return kbox_dispatch_errno(-wrc);
 
+    return kbox_dispatch_value(0);
+}
+
+/* forward_truncate.
+ *
+ * The path-based truncate(2) had no dispatch entry at all, so the deny-unknown
+ * tail answered ENOSYS and os.truncate() failed on every path
+ * (test_posix.test_truncate). It is a path operation, so it goes through the
+ * same translation as chmod and unlink: LKL for the guest rootfs, the host for
+ * a bind mount.
+ */
+static struct kbox_dispatch forward_truncate(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    char translated[KBOX_MAX_PATH];
+    long lkl_dirfd;
+    long length = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+
+    if (length < 0)
+        return kbox_dispatch_errno(EINVAL);
+
+    int rc = translate_request_path_or_bind(req, ctx, 0, translated,
+                                            sizeof(translated), &lkl_dirfd);
+    if (rc < 0)
+        return kbox_dispatch_errno(-rc);
+
+    if (should_continue_for_dirfd(lkl_dirfd) ||
+        should_continue_virtual_path(ctx, req, 0, translated)) {
+        pid_t pid = kbox_syscall_request_pid(req);
+        char sv_path[KBOX_MAX_PATH];
+        int sv_dirfd = AT_FDCWD;
+        int close_sv = 0;
+        long raw_dirfd = to_dirfd_arg(kbox_syscall_request_arg(req, 0));
+
+        translate_proc_self(translated, pid, sv_path, sizeof(sv_path));
+        if (should_continue_for_dirfd(lkl_dirfd)) {
+            int drc = open_host_dirfd_for_dispatch(pid, raw_dirfd, lkl_dirfd,
+                                                   &sv_dirfd, &close_sv);
+            if (drc < 0)
+                return kbox_dispatch_errno(-drc);
+            translate_proc_self_at(sv_dirfd, translated, pid, sv_path,
+                                   sizeof(sv_path));
+        }
+        int hfd = openat(sv_dirfd, sv_path, O_WRONLY | O_CLOEXEC);
+        int hrc;
+        int saved;
+
+        if (hfd < 0) {
+            saved = errno;
+            if (close_sv)
+                close(sv_dirfd);
+            return kbox_dispatch_errno(saved);
+        }
+        hrc = ftruncate(hfd, (off_t) length);
+        saved = errno;
+        close(hfd);
+        if (close_sv)
+            close(sv_dirfd);
+        if (hrc < 0)
+            return kbox_dispatch_errno(saved);
+        invalidate_path_shadow_cache(ctx);
+        return kbox_dispatch_value(0);
+    }
+
+    /* Guest rootfs: open for writing, truncate, close. open() reports the
+     * permission and directory errors truncate would report. */
+    long lkl_fd = kbox_lkl_openat(ctx->sysnrs, lkl_dirfd, translated,
+                                  O_WRONLY | O_CLOEXEC, 0);
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno((int) (-lkl_fd));
+    long ret = kbox_lkl_ftruncate_safe(ctx->sysnrs, lkl_fd, length);
+    kbox_lkl_close(ctx->sysnrs, lkl_fd);
+    if (ret < 0)
+        return kbox_dispatch_errno((int) (-ret));
+    invalidate_path_shadow_cache(ctx);
     return kbox_dispatch_value(0);
 }
 
@@ -5084,6 +6317,7 @@ static struct kbox_dispatch forward_newfstatat(
 
     struct stat host_stat;
     kbox_lkl_stat_to_host(&kst, &host_stat);
+    apply_writeback_shadow_stat(ctx, &kst, &host_stat);
     normalize_host_stat_if_needed(ctx, translated, &host_stat);
 
     int wrc = guest_mem_write_small_metadata(ctx, pid, remote_stat, &host_stat,
@@ -5203,6 +6437,140 @@ static struct kbox_dispatch dispatch_lkl_statfs_result(
     return kbox_dispatch_value(0);
 }
 
+/* listxattr, llistxattr, flistxattr.
+ *
+ * These used to answer "zero bytes" for every request, which made a missing
+ * file look like a file with no extended attributes: os.listxattr() on a path
+ * that does not exist returned [] instead of raising ENOENT. The guest buffer
+ * is filled from the filesystem, and errors travel back unchanged.
+ */
+static struct kbox_dispatch finish_xattr_list(struct kbox_supervisor_ctx *ctx,
+                                              pid_t pid,
+                                              uint64_t remote_list,
+                                              long size,
+                                              const uint8_t *buf,
+                                              long ret)
+{
+    if (ret < 0)
+        return kbox_dispatch_errno((int) (-ret));
+    if (size > 0 && ret > 0) {
+        long n = ret < size ? ret : size;
+        int wrc = guest_mem_write(ctx, pid, remote_list, buf, (size_t) n);
+        if (wrc < 0)
+            return kbox_dispatch_errno(-wrc);
+    }
+    return kbox_dispatch_value(ret);
+}
+
+static struct kbox_dispatch forward_xattr_list_common(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    int follow_links)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+    uint64_t remote_list = kbox_syscall_request_arg(req, 1);
+    long size = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    char translated[KBOX_MAX_PATH];
+    long lkl_dirfd = AT_FDCWD_LINUX;
+    long ret;
+    int rc;
+
+    if (size < 0)
+        return kbox_dispatch_errno(EINVAL);
+    if (size > KBOX_IO_CHUNK_LEN)
+        size = KBOX_IO_CHUNK_LEN;
+    if (size > 0 && remote_list == 0)
+        return kbox_dispatch_errno(EFAULT);
+
+    rc = translate_request_path_or_bind(req, ctx, 0, translated,
+                                        sizeof(translated), &lkl_dirfd);
+    if (rc < 0)
+        return kbox_dispatch_errno(-rc);
+
+    if (should_continue_for_dirfd(lkl_dirfd)) {
+        ret = follow_links
+                  ? (long) listxattr(translated,
+                                     size ? (char *) dispatch_scratch : NULL,
+                                     (size_t) size)
+                  : (long) llistxattr(translated,
+                                      size ? (char *) dispatch_scratch : NULL,
+                                      (size_t) size);
+        if (ret < 0)
+            return kbox_dispatch_errno(errno);
+        return finish_xattr_list(ctx, pid, remote_list, size, dispatch_scratch,
+                                 ret);
+    }
+
+    if (should_continue_virtual_path(ctx, req, 0, translated)) {
+        char sv_path[KBOX_MAX_PATH];
+        translate_proc_self(translated, pid, sv_path, sizeof(sv_path));
+        ret = follow_links
+                  ? (long) listxattr(sv_path,
+                                     size ? (char *) dispatch_scratch : NULL,
+                                     (size_t) size)
+                  : (long) llistxattr(sv_path,
+                                      size ? (char *) dispatch_scratch : NULL,
+                                      (size_t) size);
+        if (ret < 0)
+            return kbox_dispatch_errno(errno);
+        return finish_xattr_list(ctx, pid, remote_list, size, dispatch_scratch,
+                                 ret);
+    }
+
+    /* Pick the LKL syscall that matches the follow/no-follow variant. Using
+     * listxattr(2) for the no-follow call made llistxattr() on a dangling
+     * symlink fail with ENOENT, because listxattr(2) resolves the link:
+     * shutil.copystat() copies the attributes of a dangling link and got
+     * "No such file or directory" instead of the (empty) attribute list. */
+    ret = lkl_syscall6(
+        follow_links ? ctx->sysnrs->listxattr : ctx->sysnrs->llistxattr,
+        (long) translated, size ? (long) dispatch_scratch : 0, size, 0, 0, 0);
+    return finish_xattr_list(ctx, pid, remote_list, size, dispatch_scratch,
+                             ret);
+}
+
+static struct kbox_dispatch forward_listxattr(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    return forward_xattr_list_common(req, ctx, 1);
+}
+
+static struct kbox_dispatch forward_llistxattr(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    return forward_xattr_list_common(req, ctx, 0);
+}
+
+static struct kbox_dispatch forward_flistxattr(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    uint64_t remote_list = kbox_syscall_request_arg(req, 1);
+    long size = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
+        return kbox_dispatch_continue();
+    if (lkl_fd < 0)
+        return kbox_dispatch_errno(EBADF);
+    if (size < 0)
+        return kbox_dispatch_errno(EINVAL);
+    if (size > KBOX_IO_CHUNK_LEN)
+        size = KBOX_IO_CHUNK_LEN;
+    if (size > 0 && remote_list == 0)
+        return kbox_dispatch_errno(EFAULT);
+
+    long ret = lkl_syscall6(ctx->sysnrs->flistxattr, lkl_fd,
+                            size ? (long) dispatch_scratch : 0, size, 0, 0, 0);
+    return finish_xattr_list(ctx, pid, remote_list, size, dispatch_scratch,
+                             ret);
+}
+
 static struct kbox_dispatch forward_statfs(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx)
@@ -5247,7 +6615,7 @@ static struct kbox_dispatch forward_fstatfs(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -5477,7 +6845,7 @@ static struct kbox_dispatch forward_fchdir(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))) {
+        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd))) {
         char guest_cwd[KBOX_MAX_PATH];
         pid_t pid = kbox_syscall_request_pid(req);
         if (resolve_host_fd_guest_bind(ctx, pid, fd, guest_cwd,
@@ -5613,6 +6981,37 @@ static struct kbox_dispatch forward_at_path_call(
     if (invalidate_on_success && ret >= 0)
         invalidate_path_shadow_cache(ctx);
     return kbox_dispatch_from_lkl(ret);
+}
+
+static long invoke_mknodat(const struct kbox_syscall_request *req,
+                           struct kbox_supervisor_ctx *ctx,
+                           long lkl_dirfd,
+                           const char *translated)
+{
+    long mode = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    long dev = to_c_long_arg(kbox_syscall_request_arg(req, 3));
+    return kbox_lkl_mknodat(ctx->sysnrs, lkl_dirfd, translated, mode, dev);
+}
+
+static long host_invoke_mknodat(const struct kbox_syscall_request *req,
+                                struct kbox_supervisor_ctx *ctx,
+                                long sv_dirfd,
+                                const char *path)
+{
+    (void) ctx;
+    long mode = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+    long dev = to_c_long_arg(kbox_syscall_request_arg(req, 3));
+    if (mknodat((int) sv_dirfd, path, (mode_t) mode, (dev_t) dev) < 0)
+        return -errno;
+    return 0;
+}
+
+static struct kbox_dispatch forward_mknodat(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    return forward_at_path_call(req, ctx, invoke_mknodat, host_invoke_mknodat,
+                                1);
 }
 
 static long invoke_mkdirat(const struct kbox_syscall_request *req,
@@ -6004,6 +7403,7 @@ static struct kbox_dispatch forward_stat_legacy(
 
     struct stat host_stat;
     kbox_lkl_stat_to_host(&kst, &host_stat);
+    apply_writeback_shadow_stat(ctx, &kst, &host_stat);
     normalize_host_stat_if_needed(ctx, translated, &host_stat);
 
     int wrc = guest_mem_write_small_metadata(ctx, pid, remote_stat, &host_stat,
@@ -6275,6 +7675,7 @@ static struct kbox_dispatch forward_chown_legacy(
     /* Directories. */                                                        \
     _(getdents64, forward_getdents64)                                         \
     _(getdents, forward_getdents)                                             \
+    _(mknodat, forward_mknodat)                                               \
     _(mkdirat, forward_mkdirat)                                               \
     _(unlinkat, forward_unlinkat)                                             \
     _(renameat2, forward_renameat2)                                           \
@@ -6338,9 +7739,9 @@ static struct kbox_dispatch forward_chown_legacy(
     _(getxattr, forward_xattr_nodata)                                         \
     _(lgetxattr, forward_xattr_nodata)                                        \
     _(fgetxattr, forward_xattr_nodata)                                        \
-    _(listxattr, forward_xattr_empty_list)                                    \
-    _(llistxattr, forward_xattr_empty_list)                                   \
-    _(flistxattr, forward_xattr_empty_list)                                   \
+    _(listxattr, forward_listxattr)                                           \
+    _(llistxattr, forward_llistxattr)                                         \
+    _(flistxattr, forward_flistxattr)                                         \
     _(symlinkat, forward_symlinkat)                                           \
     _(linkat, forward_linkat)                                                 \
     _(utimensat, forward_utimensat)                                           \
@@ -6369,6 +7770,9 @@ static struct kbox_dispatch forward_chown_legacy(
     _(epoll_ctl, forward_epoll_ctl_gated)                                     \
     _(epoll_wait, forward_fd_gated_continue)                                  \
     _(epoll_pwait, forward_fd_gated_continue)                                 \
+    _(poll, forward_readiness_gated)                                          \
+    _(ppoll, forward_readiness_gated)                                         \
+    _(pselect6, forward_readiness_gated)                                      \
     _(timerfd_settime, forward_fd_gated_continue)                             \
     _(timerfd_gettime, forward_fd_gated_continue)                             \
     _(statfs, forward_statfs)                                                 \
@@ -6389,8 +7793,8 @@ static struct kbox_dispatch forward_chown_legacy(
     _(sched_yield) _(sched_setparam) _(sched_getparam) _(sched_setscheduler)   \
     _(sched_getscheduler) _(sched_get_priority_max) _(sched_get_priority_min)  \
     _(sched_setaffinity) _(sched_getaffinity)                                  \
-    /* I/O multiplexing (non-FD-creating multiplexers only). */                \
-    _(ppoll) _(pselect6) _(poll)                                               \
+    /* I/O multiplexing lives in DISPATCH_FORWARD_TABLE so the bridge can be
+     * made current before the kernel measures readiness. */                  \
     /* Sleep. */                                                               \
     _(nanosleep) _(clock_nanosleep)                                            \
     /* POSIX per-process timers. */                                            \
@@ -6557,6 +7961,60 @@ static struct kbox_dispatch dispatch_request_impl(
         }
     }
 
+    /* exit_group is notified (not BPF-allowed) so verbose mode can show how a
+     * process ended; the host kernel still performs the exit. The notify
+     * round-trip is also the last chance to copy writable shadows back to the
+     * LKL files, because a process exit closes its descriptors without a
+     * close(2) call. */
+    /* wait4/waitid: a parent reaping a child is the moment kbox learns that a
+     * guest process is gone. A process that dies by signal never reaches
+     * exit_group, so its writable shadows were never copied back; the parent
+     * typically reads the very file the dead child was writing (faulthandler's
+     * crash tests do exactly that). The copy is idempotent, so flushing every
+     * pending shadow here is safe, and it keeps the entry registered for the
+     * process that is still alive.
+     */
+    if (nr == h->wait4 || nr == h->waitid) {
+        sync_all_writeback_shadows(ctx, 0);
+        /* The reaped child's own table is not ctx->fd_table here: the caller is
+         * the parent. Reap the dead entries so their shadows are copied back
+         * before the table is freed. A blocking wait4 is notified on entry,
+         * while the child may still be alive, so arm a deferred reap as well:
+         * the parent's next syscall (usually the stat/open/read of the file
+         * the dead child was writing) flushes it. */
+        reap_dead_proc_fds(ctx);
+        ctx->pending_reap = 1;
+        return kbox_dispatch_continue();
+    }
+
+    if (nr == h->exit_group || nr == h->exit) {
+        if (ctx->verbose)
+            fprintf(stderr, "kbox: %s pid=%u code=%lld\n",
+                    nr == h->exit_group ? "exit_group" : "exit",
+                    kbox_syscall_request_pid(req),
+                    (long long) kbox_syscall_request_arg(req, 0));
+        /* exit_group tears the whole process down, and that closes every
+         * descriptor without a close(2) call, so the shadows are flushed and
+         * forgotten. Plain exit(2) is what a worker thread calls: the process
+         * keeps its descriptors, so its shadows must keep their registration.
+         * Deregistering here lost every buffered write of a threaded writer --
+         * the first thread to finish wiped the entry, and the close that
+         * followed had nothing to copy back (test_io.test_threads_write).
+         */
+        sync_all_writeback_shadows(ctx, nr == h->exit_group);
+        return kbox_dispatch_continue();
+    }
+
+    /* Syscalls kbox does not model in the arch tables. */
+    if (nr == __NR_sched_rr_get_interval)
+        return kbox_dispatch_continue();
+    if (nr == __NR_truncate)
+        return forward_truncate(req, ctx);
+    if (nr == __NR_preadv2)
+        return forward_preadv2(req, ctx);
+    if (nr == __NR_pwritev2)
+        return forward_pwritev2(req, ctx);
+
     /* Table-driven dispatch: forward to handler. */
 
 #define _(field, handler) \
@@ -6633,18 +8091,8 @@ static struct kbox_dispatch dispatch_request_impl(
     /* setpriority only touches the tracee's own scheduler state; left to the
      * default it was refused with ENOSYS and Chromium logged it per thread.
      */
-    if (nr == h->setpriority)
+    if (nr == h->setpriority || nr == h->getpriority)
         return kbox_dispatch_continue();
-
-    /* exit_group is notified (not BPF-allowed) so verbose mode can show how a
-     * process ended; the host kernel still performs the exit. */
-    if (nr == h->exit_group) {
-        if (ctx->verbose)
-            fprintf(stderr, "kbox: exit_group pid=%u code=%lld\n",
-                    kbox_syscall_request_pid(req),
-                    (long long) kbox_syscall_request_arg(req, 0));
-        return kbox_dispatch_continue();
-    }
 
     if (nr == h->getpid) {
         if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP)
@@ -6881,6 +8329,25 @@ static struct kbox_dispatch dispatch_request_impl(
         int sig = (int) kbox_syscall_request_arg(req, 1);
         if (target == 0 && req->source == KBOX_SYSCALL_SOURCE_SECCOMP)
             return kbox_dispatch_continue();
+        /* A process signalling itself cannot be emulated from here.
+         *
+         * The supervisor would have to send the signal before it answers the
+         * notification, and the signal then interrupts the tracee's own wait
+         * for that answer: the kernel aborts the blocked syscall and kill(2)
+         * returns EINTR instead of 0. CPython turns that into InterruptedError
+         * (test_signal.test_stress_delivery_dependent). Seccomp-notify mode
+         * reports the real PID, so a self-target becomes the caller's own
+         * thread-group and the host kernel can run the call natively.
+         */
+        if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP) {
+            pid_t caller_tgid = 0;
+            pid_t caller = kbox_syscall_request_pid(req);
+            if (read_proc_tgid_ppid(caller, &caller_tgid, NULL, NULL) < 0 ||
+                caller_tgid <= 0)
+                caller_tgid = caller;
+            if (target == caller_tgid || target == caller)
+                return kbox_dispatch_continue();
+        }
         pid_t check_pid = (target < -1) ? -target : target;
         if (target != 0 && !IS_GUEST_PID(check_pid))
             DENY_NON_GUEST(target, "kill");
@@ -7041,18 +8508,31 @@ static struct kbox_dispatch dispatch_request_impl(
         return kbox_dispatch_continue();
     }
 
-    /* prlimit64: GET is safe, SET is restricted. */
-
+    /* prlimit64: GET is unconditional. SET is left to the host kernel for the
+     * calling process itself.
+     *
+     * The old rule answered EPERM for every SET except RLIMIT_CORE and
+     * RLIMIT_AS, which broke the ordinary case as well: CPython maps EPERM to
+     * ValueError("not allowed to raise maximum limit"), and
+     * test_resource.test_fsize_ismax re-applies the limit it just read. A
+     * process lowering its own limits needs no privilege, and raising one's own
+     * hard limit is exactly what the host kernel judges with CAP_SYS_RESOURCE;
+     * duplicating that rule here can only disagree with it.
+     *
+     * A SET aimed at another pid keeps the refusal: that call reaches a host
+     * pid the guest was never given, and the guest's own limits are not the
+     * target.
+     */
     if (nr == h->prlimit64) {
         uint64_t new_limit_ptr = kbox_syscall_request_arg(req, 2);
         if (new_limit_ptr == 0)
             return kbox_dispatch_continue();
-        int resource = (int) kbox_syscall_request_arg(req, 1);
-        if (resource == 4 /* RLIMIT_CORE */ || resource == 9 /* RLIMIT_AS */)
+        pid_t target = (pid_t) kbox_syscall_request_arg(req, 0);
+        if (target == 0)
             return kbox_dispatch_continue();
         if (ctx->verbose)
-            fprintf(stderr, "kbox: prlimit64 SET resource=%d denied\n",
-                    resource);
+            fprintf(stderr, "kbox: prlimit64 SET pid=%d denied\n",
+                    (int) target);
         return kbox_dispatch_errno(EPERM);
     }
 
@@ -7088,28 +8568,291 @@ static struct kbox_dispatch dispatch_request_impl(
     return kbox_dispatch_errno(ENOSYS);
 }
 
+/* The kernel's internal "restart this syscall" codes. None of them is a
+ * userspace errno: the kernel converts them into a restarted syscall or EINTR
+ * before returning to userspace, and LKL hands the decision to its caller.
+ * Forwarding the raw code put "OSError: [Errno 512] No error information" in
+ * front of the guest -- test_ssl.test_subclass connected to its own listener
+ * in the pod and the connect came back as 512 instead of a connection.
+ */
+#define KBOX_ERESTART_FIRST 512 /* ERESTARTSYS */
+#define KBOX_ERESTART_LAST 516  /* ERESTART_RESTARTBLOCK */
+
+static int dispatch_is_restart(const struct kbox_dispatch *d)
+{
+    return d->kind == KBOX_DISPATCH_RETURN && d->error >= KBOX_ERESTART_FIRST &&
+           d->error <= KBOX_ERESTART_LAST;
+}
+
+/* Run one dispatch on a brand-new host thread.
+ *
+ * LKL gives every host thread its own kernel task, and it never resets a task's
+ * signal state. A container whose task ends up with a fatal signal pending (an
+ * OOM kill inside the LKL kernel is the way in) fails every read with EINTR for
+ * the rest of its life, while open(2) and fstat(2) keep working. A fresh thread
+ * gets a fresh task, so the call is simply re-run there.
+ *
+ * The dispatch thread waits for the helper, so the fd table and the scratch
+ * buffer are used by one thread at a time, as usual.
+ */
+struct kbox_retry_job {
+    struct kbox_supervisor_ctx *ctx;
+    const struct kbox_syscall_request *req;
+    struct kbox_dispatch result;
+};
+
+static void *kbox_retry_on_fresh_task(void *arg)
+{
+    struct kbox_retry_job *job = arg;
+
+    job->result = dispatch_request_impl(job->ctx, job->req);
+    return NULL;
+}
+
+static struct kbox_dispatch dispatch_on_fresh_task(
+    struct kbox_supervisor_ctx *ctx,
+    const struct kbox_syscall_request *req)
+{
+    struct kbox_retry_job job;
+    pthread_t thread;
+
+    memset(&job, 0, sizeof(job));
+    job.ctx = ctx;
+    job.req = req;
+    if (pthread_create(&thread, NULL, kbox_retry_on_fresh_task, &job) != 0)
+        return kbox_dispatch_errno(EINTR);
+    pthread_join(thread, NULL);
+    return job.result;
+}
+
+/* LKL never dequeues signals from the tasks it creates.
+ *
+ * When the LKL kernel queues a signal for the task running a syscall -- the OOM
+ * killer sending SIGKILL on a failed allocation is the one that matters here --
+ * nothing ever takes it off the queue. `filemap_read` returns -EINTR while a
+ * fatal signal is pending, so from that moment every read in that container
+ * fails with EINTR while open(2) and fstat(2) keep working, which is exactly
+ * what the pod runs showed. Draining the queue with a zero-timeout
+ * rt_sigtimedwait puts the task back to work.
+ *
+ * Returns the signal number that was pending, or a negative errno when there
+ * was none.
+ */
+static long lkl_task_drain_signal(struct kbox_supervisor_ctx *ctx)
+{
+    uint64_t all_signals = ~0ULL;
+    long zero_ts[2] = {0, 0};
+
+    if (!ctx || !ctx->sysnrs || ctx->sysnrs->rt_sigtimedwait <= 0)
+        return -ENOSYS;
+
+    long sig = lkl_syscall6(ctx->sysnrs->rt_sigtimedwait, (long) &all_signals,
+                            0L, (long) zero_ts, 0L, 8L, 0L);
+
+    /* A stale TIF_SIGPENDING bit also makes every interruptible wait abort
+     * even with an empty queue. Replacing the blocked set runs
+     * recalc_sigpending(), which clears the bit when nothing is queued. */
+    if (ctx->sysnrs->rt_sigprocmask > 0) {
+        long empty[1] = {0};
+
+        (void) lkl_syscall6(ctx->sysnrs->rt_sigprocmask, 2L /* SIG_SETMASK */,
+                            (long) empty, 0L, 8L, 0L, 0L);
+    }
+    return sig;
+}
+
+/* File I/O that LKL serves is not interruptible: the guest's kernel would never
+ * fail a regular-file read or write because a signal arrived. In the pod the
+ * LKL call does return EINTR, and the guest pays for it: musl's resolver treats
+ * a failed read of /etc/hosts as "the name is not listed" and falls back to
+ * DNS, so a plain bind(("localhost", 0)) ended up waiting for a DNS reply
+ * (test_ssl, test_asyncio, both wedged in socket_helper.bind_port).
+ *
+ * Only descriptors that LKL backs are retried. Sockets and pipes are host
+ * descriptors here, and EINTR on those is the caller's business.
+ */
+static int dispatch_retryable_file_io(const struct kbox_supervisor_ctx *ctx,
+                                      const struct kbox_syscall_request *req)
+{
+    const struct kbox_host_nrs *h;
+    long fd;
+
+    if (!ctx || !req)
+        return 0;
+    h = ctx->host_nrs;
+    /* Vector I/O belongs here for the same reason the scalar calls do: LKL
+     * can answer -EINTR when its engine is contended or its host task carries
+     * a stale pending signal, and a regular file never reports EINTR to
+     * userspace. Leaving the vector forms out lost real data: CPython writes
+     * the SSL keylog header with writev(), LKL's only attempt came back EINTR
+     * in the pod, OpenSSL ignored the failed write and the keylog file stayed
+     * empty (test_ssl.TestSSLDebug.test_keylog_defaults, "0 != 1").
+     *
+     * Retrying the whole request is safe because dispatch_iov_transfer()
+     * reports EINTR only when it transferred nothing.
+     */
+    if (req->nr != h->read && req->nr != h->pread64 && req->nr != h->write &&
+        req->nr != h->pwrite64 && req->nr != h->readv && req->nr != h->writev &&
+        req->nr != h->preadv && req->nr != h->pwritev)
+        return 0;
+    fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    if (fd < 0)
+        return 0;
+    return kbox_fd_table_get_lkl(ctx->fd_table, fd) >= 0;
+}
+
 struct kbox_dispatch kbox_dispatch_request(
     struct kbox_supervisor_ctx *ctx,
     const struct kbox_syscall_request *req)
 {
+    /* Trace every call that touches the first few virtual FD numbers. A
+     * write that never reaches the dispatcher at all is a different defect
+     * from a write that lands on the wrong file, and only the call sequence
+     * tells them apart.
+     */
+    if (ctx && req && getenv("KBOX_FD_TRACE") &&
+        (long) req->args[0] >= KBOX_FD_BASE &&
+        (long) req->args[0] < KBOX_FD_BASE + 8)
+        fprintf(stderr, "kbofdt: call fd=%ld nr=%d (%s) a1=%#llx a2=%#llx\n",
+                (long) req->args[0], (int) req->nr,
+                syscall_name_from_nr(ctx->host_nrs, req->nr),
+                (unsigned long long) req->args[1],
+                (unsigned long long) req->args[2]);
+
     struct kbox_dispatch d = dispatch_request_impl(ctx, req);
+    const char *name = NULL;
+
+    /* A syscall interrupted before it completed is supposed to run again. The
+     * retry budget keeps a signal storm from spinning here forever; after it
+     * the guest gets EINTR, which every libc and CPython's PEP 475 retry loop
+     * understands. */
+    if (ctx && req &&
+        (dispatch_is_restart(&d) ||
+         (d.kind == KBOX_DISPATCH_RETURN && d.error == EINTR &&
+          dispatch_retryable_file_io(ctx, req)))) {
+        int restarts = 0;
+        int eintrs = 0;
+        int retryable;
+
+        name = syscall_name_from_nr(ctx->host_nrs, req->nr);
+        for (;;) {
+            retryable = dispatch_retryable_file_io(ctx, req);
+            if (d.kind == KBOX_DISPATCH_RETURN && d.error == EINTR &&
+                retryable && ctx->lkl_task_poisoned) {
+                d = dispatch_on_fresh_task(ctx, req);
+                continue;
+            }
+            if (d.kind == KBOX_DISPATCH_RETURN && d.error == EINTR &&
+                retryable) {
+                /* LKL documents that a syscall may come back -EINTR when the
+                 * engine is contended, and that the caller should retry. The
+                 * window is longer than a tight loop covers: under the ssl
+                 * suite a read was interrupted on a thousand consecutive
+                 * attempts. Back off exponentially with a five second budget,
+                 * which is far longer than any page lock the engine holds. */
+                /* Three tries and twenty milliseconds: enough for the engine
+                 * to finish a page-in of its own, short enough that a
+                 * permanently interrupted descriptor is not worth blocking
+                 * the container on. */
+                if (eintrs >= 3)
+                    break;
+                if (eintrs == 0) {
+                    long sig = lkl_task_drain_signal(ctx);
+
+                    if (sig > 0) {
+                        static int reported;
+                        if (reported < 20) {
+                            reported++;
+                            fprintf(stderr,
+                                    "kbox: dropped pending signal %ld from the "
+                                    "LKL task; file I/O was failing with "
+                                    "EINTR\n",
+                                    sig);
+                        }
+                    }
+                }
+                if (eintrs > 0)
+                    usleep(20000);
+                eintrs++;
+                if (eintrs == 3) {
+                    /* This thread's LKL task is the suspect: try once on a
+                     * fresh one before giving the guest an error its kernel
+                     * would never produce. */
+                    d = dispatch_on_fresh_task(ctx, req);
+                    if (!(d.kind == KBOX_DISPATCH_RETURN && d.error == EINTR)) {
+                        static int reported;
+                        ctx->lkl_task_poisoned = 1;
+                        if (reported < 20) {
+                            reported++;
+                            fprintf(stderr,
+                                    "kbox: syscall nr=%d (%s) succeeded on a "
+                                    "fresh LKL task after %d EINTR; this "
+                                    "container's task stays poisoned\n",
+                                    (int) req->nr, name ? name : "unknown",
+                                    eintrs);
+                        }
+                    }
+                } else {
+                    d = dispatch_request_impl(ctx, req);
+                }
+                continue;
+            }
+            if (dispatch_is_restart(&d) && restarts < 8) {
+                restarts++;
+                d = dispatch_request_impl(ctx, req);
+                continue;
+            }
+            break;
+        }
+
+        if (dispatch_is_restart(&d)) {
+            static int reported;
+            if (reported < 200) {
+                reported++;
+                fprintf(stderr,
+                        "kbox: syscall nr=%d (%s) still interrupted after %d "
+                        "restarts; reporting EINTR\n",
+                        (int) req->nr, name ? name : "unknown", restarts);
+            }
+            d = kbox_dispatch_errno(EINTR);
+        } else if (d.kind == KBOX_DISPATCH_RETURN && d.error == EINTR) {
+            static int reported;
+            if (reported < 200) {
+                reported++;
+                fprintf(stderr,
+                        "kbox: syscall nr=%d (%s) on a guest file returned "
+                        "EINTR %d times; reporting EINTR\n",
+                        (int) req->nr, name ? name : "unknown", eintrs);
+            }
+        } else if (eintrs > 0) {
+            static int reported;
+            if (reported < 200) {
+                reported++;
+                fprintf(stderr,
+                        "kbox: syscall nr=%d (%s) recovered after %d EINTR\n",
+                        (int) req->nr, name ? name : "unknown", eintrs);
+            }
+        }
+    }
 
     /* Verbose mode shows entries only; without results a refused syscall is
      * invisible when diagnosing why an unmodified image misbehaves. */
     if (ctx && req && ctx->verbose && d.kind == KBOX_DISPATCH_RETURN &&
         d.error != 0) {
-        const char *name = syscall_name_from_nr(ctx->host_nrs, req->nr);
+        const char *call_name = syscall_name_from_nr(ctx->host_nrs, req->nr);
+
         fprintf(stderr, "kbox: result pid=%u nr=%d (%s) -> errno %d\n",
                 kbox_syscall_request_pid(req), (int) req->nr,
-                name ? name : "unknown", d.error);
+                call_name ? call_name : "unknown", d.error);
     }
     if (ctx && req && ctx->verbose && d.kind == KBOX_DISPATCH_RETURN &&
         d.error == 0) {
-        const char *name = syscall_name_from_nr(ctx->host_nrs, req->nr);
-        if (name &&
-            (strncmp(name, "recv", 4) == 0 || strncmp(name, "send", 4) == 0))
+        const char *call_name = syscall_name_from_nr(ctx->host_nrs, req->nr);
+
+        if (call_name && (strncmp(call_name, "recv", 4) == 0 ||
+                          strncmp(call_name, "send", 4) == 0))
             fprintf(stderr, "kbox: result pid=%u nr=%d (%s) -> %lld\n",
-                    kbox_syscall_request_pid(req), (int) req->nr, name,
+                    kbox_syscall_request_pid(req), (int) req->nr, call_name,
                     (long long) d.val);
     }
     return d;
@@ -7123,6 +8866,19 @@ struct kbox_dispatch kbox_dispatch_syscall(struct kbox_supervisor_ctx *ctx,
     if (kbox_syscall_request_from_notif(notif_ptr, &req) < 0)
         return kbox_dispatch_errno(EINVAL);
     struct kbox_dispatch d = kbox_dispatch_request(ctx, &req);
+
+    /* A parked accept or blocking receive is waiting for exactly this kind of
+     * event: the syscall that just ran may have completed the connection (a
+     * guest connect) or delivered the datagram. Polling here, not only at the
+     * top of the supervisor loop, makes the completion happen before the
+     * guest's next syscall. Without it the deferred accept of the server side
+     * completed only after the client had already closed the connection, so
+     * asyncio never ran the client_connected_cb
+     * (test_asyncio.test_streams.test_unhandled_exception).
+     */
+    if (ctx->pending_accept_count > 0 || ctx->pending_recv_count > 0)
+        kbox_dispatch_poll_pending(ctx);
+
     /* Verbose diagnostics: name the syscall that was rejected, with its fd
      * arguments. Without this an unexpected EBADF inside a program is opaque.
      */

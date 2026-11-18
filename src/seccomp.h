@@ -148,6 +148,49 @@ struct kbox_pending_accept {
     unsigned int in_len;
 };
 
+/* A blocking datagram recvfrom that the supervisor must not wait for.
+ *
+ * The dispatcher is one thread: it receives a notification, runs the handler,
+ * answers. A blocking recvfrom on a shadow socket therefore stalls every other
+ * syscall of the whole guest, including the other threads of the same process.
+ * Python's asyncio test helpers run a UDP echo server in a thread; the echo
+ * thread blocked in recvfrom and the main thread never got its own sendto
+ * handled, so test_asyncio hung. The request is parked here instead and the
+ * main loop completes it when data arrives.
+ */
+struct kbox_pending_recv {
+    int active;
+    struct kbox_syscall_request req;
+    long fd;
+    uint64_t buf_ptr;
+    uint64_t src_ptr;
+    uint64_t addrlen_ptr;
+    size_t len;
+    long flags;
+    unsigned int addrlen;
+    long deadline_ms; /* CLOCK_MONOTONIC, -1 = no SO_RCVTIMEO */
+};
+
+#define KBOX_PENDING_RECVS_MAX 16
+
+/* A blocking recvmsg(2) that has to wait for a datagram.
+ *
+ * The dispatcher answers every notification for the container on one thread, so
+ * waiting inside it stops the guest's other threads (the sending thread of the
+ * same process among them) from being served at all. The notification is parked
+ * instead and completed by kbox_dispatch_poll_pending.
+ */
+struct kbox_pending_recvmsg {
+    int active;
+    struct kbox_syscall_request req;
+    long fd;
+    uint64_t msg_ptr;
+    long flags;
+    long deadline_ms;
+};
+
+#define KBOX_PENDING_RECVMSGS_MAX 8
+
 struct kbox_supervisor_ctx {
     const struct kbox_sysnrs *sysnrs;
     const struct kbox_host_nrs *host_nrs;
@@ -171,6 +214,10 @@ struct kbox_supervisor_ctx {
     const struct kbox_fd_inject_ops *fd_inject_ops;
     struct kbox_web_ctx *web;
     unsigned active_writeback_shadows;
+    /* Set once this container's LKL task answers file I/O with EINTR no
+     * matter what: LKL never resets a task's signal state, so the remaining
+     * calls have to run on a fresh task (see dispatch_on_fresh_task). */
+    int lkl_task_poisoned;
     unsigned path_translation_generation;
     struct kbox_path_shadow_cache_entry
         path_shadow_cache[KBOX_PATH_SHADOW_CACHE_MAX];
@@ -201,6 +248,10 @@ struct kbox_supervisor_ctx {
 
     struct kbox_pending_accept pending_accepts[KBOX_PENDING_ACCEPTS_MAX];
     size_t pending_accept_count;
+    struct kbox_pending_recv pending_recvs[KBOX_PENDING_RECVS_MAX];
+    size_t pending_recv_count;
+    struct kbox_pending_recvmsg pending_recvmsgs[KBOX_PENDING_RECVMSGS_MAX];
+    size_t pending_recvmsg_count;
 
     struct kbox_fd_table *root_fd_table;
     struct kbox_proc_fd_entry *proc_fds;
@@ -208,6 +259,14 @@ struct kbox_supervisor_ctx {
     struct kbox_proc_fd_entry *active_proc;
     struct kbox_pending_fork *pending_forks;
     size_t pending_fork_count;
+    /* umask the guest last set. A file created on a bind mount is created by
+     * the supervisor's kernel, which applies the supervisor's umask, so the
+     * creation is corrected to this mask explicitly. */
+    unsigned guest_umask;
+    /* wait4/waitid was just dispatched. The child may still have been alive at
+     * that moment, so the dead-process shadows cannot be flushed yet; the next
+     * syscall of the parent is the first point where they can be. */
+    int pending_reap;
     struct kbox_pid_tgid_entry pid_tgid_cache[KBOX_PID_TGID_CACHE_MAX];
 
     const struct kbox_host_bind *host_binds;
@@ -269,6 +328,10 @@ int kbox_notify_send(int listener_fd, const void *resp);
 int kbox_notify_respond(int listener_fd,
                         uint64_t id,
                         const struct kbox_dispatch *d);
+/* A writeback that outstayed its budget is left running on its own thread; its
+ * LKL descriptor must never be closed or reused while that thread may still be
+ * inside a call on it. */
+int kbox_lkl_fd_is_abandoned(long lkl_fd);
 void kbox_dispatch_poll_pending(struct kbox_supervisor_ctx *ctx);
 int kbox_notify_addfd(int listener_fd,
                       uint64_t id,

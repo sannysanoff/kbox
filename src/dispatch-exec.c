@@ -310,6 +310,25 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
+
+    /* A writable shared mapping of a shadow memfd modifies the memfd through
+     * the page cache: its size does not change and its mtime is not stamped
+     * when the guest expects it. Record that so the copy back at close always
+     * runs; gdbm's ndbm backend writes its pages this way, and the skipped
+     * copy lost every stored key (test_dbm_ndbm).
+     */
+    {
+        int mmap_flags = (int) kbox_syscall_request_arg(req, 3);
+        int mmap_prot = (int) kbox_syscall_request_arg(req, 2);
+        struct kbox_fd_entry *hp = fd_table_entry(ctx->fd_table, fd);
+
+        if (hp && hp->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW &&
+            (mmap_flags & MAP_SHARED) != 0 && (mmap_prot & PROT_WRITE) != 0) {
+            hp->shadow_mmap = 1;
+            invalidate_path_shadow_cache(ctx);
+        }
+    }
+
     if (lkl_fd >= 0) {
         long host = kbox_fd_table_get_host_fd(ctx->fd_table, fd);
         if (host == -1 || host == KBOX_FD_LOCAL_ONLY_SHADOW) {
@@ -1522,6 +1541,160 @@ fail: {
 }
 }
 
+/* Prepare an exec image for the host kernel.
+ *
+ * A non-ELF file is a #! script. The host kernel would run binfmt_script on the
+ * memfd and resolve the shebang to a *host* path, which does not exist, so kbox
+ * used to answer ENOEXEC and leave the script to the calling shell. That works
+ * for shells and breaks every program that execs a script and expects the
+ * kernel to honour the shebang -- gosu, su-exec, tini, env -- which is how
+ * official images re-exec their entrypoints. Instead, rewrite the shebang to
+ * the interpreter's injected memfd and let binfmt_script do the rest: the
+ * kernel execs /proc/self/fd/<interp> and passes the script as argv[1]. The
+ * script fd therefore has to survive the exec, which is why the caller is told
+ * not to set O_CLOEXEC on it.
+ *
+ * A dynamic ELF gets the same treatment for PT_INTERP: the interpreter is
+ * extracted from the guest rootfs and injected, and the header is patched.
+ *
+ * Returns 0 on success, or a negative errno. On failure the memfd is closed and
+ * *exec_memfd_io is set to -1. On success *exec_memfd_io holds the image to
+ * inject and *cloexec_out says whether the descriptor has to survive the exec.
+ */
+static int prepare_exec_image(struct kbox_supervisor_ctx *ctx,
+                              const struct kbox_syscall_request *req,
+                              int *exec_memfd_io,
+                              const char *pathbuf,
+                              int *cloexec_out)
+{
+    int exec_memfd = *exec_memfd_io;
+    int exec_fd_cloexec = O_CLOEXEC;
+    {
+        unsigned char elf_magic[4];
+        if (pread(exec_memfd, elf_magic, 4, 0) != 4 || memcmp(elf_magic,
+                                                              "\x7f"
+                                                              "ELF",
+                                                              4) != 0) {
+            int rewritten =
+                rewrite_script_shebang(ctx, req, &exec_memfd, pathbuf);
+            if (rewritten < 0 && ctx->verbose)
+                fprintf(stderr, "kbox: exec %s: shebang rewrite failed: %s\n",
+                        pathbuf, kbox_err_text(rewritten));
+            if (rewritten < 0) {
+                close(exec_memfd);
+                *exec_memfd_io = -1;
+                return rewritten;
+            }
+            exec_fd_cloexec = 0;
+        }
+    }
+
+    /* Check for PT_INTERP (dynamic binary). */
+    {
+        unsigned char *elf_buf = NULL;
+        size_t elf_buf_len = 0;
+
+        if (kbox_read_elf_header_window_fd(exec_memfd, &elf_buf,
+                                           &elf_buf_len) == 0) {
+            char interp_path[256];
+            uint64_t pt_offset, pt_filesz;
+            int ilen = kbox_find_elf_interp_loc(
+                elf_buf, elf_buf_len, interp_path, sizeof(interp_path),
+                &pt_offset, &pt_filesz);
+
+            munmap(elf_buf, elf_buf_len);
+
+            if (ilen < 0) {
+                close(exec_memfd);
+                *exec_memfd_io = -1;
+                return -ENOEXEC;
+            }
+
+            if (ilen > 0) {
+                /* Dynamic binary. Extract the interpreter from LKL and inject
+                 * it into the tracee.
+                 */
+                long interp_lkl = kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX,
+                                                  interp_path, O_RDONLY, 0);
+                if (interp_lkl < 0) {
+                    if (ctx->verbose)
+                        fprintf(stderr,
+                                "kbox: exec %s: cannot open "
+                                "interpreter %s: %s\n",
+                                pathbuf, interp_path,
+                                kbox_err_text(interp_lkl));
+                    close(exec_memfd);
+                    *exec_memfd_io = -1;
+                    return (int) interp_lkl;
+                }
+
+                int interp_memfd = kbox_shadow_create(ctx->sysnrs, interp_lkl);
+                lkl_close_and_invalidate(ctx, interp_lkl);
+
+                if (interp_memfd < 0) {
+                    close(exec_memfd);
+                    *exec_memfd_io = -1;
+                    return interp_memfd;
+                }
+
+                /* Inject the interpreter memfd first so we know its FD number
+                 * in the tracee for the PT_INTERP patch. O_CLOEXEC is safe: the
+                 * kernel resolves /proc/self/fd/N via open_exec() before
+                 * begin_new_exec() closes CLOEXEC descriptors.
+                 */
+                int tracee_interp_fd =
+                    request_addfd(ctx, req, interp_memfd, O_CLOEXEC);
+                close(interp_memfd);
+
+                if (tracee_interp_fd < 0) {
+                    close(exec_memfd);
+                    *exec_memfd_io = -1;
+                    return -tracee_interp_fd;
+                }
+
+                /* Patch PT_INTERP in the exec memfd to point at the injected
+                 * interpreter: /proc/self/fd/<N>.
+                 */
+                char new_interp[64];
+                int new_len = snprintf(new_interp, sizeof(new_interp),
+                                       "/proc/self/fd/%d", tracee_interp_fd);
+
+                if ((uint64_t) (new_len + 1) > pt_filesz) {
+                    close(exec_memfd);
+                    *exec_memfd_io = -1;
+                    return -ENOMEM;
+                }
+
+                char patch[256];
+                size_t patch_len = (size_t) pt_filesz;
+                if (patch_len > sizeof(patch))
+                    patch_len = sizeof(patch);
+                memset(patch, 0, patch_len);
+                memcpy(patch, new_interp, (size_t) new_len);
+
+                if (pwrite(exec_memfd, patch, patch_len, (off_t) pt_offset) !=
+                    (ssize_t) patch_len) {
+                    close(exec_memfd);
+                    *exec_memfd_io = -1;
+                    return -EIO;
+                }
+
+                if (ctx->verbose)
+                    fprintf(stderr,
+                            "kbox: exec %s: interpreter %s "
+                            "-> /proc/self/fd/%d\n",
+                            pathbuf, interp_path, tracee_interp_fd);
+            }
+        } else {
+            munmap(elf_buf, elf_buf_len);
+        }
+    }
+
+    *exec_memfd_io = exec_memfd;
+    *cloexec_out = exec_fd_cloexec;
+    return 0;
+}
+
 static struct kbox_dispatch forward_execve_impl(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx,
@@ -1592,6 +1765,117 @@ struct kbox_dispatch forward_execve(const struct kbox_syscall_request *req,
     return d;
 }
 
+/* Resolve a symlink chain that starts at a path on a bind mount.
+ *
+ * The host resolves a link found on the mount against the *host* root, but an
+ * absolute target names a file in the guest rootfs. test_sysconfig and
+ * test_platform symlink the interpreter into a temporary directory and exec
+ * the link; the host has no /usr/local/bin/python3, so execve answered ENOENT.
+ *
+ * Returns 1 when out holds a host path that can be opened directly, 0 when out
+ * holds an absolute guest path that must be resolved through the guest rootfs,
+ * and -errno on failure.
+ */
+static int resolve_mount_exec_path(const char *host_path,
+                                   char *out,
+                                   size_t out_size)
+{
+    char cur[KBOX_MAX_PATH];
+
+    if (snprintf(cur, sizeof(cur), "%s", host_path) >= (int) sizeof(cur))
+        return -ENAMETOOLONG;
+    for (int hop = 0; hop < 8; hop++) {
+        struct stat st;
+        char tgt[KBOX_MAX_PATH];
+        char *slash;
+        ssize_t n;
+
+        if (lstat(cur, &st) < 0)
+            return -errno;
+        if (!S_ISLNK(st.st_mode)) {
+            if (snprintf(out, out_size, "%s", cur) >= (int) out_size)
+                return -ENAMETOOLONG;
+            return 1;
+        }
+        n = readlink(cur, tgt, sizeof(tgt) - 1);
+        if (n <= 0)
+            return n < 0 ? -errno : -EINVAL;
+        tgt[n] = '\0';
+        if (tgt[0] == '/') {
+            if (snprintf(out, out_size, "%s", tgt) >= (int) out_size)
+                return -ENAMETOOLONG;
+            return 0; /* guest absolute path */
+        }
+        slash = strrchr(cur, '/');
+        if (!slash)
+            return -EINVAL;
+        *slash = '\0';
+        if (snprintf(out, out_size, "%s/%s", cur, tgt) >= (int) out_size)
+            return -ENAMETOOLONG;
+        if (snprintf(cur, sizeof(cur), "%s", out) >= (int) sizeof(cur))
+            return -ENAMETOOLONG;
+    }
+    return -ELOOP;
+}
+
+/* fexecve() through a kbox descriptor.
+ *
+ * execveat(fd, "", argv, envp, AT_EMPTY_PATH) names the executable by
+ * descriptor. A virtual descriptor exists only in kbox's table, so the host
+ * kernel answers EBADF. The file is copied out of the guest filesystem into an
+ * executable image, prepared like any other exec (shebang or PT_INTERP), and
+ * injected at the same descriptor number. The empty pathname is never touched.
+ */
+static struct kbox_dispatch fexecve_virtual_fd(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx)
+{
+    long fd = to_dirfd_arg(kbox_syscall_request_arg(req, 0));
+    if (fd < 0)
+        return kbox_dispatch_continue();
+
+    long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (lkl_fd < 0)
+        return kbox_dispatch_continue();
+
+    /* The tracee already holds a host descriptor here: the kernel can exec it
+     * without help (this is the re-exec through the image.c exec memfd). */
+    if (child_fd_is_open(ctx, fd))
+        return kbox_dispatch_continue();
+
+    /* execveat(2) requires the file open for reading. */
+    long acc = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, F_GETFL, 0);
+    if (acc < 0 || (acc & O_ACCMODE) != O_RDONLY)
+        return kbox_dispatch_continue();
+
+    int exec_memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
+    if (exec_memfd < 0)
+        return kbox_dispatch_continue();
+
+    int cloexec = O_CLOEXEC;
+    int rc = prepare_exec_image(ctx, req, &exec_memfd, "<fexecve>", &cloexec);
+    if (rc < 0) {
+        if (exec_memfd >= 0)
+            close(exec_memfd);
+        return kbox_dispatch_errno(-rc);
+    }
+
+    int injected = request_addfd_at(ctx, req, exec_memfd, (int) fd, cloexec);
+    close(exec_memfd);
+    if (injected < 0)
+        return kbox_dispatch_errno(-injected);
+    if (injected != fd) {
+        /* ADDFD_AT promises the requested number; anything else would leave a
+         * descriptor the guest never asked for. */
+        fprintf(stderr,
+                "kbox: fexecve ADDFD_AT returned %d, expected %ld -- "
+                "aborting\n",
+                injected, fd);
+        abort();
+    }
+    return kbox_dispatch_continue();
+}
+
 static struct kbox_dispatch forward_execve_impl(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx,
@@ -1599,14 +1883,24 @@ static struct kbox_dispatch forward_execve_impl(
 {
     pid_t pid = kbox_syscall_request_pid(req);
 
-    /* Detect fexecve: execveat(fd, "", argv, envp, AT_EMPTY_PATH). This is the
-     * initial exec from image.c on the host memfd. Let the kernel handle it
-     * directly.
+    /* Detect fexecve: execveat(fd, "", argv, envp, AT_EMPTY_PATH). A descriptor
+     * the tracee really holds on the host (the exec memfd from image.c, a
+     * shadow, an interpreter's own fd) is resolved by the kernel directly.
+     * A kbox virtual descriptor has no host descriptor behind it, so the
+     * kernel answered EBADF and every fexecve() failed
+     * (test_posix.test_fexecve, and the child left behind kept running the test
+     * suite, which is what aborted the whole module on a timeout).
+     *
+     * With AT_EMPTY_PATH the pathname is ignored, so nothing can be rewritten
+     * in the tracee's (empty) path buffer. Instead the file is materialised as
+     * an executable image at the very descriptor number the guest named, and
+     * the syscall continues: the kernel resolves that number and execs the
+     * image.
      */
     if (is_execveat) {
         long flags = to_c_long_arg(kbox_syscall_request_arg(req, 4));
         if (flags & KBOX_AT_EMPTY_PATH)
-            return kbox_dispatch_continue();
+            return fexecve_virtual_fd(req, ctx);
     }
 
     /* Read pathname from tracee memory. */
@@ -1648,14 +1942,41 @@ static struct kbox_dispatch forward_execve_impl(
     if (brc < 0)
         return kbox_dispatch_errno(-brc);
 
-    int exec_memfd;
-    if (brc > 0) {
-        int hfd = open(translated, O_RDONLY | O_CLOEXEC);
-        if (hfd < 0)
-            return kbox_dispatch_errno(errno);
-        exec_memfd = kbox_shadow_create_from_host_fd(hfd);
-        close(hfd);
-    } else {
+    int exec_memfd = -1;
+
+    /* Follow symlinks that live on a bind mount. A link there may point at a
+     * sibling inside the same mount (a host path) or at an absolute guest path
+     * such as the interpreter in the guest rootfs. Neither case can be left to
+     * the host kernel, which resolves both against the host root.
+     */
+    for (int hop = 0; hop < 8; hop++) {
+        char resolved[KBOX_MAX_PATH];
+        int kind;
+
+        brc = kbox_resolve_host_bind_at(ctx, raw_dirfd, pathbuf, translated,
+                                        sizeof(translated), &bind_ro);
+        if (brc < 0)
+            return kbox_dispatch_errno(-brc);
+        if (brc > 0) {
+            kind =
+                resolve_mount_exec_path(translated, resolved, sizeof(resolved));
+            if (kind < 0)
+                return kbox_dispatch_errno(-kind);
+            if (kind == 0) {
+                /* Absolute target: resolve it from the top, it may be another
+                 * bind mount or a guest rootfs path. */
+                snprintf(pathbuf, sizeof(pathbuf), "%s", resolved);
+                raw_dirfd = AT_FDCWD_LINUX;
+                continue;
+            }
+            int hfd = open(resolved, O_RDONLY | O_CLOEXEC);
+            if (hfd < 0)
+                return kbox_dispatch_errno(errno);
+            exec_memfd = kbox_shadow_create_from_host_fd(hfd);
+            close(hfd);
+            break;
+        }
+
         rc = kbox_translate_path_for_lkl(pid, pathbuf, ctx->host_root,
                                          translated, sizeof(translated));
         if (rc < 0)
@@ -1668,7 +1989,6 @@ static struct kbox_dispatch forward_execve_impl(
         if (kbox_is_lkl_virtual_path(translated))
             return kbox_dispatch_errno(EACCES);
 
-
         /* Open the binary from LKL. */
         long lkl_fd = kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX, translated,
                                       O_RDONLY, 0);
@@ -1678,6 +1998,7 @@ static struct kbox_dispatch forward_execve_impl(
         /* Create a memfd with the binary contents. */
         exec_memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
         lkl_close_and_invalidate(ctx, lkl_fd);
+        break;
     }
 
     if (exec_memfd < 0)
@@ -1691,132 +2012,12 @@ static struct kbox_dispatch forward_execve_impl(
     if (request_uses_trap_signals(req))
         return trap_userspace_exec(req, ctx, exec_memfd, pathbuf, is_execveat);
 
-    /* Non-ELF executables are #! scripts. The host kernel would run
-     * binfmt_script on the memfd and resolve the shebang to a *host* path,
-     * which does not exist, so kbox used to answer ENOEXEC and leave the
-     * script to the calling shell. That works for shells and breaks every
-     * program that execs a script and expects the kernel to honour the
-     * shebang -- gosu, su-exec, tini, env -- which is how official images
-     * re-exec their entrypoints.
-     *
-     * Instead, rewrite the shebang to the interpreter's injected memfd and let
-     * binfmt_script do the rest: the kernel execs /proc/self/fd/<interp> and
-     * passes the script as argv[1]. The script fd therefore has to survive the
-     * exec, which is why this branch injects it without O_CLOEXEC.
-     */
     int exec_fd_cloexec = O_CLOEXEC;
-    {
-        unsigned char elf_magic[4];
-        if (pread(exec_memfd, elf_magic, 4, 0) != 4 || memcmp(elf_magic,
-                                                              "\x7f"
-                                                              "ELF",
-                                                              4) != 0) {
-            int rewritten =
-                rewrite_script_shebang(ctx, req, &exec_memfd, pathbuf);
-            if (rewritten < 0 && ctx->verbose)
-                fprintf(stderr, "kbox: exec %s: shebang rewrite failed: %s\n",
-                        pathbuf, kbox_err_text(rewritten));
-            if (rewritten < 0) {
-                close(exec_memfd);
-                return kbox_dispatch_errno(-rewritten);
-            }
-            exec_fd_cloexec = 0;
-        }
-    }
-
-    /* Check for PT_INTERP (dynamic binary). */
-    {
-        unsigned char *elf_buf = NULL;
-        size_t elf_buf_len = 0;
-
-        if (kbox_read_elf_header_window_fd(exec_memfd, &elf_buf,
-                                           &elf_buf_len) == 0) {
-            char interp_path[256];
-            uint64_t pt_offset, pt_filesz;
-            int ilen = kbox_find_elf_interp_loc(
-                elf_buf, elf_buf_len, interp_path, sizeof(interp_path),
-                &pt_offset, &pt_filesz);
-
-            munmap(elf_buf, elf_buf_len);
-
-            if (ilen < 0) {
-                close(exec_memfd);
-                return kbox_dispatch_errno(ENOEXEC);
-            }
-
-            if (ilen > 0) {
-                /* Dynamic binary. Extract the interpreter from LKL and inject
-                 * it into the tracee.
-                 */
-                long interp_lkl = kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX,
-                                                  interp_path, O_RDONLY, 0);
-                if (interp_lkl < 0) {
-                    if (ctx->verbose)
-                        fprintf(stderr,
-                                "kbox: exec %s: cannot open "
-                                "interpreter %s: %s\n",
-                                pathbuf, interp_path,
-                                kbox_err_text(interp_lkl));
-                    close(exec_memfd);
-                    return kbox_dispatch_errno((int) (-interp_lkl));
-                }
-
-                int interp_memfd = kbox_shadow_create(ctx->sysnrs, interp_lkl);
-                lkl_close_and_invalidate(ctx, interp_lkl);
-
-                if (interp_memfd < 0) {
-                    close(exec_memfd);
-                    return kbox_dispatch_errno(-interp_memfd);
-                }
-
-                /* Inject the interpreter memfd first so we know its FD number
-                 * in the tracee for the PT_INTERP patch. O_CLOEXEC is safe: the
-                 * kernel resolves /proc/self/fd/N via open_exec() before
-                 * begin_new_exec() closes CLOEXEC descriptors.
-                 */
-                int tracee_interp_fd =
-                    request_addfd(ctx, req, interp_memfd, O_CLOEXEC);
-                close(interp_memfd);
-
-                if (tracee_interp_fd < 0) {
-                    close(exec_memfd);
-                    return kbox_dispatch_errno(-tracee_interp_fd);
-                }
-
-                /* Patch PT_INTERP in the exec memfd to point at the injected
-                 * interpreter: /proc/self/fd/<N>.
-                 */
-                char new_interp[64];
-                int new_len = snprintf(new_interp, sizeof(new_interp),
-                                       "/proc/self/fd/%d", tracee_interp_fd);
-
-                if ((uint64_t) (new_len + 1) > pt_filesz) {
-                    close(exec_memfd);
-                    return kbox_dispatch_errno(ENOMEM);
-                }
-
-                char patch[256];
-                size_t patch_len = (size_t) pt_filesz;
-                if (patch_len > sizeof(patch))
-                    patch_len = sizeof(patch);
-                memset(patch, 0, patch_len);
-                memcpy(patch, new_interp, (size_t) new_len);
-
-                if (pwrite(exec_memfd, patch, patch_len, (off_t) pt_offset) !=
-                    (ssize_t) patch_len) {
-                    close(exec_memfd);
-                    return kbox_dispatch_errno(EIO);
-                }
-
-                if (ctx->verbose)
-                    fprintf(stderr,
-                            "kbox: exec %s: interpreter %s "
-                            "-> /proc/self/fd/%d\n",
-                            pathbuf, interp_path, tracee_interp_fd);
-            }
-        } else {
-            munmap(elf_buf, elf_buf_len);
-        }
+    rc = prepare_exec_image(ctx, req, &exec_memfd, pathbuf, &exec_fd_cloexec);
+    if (rc < 0) {
+        if (exec_memfd >= 0)
+            close(exec_memfd);
+        return kbox_dispatch_errno(-rc);
     }
 
     /* Inject the exec memfd into the tracee. O_CLOEXEC keeps the tracee's FD

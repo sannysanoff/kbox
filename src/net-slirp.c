@@ -191,9 +191,18 @@ static int wakeup_pipe[2] = {-1, -1};
 
 #define DGRAM_ADDR_QUEUE_LEN 64
 
+/* Per-datagram metadata the guest must see with the data: the source address
+ * and the ancillary data (IPV6_TCLASS, IPV6_HOPLIMIT, IP_TOS ...) the LKL
+ * socket produced. The data itself travels through the supervisor socketpair,
+ * which cannot carry either.
+ */
+#define SHADOW_DGRAM_CTL_MAX 256
+
 struct dgram_addr_entry {
     uint8_t addr[128];
     unsigned int addrlen;
+    uint8_t ctl[SHADOW_DGRAM_CTL_MAX];
+    size_t ctllen;
 };
 
 struct shadow_socket {
@@ -218,7 +227,93 @@ struct shadow_socket {
     unsigned int dgram_tail;
     uint64_t gen;
     int active;
+    /* Diagnostics for the readiness defect: how long buffered guest data has
+     * been waiting for the LKL socket to accept it. */
+    uint64_t stall_since_ns;
+    int stall_reported;
+    /* ICMP-derived error (ECONNRESET and friends) that the guest's next
+     * receive must report once, as a real datagram socket does. */
+    long pending_recv_error;
+    /* The tracee closed this socket while it still held bytes for the LKL
+     * socket. close(2) may not wait for those bytes: the guest's own reader is
+     * often the process that must drain them, and the dispatcher answers every
+     * notification of the container, so waiting here froze both ends for the
+     * whole wait (test_socket.SendfileUsingSendfileTest.testOffset lost its
+     * tail after ten seconds of nothing). The pump finishes the transfer and
+     * closes the LKL socket itself.
+     */
+    int closing;
+    int owns_lkl;
+    uint64_t closing_since_ns;
 };
+
+/* How long a closed bridge may keep an LKL socket alive while it finishes
+ * delivering the bytes the tracee already wrote. The tracee needs the
+ * dispatcher to make progress, so a reader that never comes back is a real
+ * possibility and must not pin the slot forever.
+ */
+#define KBOX_CLOSE_DRAIN_NS (5ull * 1000000000ull)
+
+/* Where the bridge pump is right now.
+ *
+ * The pump is the only thread that reads and writes the LKL sockets behind the
+ * tracees' socketpairs, and it holds shadow_lock while it does so. A pump that
+ * stops for good freezes every socket of every container and leaves nothing but
+ * a guest spinning on a poll that keeps reporting ready, so the current step is
+ * published here for the supervisor's stall reporter to print.
+ */
+enum {
+    KBOX_PUMP_IDLE = 0,
+    KBOX_PUMP_PASS,
+    KBOX_PUMP_FLUSH_TO_LKL,
+    KBOX_PUMP_READ_GUEST,
+    KBOX_PUMP_LKL_POLL,
+    KBOX_PUMP_LKL_READ,
+    KBOX_PUMP_CLOSE_FLUSH,
+};
+
+/* Completion of pump passes, so a readiness call can wait until the bridge
+ * has nothing left to move.
+ *
+ * The pump is the only thread that touches the LKL sockets, and it holds
+ * shadow_lock while it does. A dispatcher that waits here holds no lock and
+ * runs no LKL code: it only waits for the pump's own report, which is why this
+ * cannot starve the pump the way a synchronous pump from the dispatcher did.
+ */
+static pthread_mutex_t g_pass_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pass_cond = PTHREAD_COND_INITIALIZER;
+static unsigned int g_pass_epoch; /* bumped for every guest write */
+static unsigned int g_pass_done;  /* epoch the pump has fully delivered */
+static int g_pass_count;          /* completed passes, for diagnostics */
+
+static volatile int g_pump_stage;
+static volatile int g_pump_slot;
+static volatile uint64_t g_pump_since_ns;
+
+static uint64_t shadow_now_ns(void);
+
+static void pump_note(int stage, int slot)
+{
+    g_pump_stage = stage;
+    g_pump_slot = slot;
+    __atomic_store_n(&g_pump_since_ns, shadow_now_ns(), __ATOMIC_RELAXED);
+}
+
+/* Age of the current pump step in milliseconds (0 when the pump is idle). */
+uint64_t kbox_net_pump_stage_age_ms(int *stage, int *slot)
+{
+    uint64_t since = __atomic_load_n(&g_pump_since_ns, __ATOMIC_RELAXED);
+    uint64_t now;
+
+    *stage = g_pump_stage;
+    *slot = g_pump_slot;
+    if (*stage == KBOX_PUMP_IDLE || since == 0)
+        return 0;
+    now = shadow_now_ns();
+    if (now <= since)
+        return 0;
+    return (now - since) / 1000000ull;
+}
 
 static struct shadow_socket shadow_sockets[MAX_SHADOW_SOCKETS];
 static uint64_t next_shadow_gen = 1;
@@ -499,8 +594,22 @@ static int get_revents_cb(int idx, void *opaque)
 #define LKL_SIOCADDRT 0x890B
 #define LKL_SIOCDELRT 0x890C
 
-static void retire_shadow_socket(struct shadow_socket *sock)
+/* Tear a bridge down. `why` names the caller: a bridge that disappears with
+ * data still buffered loses those bytes, and only the reason tells a reader
+ * whether that is expected (the guest closed) or a defect.
+ */
+static void retire_shadow_socket(struct shadow_socket *sock, const char *why)
 {
+    if (getenv("KBOX_NET_TRACE"))
+        fprintf(stderr, "kbox: net: retire lkl=%d sp=%d gen=%llu why=%s\n",
+                sock->lkl_fd, sock->supervisor_fd,
+                (unsigned long long) sock->gen, why);
+    if (getenv("KBOX_NET_TRACE") &&
+        (sock->to_lkl_len > 0 || sock->to_supervisor_len > 0) &&
+        sock->lkl_fd >= 0 && sock->supervisor_fd >= 0)
+        fprintf(stderr,
+                "kbox: net: retire lkl=%d why=%s DROPS to_lkl=%zu to_sup=%zu\n",
+                sock->lkl_fd, why, sock->to_lkl_len, sock->to_supervisor_len);
     sock->active = 0;
     if (sock->supervisor_fd >= 0) {
         close(sock->supervisor_fd);
@@ -508,13 +617,21 @@ static void retire_shadow_socket(struct shadow_socket *sock)
     }
 }
 
+/* Hands everything the tracee wrote to the LKL socket. Returns the number of
+ * bytes transferred (0 when nothing was pending) or -1 on a fatal error, so the
+ * caller can tell whether this pass pushed data that may now be readable on the
+ * peer.
+ */
 static int shadow_flush_to_lkl(struct shadow_socket *sock)
 {
+    int moved = 0;
+
     while (sock->to_lkl_len > 0) {
         long r = kbox_lkl_sendto(
             net_sysnrs, sock->lkl_fd, sock->to_lkl_buf + sock->to_lkl_off,
             (long) sock->to_lkl_len, LKL_MSG_DONTWAIT, NULL, 0);
         if (r > 0) {
+            moved += (int) r;
             sock->to_lkl_off += (size_t) r;
             sock->to_lkl_len -= (size_t) r;
             if (sock->to_lkl_len == 0)
@@ -522,8 +639,12 @@ static int shadow_flush_to_lkl(struct shadow_socket *sock)
             continue;
         }
         if (r == -EAGAIN || r == -EWOULDBLOCK || r == -EINPROGRESS ||
-            r == -EALREADY)
-            return 0;
+            r == -EALREADY || r == -EINTR || (r <= -512 && r >= -516))
+            return moved;
+        if (getenv("KBOX_NET_TRACE"))
+            fprintf(stderr,
+                    "kbox: net: flush_to_lkl lkl=%d pending=%zu -> %ld\n",
+                    sock->lkl_fd, sock->to_lkl_len, r);
         return -1;
     }
     if (sock->sp_eof && !sock->lkl_wr_shutdown &&
@@ -531,12 +652,14 @@ static int shadow_flush_to_lkl(struct shadow_socket *sock)
         kbox_lkl_shutdown(net_sysnrs, sock->lkl_fd, 1 /* SHUT_WR */);
         sock->lkl_wr_shutdown = 1;
     }
-    return 0;
+    return moved;
 }
 
 static void push_dgram_addr_locked(struct shadow_socket *sock)
 {
-    if (sock->sock_type != SOCK_DGRAM || sock->pending_dgram_addr.addrlen == 0)
+    if (sock->sock_type != SOCK_DGRAM ||
+        (sock->pending_dgram_addr.addrlen == 0 &&
+         sock->pending_dgram_addr.ctllen == 0))
         return;
 
     unsigned int next_tail = (sock->dgram_tail + 1) % DGRAM_ADDR_QUEUE_LEN;
@@ -545,6 +668,7 @@ static void push_dgram_addr_locked(struct shadow_socket *sock)
     sock->dgram_q[sock->dgram_tail] = sock->pending_dgram_addr;
     sock->dgram_tail = next_tail;
     sock->pending_dgram_addr.addrlen = 0;
+    sock->pending_dgram_addr.ctllen = 0;
 }
 
 static int shadow_flush_to_supervisor(struct shadow_socket *sock)
@@ -575,9 +699,22 @@ static int shadow_flush_to_supervisor(struct shadow_socket *sock)
     return 0;
 }
 
+/* Errors that mean "nothing to report yet", not "this socket is broken".
+ *
+ * LKL returns -EINTR when the engine was contended and documents that the call
+ * should simply be retried. Treating it as fatal retired the bridge, and the
+ * guest's end of the socketpair stayed open with nobody feeding it: the guest
+ * then blocked in a blocking recvmsg(2) with no way to finish, which is how
+ * test_socket wedged in the pod.
+ */
 static int shadow_nonfatal_recv_error(const struct shadow_socket *sock, long r)
 {
     if (r == -EAGAIN || r == -EWOULDBLOCK)
+        return 1;
+    if (r == -EINTR)
+        return 1;
+    /* Kernel-internal restart codes (see seccomp-dispatch.c). */
+    if (r <= -512 && r >= -516)
         return 1;
 
     /* Stream sockets can report "not connected" or "invalid" while the
@@ -594,24 +731,62 @@ static int shadow_nonfatal_recv_error(const struct shadow_socket *sock, long r)
 
 static int pump_shadow_lkl_read(struct shadow_socket *sock)
 {
+    pump_note(KBOX_PUMP_LKL_READ, -1);
     void *addr_arg = NULL;
     unsigned int *addrlen_arg = NULL;
-    if (sock->sock_type == SOCK_DGRAM) {
-        sock->pending_dgram_addr.addrlen =
-            (unsigned int) sizeof(sock->pending_dgram_addr.addr);
-        addr_arg = sock->pending_dgram_addr.addr;
-        addrlen_arg = &sock->pending_dgram_addr.addrlen;
+    long r;
+
+    /* Bytes already taken from LKL but not yet written into the guest's end of
+     * the socketpair live in to_supervisor_buf. Reading again overwrites them:
+     * a reader that never drains its socket then cost the transfer whole
+     * buffers, silently, and the sender never saw back-pressure because the
+     * LKL receive queue kept being emptied into that buffer
+     * (test_socket.InterruptedSendTimeoutTest sent 79 MB to a peer that read
+     * nothing, and the collection of "empty stream receive" failures under
+     * load came from the same overwrite).
+     */
+    if (sock->to_supervisor_len > 0) {
+        if (shadow_flush_to_supervisor(sock) < 0)
+            retire_shadow_socket(sock, "lkl-read:pending-flush");
+        if (sock->to_supervisor_len > 0)
+            return 0;
     }
 
-    long r =
-        kbox_lkl_recvfrom(net_sysnrs, sock->lkl_fd, sock->to_supervisor_buf,
-                          (long) sizeof(sock->to_supervisor_buf),
-                          LKL_MSG_DONTWAIT, addr_arg, addrlen_arg);
+    if (sock->sock_type == SOCK_DGRAM) {
+        /* recvmsg, not recvfrom: the guest asked for ancillary data
+         * (IPV6_TCLASS, IPV6_HOPLIMIT, IP_TOS) and the socketpair that carries
+         * the payload cannot express it, so it is captured here and handed to
+         * the guest's next recvmsg. */
+        struct iovec iov = {
+            .iov_base = sock->to_supervisor_buf,
+            .iov_len = sizeof(sock->to_supervisor_buf),
+        };
+        struct msghdr mh;
+
+        memset(&mh, 0, sizeof(mh));
+        mh.msg_name = sock->pending_dgram_addr.addr;
+        mh.msg_namelen = sizeof(sock->pending_dgram_addr.addr);
+        mh.msg_iov = &iov;
+        mh.msg_iovlen = 1;
+        mh.msg_control = sock->pending_dgram_addr.ctl;
+        mh.msg_controllen = sizeof(sock->pending_dgram_addr.ctl);
+
+        r = lkl_syscall6(net_sysnrs->recvmsg, sock->lkl_fd, (long) &mh,
+                         0x40 /* MSG_DONTWAIT */, 0, 0, 0);
+        if (r >= 0) {
+            sock->pending_dgram_addr.addrlen = mh.msg_namelen;
+            sock->pending_dgram_addr.ctllen = mh.msg_controllen;
+        }
+    } else {
+        r = kbox_lkl_recvfrom(net_sysnrs, sock->lkl_fd, sock->to_supervisor_buf,
+                              (long) sizeof(sock->to_supervisor_buf),
+                              LKL_MSG_DONTWAIT, addr_arg, addrlen_arg);
+    }
     if (r > 0) {
         sock->to_supervisor_off = 0;
         sock->to_supervisor_len = (size_t) r;
         if (shadow_flush_to_supervisor(sock) < 0)
-            retire_shadow_socket(sock);
+            retire_shadow_socket(sock, "lkl-read:flush-to-guest");
         return 1;
     }
     if (r == 0) {
@@ -627,9 +802,72 @@ static int pump_shadow_lkl_read(struct shadow_socket *sock)
         return 0;
     }
     sock->pending_dgram_addr.addrlen = 0;
-    if (!shadow_nonfatal_recv_error(sock, r))
-        retire_shadow_socket(sock);
+
+    /* A datagram socket reports an ICMP-derived error once, on the next
+     * receive, and stays usable. Retiring the bridge instead left the guest's
+     * end of the socketpair open with nobody feeding it, so a blocking
+     * recvmsg(2) on that socket never completed: test_socket wedged. */
+    if (sock->sock_type == SOCK_DGRAM &&
+        (r == -ECONNRESET || r == -ECONNREFUSED || r == -EHOSTUNREACH ||
+         r == -ENETUNREACH)) {
+        sock->pending_recv_error = r;
+        return 0;
+    }
+
+    if (!shadow_nonfatal_recv_error(sock, r)) {
+        static int reported;
+
+        if (reported < 20) {
+            reported++;
+            fprintf(stderr,
+                    "kbox: net: bridge retired lkl=%d sp=%d after recv error "
+                    "%ld\n",
+                    sock->lkl_fd, sock->supervisor_fd, r);
+        }
+        retire_shadow_socket(sock, "lkl-recv-error");
+    }
     return 0;
+}
+
+static uint64_t shadow_now_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
+/* Name a socket whose guest data has been stuck for a while.
+ *
+ * The guest's end of the bridge becomes writable again only after the pump has
+ * handed the pending bytes to LKL, so a socket that keeps `to_lkl_len > 0`
+ * leaves the guest waiting for EPOLLOUT with no way to make progress. Without
+ * this line that looks exactly like a guest stuck in its own syscall.
+ */
+static void note_shadow_stall(struct shadow_socket *sock)
+{
+    uint64_t now = shadow_now_ns();
+
+    if (sock->to_lkl_len == 0 && sock->to_supervisor_len == 0) {
+        sock->stall_since_ns = 0;
+        sock->stall_reported = 0;
+        return;
+    }
+    if (sock->stall_since_ns == 0) {
+        sock->stall_since_ns = now;
+        return;
+    }
+    if (sock->stall_reported || now - sock->stall_since_ns < 200000000ull)
+        return;
+    sock->stall_reported = 1;
+    fprintf(stderr,
+            "kbox: net: socket lkl=%d sp=%d stuck for %llums "
+            "to_lkl=%zu/%zu to_sp=%zu/%zu eof=%d/%d shutdown=%d/%d\n",
+            sock->lkl_fd, sock->supervisor_fd,
+            (unsigned long long) ((now - sock->stall_since_ns) / 1000000ull),
+            sock->to_lkl_len, sizeof(sock->to_lkl_buf), sock->to_supervisor_len,
+            sizeof(sock->to_supervisor_buf), sock->lkl_eof, sock->sp_eof,
+            sock->lkl_wr_shutdown, sock->sp_wr_shutdown);
 }
 
 static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
@@ -652,9 +890,82 @@ static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
 
         struct shadow_socket *sock = &shadow_sockets[slot];
 
+        pump_note(KBOX_PUMP_PASS, slot);
+        if (sock->closing) {
+            /* The tracee is gone. Everything it wrote is still owed to the
+             * peer, including bytes the pump has not read out of the
+             * socketpair yet, so drain the pair first, push it all into LKL,
+             * and only then half-close. Closing on the first empty bridge
+             * buffer dropped the last read chunk of every transfer
+             * (test_socket.SendfileUsingSendfileTest.testOffset).
+             *
+             * The wait is capped: a descriptor that the tracee closed but the
+             * supervisor still holds a copy of never reports end of file, and
+             * the bridge must not keep a slot and an LKL FD forever.
+             */
+            uint64_t elapsed = shadow_now_ns() - sock->closing_since_ns;
+
+            if (elapsed > KBOX_CLOSE_DRAIN_NS) {
+                if (sock->owns_lkl && net_sysnrs) {
+                    kbox_lkl_shutdown(net_sysnrs, sock->lkl_fd, 1);
+                    kbox_lkl_close(net_sysnrs, sock->lkl_fd);
+                    sock->owns_lkl = 0;
+                }
+                if (sock->to_lkl_len > 0 || sock->to_supervisor_len > 0)
+                    fprintf(stderr,
+                            "kbox: net: close drained lkl=%d after %llus, "
+                            "dropping to_lkl=%zu to_sup=%zu\n",
+                            sock->lkl_fd,
+                            (unsigned long long) (elapsed / 1000000000ull),
+                            sock->to_lkl_len, sock->to_supervisor_len);
+                retire_shadow_socket(sock, "close-drain-timeout");
+                progressed = 1;
+                continue;
+            }
+
+            if (sock->to_lkl_len == 0 && !sock->sp_eof) {
+                ssize_t n;
+
+                pump_note(KBOX_PUMP_CLOSE_FLUSH, slot);
+                n = read(sock->supervisor_fd, sock->to_lkl_buf,
+                         sizeof(sock->to_lkl_buf));
+                pump_note(KBOX_PUMP_PASS, slot);
+                if (n > 0) {
+                    sock->to_lkl_off = 0;
+                    sock->to_lkl_len = (size_t) n;
+                    progressed = 1;
+                } else if (n == 0) {
+                    sock->sp_eof = 1;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK &&
+                           errno != EINTR) {
+                    sock->sp_eof = 1;
+                }
+            }
+
+            pump_note(KBOX_PUMP_CLOSE_FLUSH, slot);
+            int fr = shadow_flush_to_lkl(sock);
+            pump_note(KBOX_PUMP_PASS, slot);
+
+            if (sock->to_lkl_len > 0) {
+                /* Waiting for the LKL socket to accept the tail. Do not ask
+                 * for a busy pass: spinning here starves the rest of the
+                 * bridge (SSL handshakes and logging's server timed out when
+                 * it did). The pump retries on its next short tick. */
+            } else if (sock->sp_eof || fr < 0) {
+                if (sock->owns_lkl && net_sysnrs) {
+                    kbox_lkl_shutdown(net_sysnrs, sock->lkl_fd, 1);
+                    kbox_lkl_close(net_sysnrs, sock->lkl_fd);
+                    sock->owns_lkl = 0;
+                }
+                retire_shadow_socket(sock, "deferred-close");
+                progressed = 1;
+            }
+            continue;
+        }
+
         if (sock->listening) {
             if (ctx->pfds[pidx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-                retire_shadow_socket(sock);
+                retire_shadow_socket(sock, "listen-hup");
                 continue;
             }
             if (!sock->listen_notified && net_sysnrs &&
@@ -669,11 +980,15 @@ static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
         }
 
         /* Retry any buffered stream data before reading more. */
-        if (shadow_flush_to_lkl(sock) < 0 ||
-            shadow_flush_to_supervisor(sock) < 0) {
-            retire_shadow_socket(sock);
+        pump_note(KBOX_PUMP_FLUSH_TO_LKL, slot);
+        int flushed = shadow_flush_to_lkl(sock);
+        pump_note(KBOX_PUMP_PASS, slot);
+        if (flushed < 0 || shadow_flush_to_supervisor(sock) < 0) {
+            retire_shadow_socket(sock, "pump-flush");
             continue;
         }
+        (void) flushed;
+        note_shadow_stall(sock);
 
         /* supervisor_fd -> LKL socket (non-blocking via sendto). For datagram
          * sockets, drain up to 8 queued messages (e.g. glibc sendmmsg A+AAAA)
@@ -684,30 +999,37 @@ static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
             int max_reads = (sock->sock_type == SOCK_DGRAM) ? 8 : 1;
             for (int riter = 0; riter < max_reads && sock->to_lkl_len == 0;
                  riter++) {
-                ssize_t n = read(sock->supervisor_fd, sock->to_lkl_buf,
-                                 sizeof(sock->to_lkl_buf));
+                ssize_t n;
+
+                pump_note(KBOX_PUMP_READ_GUEST, slot);
+                n = read(sock->supervisor_fd, sock->to_lkl_buf,
+                         sizeof(sock->to_lkl_buf));
+                pump_note(KBOX_PUMP_PASS, slot);
                 if (n > 0) {
                     sock->to_lkl_off = 0;
                     sock->to_lkl_len = (size_t) n;
                     progressed = 1;
-                    if (shadow_flush_to_lkl(sock) < 0) {
-                        retire_shadow_socket(sock);
+                    flushed = shadow_flush_to_lkl(sock);
+                    if (flushed < 0) {
+                        retire_shadow_socket(sock, "guest-read:flush");
                         break;
                     }
+                    (void) flushed;
                 } else if (n == 0) {
                     /* Tracee closed write half (shutdown SHUT_WR) or closed FD;
                      * keep the slot alive until POLLHUP/deregister if
                      * LKL->tracee direction may still carry responses.
                      */
                     sock->sp_eof = 1;
-                    if (shadow_flush_to_lkl(sock) < 0) {
-                        retire_shadow_socket(sock);
+                    flushed = shadow_flush_to_lkl(sock);
+                    if (flushed < 0) {
+                        retire_shadow_socket(sock, "guest-eof:flush");
                     }
                     break;
                 } else {
                     if (errno != EAGAIN && errno != EWOULDBLOCK &&
                         errno != EINTR)
-                        retire_shadow_socket(sock);
+                        retire_shadow_socket(sock, "guest-read-error");
                     break;
                 }
             }
@@ -717,8 +1039,32 @@ static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
             continue;
 
         if (ctx->pfds[pidx].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            retire_shadow_socket(sock);
-            continue;
+            /* The tracee closed its end of the socketpair. Bytes it wrote
+             * before close() were accepted by the kernel and must still reach
+             * the LKL socket: a stream ends by closing, and dropping the
+             * buffer here truncated the transfer (asyncio's sendfile fallback
+             * lost its tail when the transport closed right after the last
+             * write). Push them through, then let the LKL side see the EOF.
+             */
+            sock->sp_eof = 1;
+            flushed = shadow_flush_to_lkl(sock);
+            if (flushed < 0) {
+                retire_shadow_socket(sock, "hup:flush");
+                continue;
+            }
+            (void) flushed;
+            if (sock->to_lkl_len > 0) {
+                progressed = 1; /* ask for another pass right away */
+                continue;
+            }
+            if (shadow_flush_to_supervisor(sock) < 0) {
+                retire_shadow_socket(sock, "hup:flush-to-guest");
+                continue;
+            }
+            if (sock->lkl_eof && sock->to_supervisor_len == 0) {
+                retire_shadow_socket(sock, "both-ends-done");
+                continue;
+            }
         }
 
         if (!sock->lkl_eof && sock->to_supervisor_len == 0 && net_sysnrs &&
@@ -737,6 +1083,7 @@ static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
 
     if (npoll > 0 && net_sysnrs) {
         /* Flush pending LKL IRQs once so socket readiness is up to date. */
+        pump_note(KBOX_PUMP_LKL_POLL, -1);
         kbox_lkl_getuid(net_sysnrs);
 
         struct timespec zero_ts = {0, 0};
@@ -795,8 +1142,60 @@ static int pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
             }
         }
     }
+    pump_note(KBOX_PUMP_IDLE, -1);
     pthread_mutex_unlock(&shadow_lock);
     return progressed;
+}
+
+/* Print the state of every bridge, on demand.
+ *
+ * A guest that waits for a socket that never becomes readable leaves no trace:
+ * the pump keeps ticking, the LKL sockets keep the right bytes, and only the
+ * pair of readiness flags says which direction is stuck. Send SIGUSR1 to the
+ * daemon and this is printed once per live bridge.
+ */
+void kbox_net_dump_state(void)
+{
+    int stage = 0;
+    int pslot = -1;
+    uint64_t age = kbox_net_pump_stage_age_ms(&stage, &pslot);
+
+    fprintf(stderr,
+            "kbox: net: dump: bridges=%d pump stage=%d slot=%d age=%llums\n",
+            MAX_SHADOW_SOCKETS, stage, pslot, (unsigned long long) age);
+    pthread_mutex_lock(&shadow_lock);
+    for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
+        struct shadow_socket *sock = &shadow_sockets[i];
+        struct pollfd guest = {.fd = -1, .events = 0, .revents = 0};
+        struct pollfd lkl = {
+            .fd = -1, .events = POLLIN | POLLOUT, .revents = 0};
+        long lkl_ready = -1;
+        int guest_ready = -1;
+
+        if (!sock->active)
+            continue;
+        guest.fd = sock->supervisor_fd;
+        guest.events = POLLIN | POLLOUT;
+        guest_ready = poll(&guest, 1, 0);
+        if (sock->lkl_fd >= 0 && net_sysnrs) {
+            struct timespec zero = {0, 0};
+
+            lkl.fd = sock->lkl_fd;
+            lkl_ready = kbox_lkl_ppoll(net_sysnrs, &lkl, 1, &zero, NULL, 0);
+        }
+        fprintf(stderr,
+                "kbox: net: dump slot=%d lkl=%d sp=%d type=%d listen=%d "
+                "closing=%d gen=%llu to_lkl=%zu/%zu to_sp=%zu/%zu "
+                "lkl_eof=%d sp_eof=%d peer_hup=%d guest_poll=%d/%#x "
+                "lkl_poll=%ld/%#x\n",
+                i, sock->lkl_fd, sock->supervisor_fd, sock->sock_type,
+                sock->listening, sock->closing, (unsigned long long) sock->gen,
+                sock->to_lkl_off, sock->to_lkl_len, sock->to_supervisor_off,
+                sock->to_supervisor_len, sock->lkl_eof, sock->sp_eof,
+                sock->sp_wr_shutdown, guest_ready, (unsigned) guest.revents,
+                lkl_ready, (unsigned) lkl.revents);
+    }
+    pthread_mutex_unlock(&shadow_lock);
 }
 
 /* LKL virtio-net callbacks (iovec-based). */
@@ -1079,6 +1478,17 @@ static void *slirp_event_loop(void *arg)
             busy = pump_shadow_sockets(&ctx, shadow_base);
         else
             busy = 0;
+
+        /* A pass that moved nothing means every bridge is drained: the bytes
+         * a guest wrote are in LKL and everything LKL delivered is in the
+         * guest's end of the socketpair. Readiness calls wait for exactly
+         * this, so the kernel measures readiness on a current bridge. */
+        pthread_mutex_lock(&g_pass_lock);
+        g_pass_count++;
+        if (!busy)
+            g_pass_done = g_pass_epoch;
+        pthread_cond_broadcast(&g_pass_cond);
+        pthread_mutex_unlock(&g_pass_lock);
     }
     return NULL;
 }
@@ -1538,8 +1948,14 @@ int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type)
             shadow_sockets[i].to_supervisor_off = 0;
             shadow_sockets[i].to_supervisor_len = 0;
             shadow_sockets[i].pending_dgram_addr.addrlen = 0;
+            shadow_sockets[i].pending_dgram_addr.ctllen = 0;
             shadow_sockets[i].dgram_head = 0;
             shadow_sockets[i].dgram_tail = 0;
+            shadow_sockets[i].pending_recv_error = 0;
+            shadow_sockets[i].stall_since_ns = 0;
+            shadow_sockets[i].stall_reported = 0;
+            shadow_sockets[i].closing = 0;
+            shadow_sockets[i].owns_lkl = 0;
             shadow_sockets[i].gen = next_shadow_gen++;
             shadow_sockets[i].active = 1;
             reserved = 1;
@@ -1549,6 +1965,9 @@ int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type)
     pthread_mutex_unlock(&shadow_lock);
     if (!reserved)
         return -1;
+    if (getenv("KBOX_NET_TRACE"))
+        fprintf(stderr, "kbox: net: register lkl=%d sp=%d gen=%llu\n", lkl_fd,
+                supervisor_fd, (unsigned long long) next_shadow_gen);
 
     /* Wake the event loop to include the new socket in its poll set. */
 
@@ -1565,6 +1984,12 @@ static void flush_shadow_socket_to_lkl_locked(struct shadow_socket *sock)
         !net_sysnrs)
         return;
 
+    /* Move whatever the tracee already wrote into the LKL socket. No waiting
+     * here: the caller owns the lock, and the peer's pump needs that same lock
+     * to make room, so waiting inside the lock would deadlock against the
+     * transfer it is waiting for. kbox_net_deregister_socket() releases the
+     * lock between attempts.
+     */
     for (int iter = 0; iter < 16; iter++) {
         if (sock->to_lkl_len == 0) {
             ssize_t n = read(sock->supervisor_fd, sock->to_lkl_buf,
@@ -1574,22 +1999,128 @@ static void flush_shadow_socket_to_lkl_locked(struct shadow_socket *sock)
             sock->to_lkl_off = 0;
             sock->to_lkl_len = (size_t) n;
         }
-        if (shadow_flush_to_lkl(sock) < 0)
+        long fr = shadow_flush_to_lkl(sock);
+        if (fr < 0) {
+            if (getenv("KBOX_NET_TRACE"))
+                fprintf(stderr,
+                        "kbox: net: drain flush lkl=%d failed ret=%ld "
+                        "pending=%zu\n",
+                        sock->lkl_fd, fr, sock->to_lkl_len);
             break;
-        if (sock->to_lkl_len > 0) {
-            struct pollfd wp = {
-                .fd = sock->lkl_fd,
-                .events = POLLOUT,
-                .revents = 0,
-            };
-            struct timespec wts = {0, 20 * 1000 * 1000};
-            if (kbox_lkl_ppoll(net_sysnrs, &wp, 1, &wts, NULL, 0) <= 0 ||
-                !(wp.revents & POLLOUT))
-                break;
-            if (shadow_flush_to_lkl(sock) < 0 || sock->to_lkl_len > 0)
-                break;
+        }
+        if (sock->to_lkl_len > 0)
+            break;
+    }
+}
+
+/* Wake the guest when a listening shadow socket has a connection queued.
+ *
+ * The guest's epoll sees a listening socket as readable only when the pump
+ * thread writes a wake byte into the socketpair. Waiting for that cycle makes a
+ * guest connect() and the matching accept() straddle two event-loop
+ * iterations: asyncio's server.close() ran before the accepted connection
+ * reached client_connected_cb, so the callback never ran
+ * (test_asyncio.test_streams.test_unhandled_exception). Checking the backlog
+ * right after a connect keeps the pair in the same iteration, which is what a
+ * loopback connection does on a real kernel.
+ */
+/* Error the guest's next receive on this socket must report (0 when none). */
+long kbox_net_pop_recv_error(int lkl_fd)
+{
+    long err = 0;
+
+    pthread_mutex_lock(&shadow_lock);
+    for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
+        if (!shadow_sockets[i].active || shadow_sockets[i].lkl_fd != lkl_fd)
+            continue;
+        err = shadow_sockets[i].pending_recv_error;
+        shadow_sockets[i].pending_recv_error = 0;
+        break;
+    }
+    pthread_mutex_unlock(&shadow_lock);
+    return err;
+}
+
+void kbox_net_notify_listeners(void)
+{
+    if (!net_sysnrs)
+        return;
+    pthread_mutex_lock(&shadow_lock);
+    for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
+        struct shadow_socket *sock = &shadow_sockets[i];
+        struct pollfd lpfd;
+        struct timespec zero_ts = {0, 0};
+        char wake = 'A';
+        long pr;
+
+        if (!sock->active || !sock->listening || sock->listen_notified ||
+            sock->supervisor_fd < 0)
+            continue;
+        lpfd.fd = sock->lkl_fd;
+        lpfd.events = POLLIN;
+        lpfd.revents = 0;
+        pr = kbox_lkl_ppoll(net_sysnrs, &lpfd, 1, &zero_ts, NULL, 0);
+        if (pr > 0 && (lpfd.revents & (POLLIN | POLLERR | POLLHUP))) {
+            if (write(sock->supervisor_fd, &wake, 1) == 1)
+                sock->listen_notified = 1;
         }
     }
+    pthread_mutex_unlock(&shadow_lock);
+}
+
+/* Wait (bounded) until the pump reports a pass that moved nothing.
+ *
+ * Returns immediately when the last completed pass was already quiet, which is
+ * the steady state: the cost falls only on a readiness call that races the
+ * delivery of a write the guest just made.
+ */
+void kbox_net_wait_until_quiet(int max_ms)
+{
+    struct timespec deadline;
+
+    if (!kbox_net_is_active() || !net_sysnrs || max_ms <= 0)
+        return;
+
+    pthread_mutex_lock(&g_pass_lock);
+    if (g_pass_done == g_pass_epoch || g_pass_count == 0) {
+        pthread_mutex_unlock(&g_pass_lock);
+        return;
+    }
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += (long) max_ms * 1000000L;
+    while (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_nsec -= 1000000000L;
+        deadline.tv_sec++;
+    }
+
+    /* Nudge the pump so this pass starts now instead of at its next tick. */
+    if (wakeup_pipe[1] >= 0) {
+        char c = 'Q';
+        ssize_t w = write(wakeup_pipe[1], &c, 1);
+        (void) w;
+    }
+
+    while (g_pass_done != g_pass_epoch) {
+        if (pthread_cond_timedwait(&g_pass_cond, &g_pass_lock, &deadline) ==
+            ETIMEDOUT)
+            break;
+    }
+    pthread_mutex_unlock(&g_pass_lock);
+}
+
+/* Note that the tracee wrote into a bridged socket.
+ *
+ * The write itself is a host write into the socketpair, so kbox only learns
+ * about it here, on the way in. Until a pump pass has moved those bytes into
+ * LKL and on to the peer, a readiness call must not report the bridge as
+ * drained.
+ */
+void kbox_net_mark_guest_write(void)
+{
+    if (!kbox_net_is_active())
+        return;
+    __atomic_add_fetch(&g_pass_epoch, 1, __ATOMIC_ACQ_REL);
 }
 
 void kbox_net_flush_socket(int lkl_fd)
@@ -1604,25 +2135,39 @@ void kbox_net_flush_socket(int lkl_fd)
     pthread_mutex_unlock(&shadow_lock);
 }
 
-int kbox_net_pop_dgram_addr(int lkl_fd,
+int kbox_net_pop_dgram_meta(int lkl_fd,
                             void *addr_out,
                             unsigned int *addrlen_io,
+                            void *ctl_out,
+                            size_t *ctllen_io,
+                            size_t ctl_cap,
                             int peek)
 {
     int found = 0;
+
     pthread_mutex_lock(&shadow_lock);
     for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
         struct shadow_socket *s = &shadow_sockets[i];
+
         if (!s->active || s->lkl_fd != lkl_fd)
             continue;
         if (s->dgram_head != s->dgram_tail) {
             const struct dgram_addr_entry *e = &s->dgram_q[s->dgram_head];
+
             if (addr_out && addrlen_io) {
                 unsigned int cp =
                     e->addrlen < *addrlen_io ? e->addrlen : *addrlen_io;
+
                 if (cp > 0)
                     memcpy(addr_out, e->addr, cp);
                 *addrlen_io = e->addrlen;
+            }
+            if (ctl_out && ctllen_io) {
+                size_t cp = e->ctllen < ctl_cap ? e->ctllen : ctl_cap;
+
+                if (cp > 0)
+                    memcpy(ctl_out, e->ctl, cp);
+                *ctllen_io = e->ctllen;
             }
             if (!peek)
                 s->dgram_head = (s->dgram_head + 1) % DGRAM_ADDR_QUEUE_LEN;
@@ -1634,18 +2179,73 @@ int kbox_net_pop_dgram_addr(int lkl_fd,
     return found;
 }
 
-void kbox_net_deregister_socket(int lkl_fd)
+int kbox_net_pop_dgram_addr(int lkl_fd,
+                            void *addr_out,
+                            unsigned int *addrlen_io,
+                            int peek)
 {
-    /* Drain any queued guest-written data into LKL before closing supervisor_fd
-     * and the LKL socket (otherwise write()+close() drops the reply).
-     * Close supervisor_fd and mark inactive under the lock.
+    return kbox_net_pop_dgram_meta(lkl_fd, addr_out, addrlen_io, NULL, NULL, 0,
+                                   peek);
+}
+
+int kbox_net_deregister_socket(int lkl_fd)
+{
+    /* Drain queued guest-written data into LKL before closing supervisor_fd
+     * and the LKL socket. A stream ends by closing, and the bytes were already
+     * accepted by the kernel when write() returned to the tracee, so dropping
+     * them truncates the transfer (asyncio's sendfile fallback lost its tail
+     * exactly here).
+     *
+     * The peer's pump runs in the event loop thread and needs shadow_lock to
+     * make room, so the wait happens with the lock released; holding it would
+     * deadlock against the very drain being waited for.
      */
+    struct shadow_socket *target = NULL;
+    int deferred = 0;
+
     pthread_mutex_lock(&shadow_lock);
     for (int i = 0; i < MAX_SHADOW_SOCKETS; i++) {
         if (shadow_sockets[i].active && shadow_sockets[i].lkl_fd == lkl_fd) {
-            flush_shadow_socket_to_lkl_locked(&shadow_sockets[i]);
-            retire_shadow_socket(&shadow_sockets[i]);
+            target = &shadow_sockets[i];
             break;
+        }
+    }
+    if (getenv("KBOX_NET_TRACE"))
+        fprintf(stderr, "kbox: net: deregister lkl=%d found=%d gen=%llu\n",
+                lkl_fd, target != NULL,
+                (unsigned long long) (target ? target->gen : 0));
+
+    if (target) {
+        /* Push what is already here, and give the LKL socket one short chance
+         * to take the rest. Whatever is left belongs to the pump: waiting for
+         * it here freezes every other syscall of the container, and the reader
+         * that would free space is usually in this very container.
+         */
+        flush_shadow_socket_to_lkl_locked(target);
+        if (target->to_lkl_len > 0 && net_sysnrs) {
+            pthread_mutex_unlock(&shadow_lock);
+            struct pollfd wp = {
+                .fd = lkl_fd,
+                .events = POLLOUT,
+                .revents = 0,
+            };
+            struct timespec wts = {0, 2 * 1000 * 1000};
+            (void) kbox_lkl_ppoll(net_sysnrs, &wp, 1, &wts, NULL, 0);
+            pthread_mutex_lock(&shadow_lock);
+            flush_shadow_socket_to_lkl_locked(target);
+        }
+
+        if (target->to_lkl_len == 0) {
+            retire_shadow_socket(target, "deregister");
+        } else {
+            if (getenv("KBOX_NET_TRACE"))
+                fprintf(stderr,
+                        "kbox: net: close deferred lkl=%d pending=%zu\n",
+                        lkl_fd, target->to_lkl_len);
+            target->closing = 1;
+            target->owns_lkl = 1;
+            target->closing_since_ns = shadow_now_ns();
+            deferred = 1;
         }
     }
     pthread_mutex_unlock(&shadow_lock);
@@ -1654,6 +2254,7 @@ void kbox_net_deregister_socket(int lkl_fd)
     char c = 'D';
     ssize_t n = write(wakeup_pipe[1], &c, 1);
     (void) n;
+    return deferred;
 }
 
 void kbox_net_set_listening(int lkl_fd)
@@ -1721,6 +2322,24 @@ int kbox_net_register_socket(int lkl_fd, int supervisor_fd, int sock_type)
     return -1;
 }
 
+int kbox_net_pop_dgram_meta(int lkl_fd,
+                            void *addr_out,
+                            unsigned int *addrlen_io,
+                            void *ctl_out,
+                            size_t *ctllen_io,
+                            size_t ctl_cap,
+                            int peek)
+{
+    (void) lkl_fd;
+    (void) addr_out;
+    (void) addrlen_io;
+    (void) ctl_out;
+    (void) ctllen_io;
+    (void) ctl_cap;
+    (void) peek;
+    return 0;
+}
+
 int kbox_net_pop_dgram_addr(int lkl_fd,
                             void *addr_out,
                             unsigned int *addrlen_io,
@@ -1738,10 +2357,20 @@ void kbox_net_flush_socket(int lkl_fd)
     (void) lkl_fd;
 }
 
-void kbox_net_deregister_socket(int lkl_fd)
+int kbox_net_deregister_socket(int lkl_fd)
 {
     (void) lkl_fd;
+    return 0;
 }
+
+void kbox_net_dump_state(void) {}
+
+void kbox_net_wait_until_quiet(int max_ms)
+{
+    (void) max_ms;
+}
+
+void kbox_net_mark_guest_write(void) {}
 
 void kbox_net_set_listening(int lkl_fd)
 {

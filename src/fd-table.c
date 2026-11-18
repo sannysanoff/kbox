@@ -42,8 +42,18 @@ static inline void clear_fd_entry(struct kbox_fd_entry *e)
     e->host_sv_fd = -1;
     e->shadow_sp = -1;
     e->shadow_writeback = 0;
+    e->shadow_mtime_sec = 0;
+    e->shadow_mtime_nsec = 0;
+    e->shadow_size = 0;
     e->mirror_tty = 0;
     e->cloexec = 0;
+    e->opath = 0;
+    e->sock_type = 0;
+    e->sock_connected = 0;
+    e->sock_peer_family = 0;
+    memset(&e->sock_peer, 0, sizeof(e->sock_peer));
+    e->sock_established = 0;
+    e->shadow_mmap = 0;
 }
 
 /* Populate an already-free slot with a fresh lkl_fd. All other fields
@@ -60,8 +70,18 @@ static inline void init_live_entry(struct kbox_fd_entry *e,
     e->host_sv_fd = -1;
     e->shadow_sp = -1;
     e->shadow_writeback = 0;
+    e->shadow_mtime_sec = 0;
+    e->shadow_mtime_nsec = 0;
+    e->shadow_size = 0;
     e->mirror_tty = mirror_tty;
     e->cloexec = 0;
+    e->opath = 0;
+    e->sock_type = 0;
+    e->sock_connected = 0;
+    e->sock_peer_family = 0;
+    memset(&e->sock_peer, 0, sizeof(e->sock_peer));
+    e->sock_established = 0;
+    e->shadow_mmap = 0;
 }
 
 /* Reverse-map and refcount maintenance helpers.
@@ -351,6 +371,22 @@ int kbox_fd_table_get_cloexec(const struct kbox_fd_table *t, long fd)
     if (!e || e->lkl_fd == -1)
         return 0;
     return e->cloexec;
+}
+
+void kbox_fd_table_set_opath(struct kbox_fd_table *t, long fd, int val)
+{
+    struct kbox_fd_entry *e = fd_lookup(t, fd);
+    if (!e || e->lkl_fd == -1)
+        return;
+    e->opath = val ? 1 : 0;
+}
+
+int kbox_fd_table_get_opath(const struct kbox_fd_table *t, long fd)
+{
+    const struct kbox_fd_entry *e = fd_lookup(t, fd);
+    if (!e || e->lkl_fd == -1)
+        return 0;
+    return e->opath;
 }
 
 #ifndef KBOX_UNIT_TEST

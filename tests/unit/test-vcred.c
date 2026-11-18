@@ -129,6 +129,79 @@ static void test_owner_foreign_uid_untouched(void)
     ASSERT_EQ(st.st_uid, getuid() + 12345);
 }
 
+static void test_default_group_list_is_effective_gid(void)
+{
+    uint32_t out[KBOX_VCRED_MAX_GROUPS];
+    kbox_vcred_reset_for_test();
+    ASSERT_EQ(kbox_vcred_setgid(P, 77), 0);
+    ASSERT_EQ(kbox_vcred_group_count(P), 1);
+    ASSERT_EQ(kbox_vcred_getgroups(P, KBOX_VCRED_MAX_GROUPS, out), 1);
+    ASSERT_EQ(out[0], 77);
+}
+
+static void test_setgroups_replaces_the_list(void)
+{
+    uint32_t groups[16];
+    uint32_t out[KBOX_VCRED_MAX_GROUPS];
+
+    kbox_vcred_reset_for_test();
+    for (int i = 0; i < 16; i++)
+        groups[i] = (uint32_t) i;
+    ASSERT_EQ(kbox_vcred_setgroups(P, 16, groups), 0);
+    ASSERT_EQ(kbox_vcred_group_count(P), 16);
+    ASSERT_EQ(kbox_vcred_getgroups(P, KBOX_VCRED_MAX_GROUPS, out), 16);
+    for (int i = 0; i < 16; i++)
+        ASSERT_EQ(out[i], (uint32_t) i);
+}
+
+static void test_setgroups_empty_list_is_legal(void)
+{
+    uint32_t groups[2] = {5, 6};
+    uint32_t out[KBOX_VCRED_MAX_GROUPS];
+
+    kbox_vcred_reset_for_test();
+    ASSERT_EQ(kbox_vcred_setgroups(P, 2, groups), 0);
+    ASSERT_EQ(kbox_vcred_setgroups(P, 0, NULL), 0);
+    ASSERT_EQ(kbox_vcred_group_count(P), 0);
+    ASSERT_EQ(kbox_vcred_getgroups(P, KBOX_VCRED_MAX_GROUPS, out), 0);
+}
+
+static void test_setgroups_allowed_after_dropping_root(void)
+{
+    uint32_t groups[2] = {3, 4};
+    uint32_t out[KBOX_VCRED_MAX_GROUPS];
+
+    /* gosu and setpriv drop the uid first and change groups afterwards, which
+     * the model permits once the process has held root. */
+    kbox_vcred_reset_for_test();
+    ASSERT_EQ(kbox_vcred_setuid(P, 999), 0);
+    ASSERT_EQ(kbox_vcred_setgroups(P, 2, groups), 0);
+    ASSERT_EQ(kbox_vcred_getgroups(P, KBOX_VCRED_MAX_GROUPS, out), 2);
+    ASSERT_EQ(out[0], 3);
+    ASSERT_EQ(out[1], 4);
+}
+
+static void test_getgroups_rejects_small_buffer(void)
+{
+    uint32_t groups[4] = {1, 2, 3, 4};
+    uint32_t out[KBOX_VCRED_MAX_GROUPS];
+
+    kbox_vcred_reset_for_test();
+    ASSERT_EQ(kbox_vcred_setgroups(P, 4, groups), 0);
+    ASSERT_EQ(kbox_vcred_getgroups(P, 2, out), -EINVAL);
+}
+
+static void test_setgroups_rejects_oversized_list(void)
+{
+    uint32_t groups[KBOX_VCRED_MAX_GROUPS + 1];
+
+    kbox_vcred_reset_for_test();
+    for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++)
+        groups[i] = (uint32_t) i;
+    ASSERT_EQ(kbox_vcred_setgroups(P, KBOX_VCRED_MAX_GROUPS + 1, groups),
+              -EINVAL);
+}
+
 void test_vcred_init(void)
 {
     TEST_REGISTER(test_new_pid_is_root);
@@ -141,4 +214,10 @@ void test_vcred_init(void)
     TEST_REGISTER(test_owner_overlay_wins);
     TEST_REGISTER(test_owner_default_follows_caller);
     TEST_REGISTER(test_owner_foreign_uid_untouched);
+    TEST_REGISTER(test_default_group_list_is_effective_gid);
+    TEST_REGISTER(test_setgroups_replaces_the_list);
+    TEST_REGISTER(test_setgroups_empty_list_is_legal);
+    TEST_REGISTER(test_setgroups_allowed_after_dropping_root);
+    TEST_REGISTER(test_getgroups_rejects_small_buffer);
+    TEST_REGISTER(test_setgroups_rejects_oversized_list);
 }

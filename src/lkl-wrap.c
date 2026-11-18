@@ -5,13 +5,117 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
 
 #include "lkl-wrap.h"
+
+/* Every LKL call in flight, so a stuck engine can name its holder.
+ *
+ * lkl_syscall() takes LKL's CPU lock for the whole call: one call that never
+ * returns stops every other LKL syscall, of every container, forever. Only the
+ * guest notices, as a syscall that never gets an answer (the pod wedged while a
+ * guest waited for getrandom()). Each entry point publishes its number and
+ * start time here; the supervisor's stall reporter prints them.
+ *
+ * A thread claims one slot for its lifetime and clears only the call number
+ * when a call returns, so two threads can never share a slot.
+ */
+#define KBOX_LKL_SLOTS 64
+
+struct kbox_lkl_slot {
+    int claimed;
+    volatile long nr;
+    long a1;
+    unsigned long tid;
+    uint64_t start_ns;
+};
+
+static struct kbox_lkl_slot g_lkl_slots[KBOX_LKL_SLOTS];
+static __thread int t_lkl_slot = -1;
+
+static uint64_t lkl_now_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
+static int lkl_slot_enter(long nr, long a1)
+{
+    int slot = t_lkl_slot;
+
+    if (slot < 0) {
+        for (int i = 0; i < KBOX_LKL_SLOTS; i++) {
+            int unclaimed = 0;
+
+            if (__atomic_compare_exchange_n(&g_lkl_slots[i].claimed, &unclaimed,
+                                            1, 0, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_RELAXED)) {
+                slot = i;
+                t_lkl_slot = i;
+                break;
+            }
+        }
+        if (slot < 0)
+            return -1;
+    }
+    g_lkl_slots[slot].a1 = a1;
+    g_lkl_slots[slot].tid = (unsigned long) pthread_self();
+    __atomic_store_n(&g_lkl_slots[slot].start_ns, lkl_now_ns(),
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&g_lkl_slots[slot].nr, nr, __ATOMIC_RELEASE);
+    return slot;
+}
+
+static void lkl_slot_leave(int slot)
+{
+    if (slot < 0)
+        return;
+    __atomic_store_n(&g_lkl_slots[slot].nr, 0, __ATOMIC_RELEASE);
+}
+
+void kbox_lkl_report_stalls(int min_ms)
+{
+    static uint64_t reported;
+    uint64_t now_reported = 0;
+    uint64_t now = lkl_now_ns();
+
+    for (int i = 0; i < KBOX_LKL_SLOTS; i++) {
+        uint64_t since;
+        uint64_t age_ms;
+
+        if (!__atomic_load_n(&g_lkl_slots[i].claimed, __ATOMIC_ACQUIRE))
+            continue;
+        if (__atomic_load_n(&g_lkl_slots[i].nr, __ATOMIC_ACQUIRE) == 0)
+            continue;
+        since = __atomic_load_n(&g_lkl_slots[i].start_ns, __ATOMIC_RELAXED);
+        if (since == 0 || now <= since)
+            continue;
+        age_ms = (now - since) / 1000000ull;
+        if (age_ms < (uint64_t) min_ms)
+            continue;
+        now_reported |= 1ull << i;
+        if (reported & (1ull << i))
+            continue;
+        fprintf(stderr,
+                "kbox: lkl: syscall nr=%ld a1=%ld tid=%lu in flight for "
+                "%llums (slot %d)\n",
+                g_lkl_slots[i].nr, g_lkl_slots[i].a1, g_lkl_slots[i].tid,
+                (unsigned long long) age_ms, i);
+    }
+    reported = now_reported;
+}
 
 long lkl_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6)
 {
     long args[6] = {a1, a2, a3, a4, a5, a6};
-    return lkl_syscall(nr, args);
+    int slot = lkl_slot_enter(nr, a1);
+    long ret = lkl_syscall(nr, args);
+
+    lkl_slot_leave(slot);
+    return ret;
 }
 
 const char *kbox_err_text(long code)
@@ -55,6 +159,34 @@ int kbox_boot_kernel(const char *cmdline)
     }
 
     return 0;
+}
+
+/* Point the guest's realtime clock at the host's.
+ *
+ * LKL derives the guest wall clock from the host's CLOCK_MONOTONIC (see
+ * read_persistent_clock64 in arch/lkl/kernel/time.c), so without this the
+ * guest believes it is the year 1970 plus the host's uptime. Every kernel
+ * timestamp then disagrees with time.time(), which kbox answers from the
+ * host clock: file mtimes, utime(2) with UTIME_NOW, and anything that
+ * compares a timestamp against the current time (make, pip, tar) goes
+ * wrong. Setting CLOCK_REALTIME once after boot fixes the offset for good,
+ * because after boot the wall clock advances with the same monotonic
+ * source.
+ */
+void kbox_sync_guest_realtime(void)
+{
+    const struct kbox_sysnrs *s = detect_sysnrs();
+    struct timespec ts;
+
+    if (!s || s->clock_settime <= 0)
+        return;
+    if (clock_gettime(CLOCK_REALTIME, &ts) < 0)
+        return;
+    long ret =
+        lkl_syscall6(s->clock_settime, CLOCK_REALTIME, (long) &ts, 0, 0, 0, 0);
+    if (ret < 0)
+        fprintf(stderr, "kbox: guest clock_settime failed: %s (%ld)\n",
+                lkl_strerror((int) ret), ret);
 }
 
 void kbox_halt_kernel(void)
@@ -143,6 +275,11 @@ long kbox_lkl_fcntl(const struct kbox_sysnrs *s, long fd, long cmd, long arg)
     return lkl_syscall6(s->fcntl, fd, cmd, arg, 0, 0, 0);
 }
 
+long kbox_lkl_ioctl(const struct kbox_sysnrs *s, long fd, long cmd, long arg)
+{
+    return lkl_syscall6(s->ioctl, fd, cmd, arg, 0, 0, 0);
+}
+
 long kbox_lkl_dup(const struct kbox_sysnrs *s, long fd)
 {
     return lkl_syscall6(s->dup, fd, 0, 0, 0, 0, 0);
@@ -205,6 +342,15 @@ long kbox_lkl_mkdirat(const struct kbox_sysnrs *s,
                       long mode)
 {
     return lkl_syscall6(s->mkdirat, dirfd, (long) path, mode, 0, 0, 0);
+}
+
+long kbox_lkl_mknodat(const struct kbox_sysnrs *s,
+                      long dirfd,
+                      const char *path,
+                      long mode,
+                      long dev)
+{
+    return lkl_syscall6(s->mknodat, dirfd, (long) path, mode, dev, 0, 0);
 }
 
 long kbox_lkl_mkdir(const struct kbox_sysnrs *s, const char *path, int mode)
@@ -407,6 +553,38 @@ long kbox_lkl_ftruncate(const struct kbox_sysnrs *s, long fd, long length)
     return lkl_syscall6(s->ftruncate, fd, length, 0, 0, 0, 0);
 }
 
+/* ftruncate that also works where the guest kernel refuses to grow a file.
+ *
+ * In the pod, ftruncate(2) of a file on an overlay (and on the tmpfs mounted at
+ * /tmp) answers -EFBIG once the requested size passes 4 MiB, while writes at
+ * the very same offsets are accepted: the file-size check is enforced in
+ * do_truncate/notify_change but not in the write path. A 10 MB file written
+ * through a shadow therefore came back as 0 bytes, because the copy-back
+ * pre-sizes the file with ftruncate before writing it.
+ *
+ * Growing a file does not actually need ftruncate: one zero byte at the last
+ * offset extends it to the same length and leaves the same holes. Only a
+ * shrink keeps using ftruncate, and a shrink never leaves the old size.
+ */
+long kbox_lkl_ftruncate_safe(const struct kbox_sysnrs *s, long fd, long length)
+{
+    struct kbox_lkl_stat st;
+    uint8_t zero = 0;
+    long ret;
+
+    memset(&st, 0, sizeof(st));
+    if (kbox_lkl_fstat(s, fd, &st) < 0)
+        return kbox_lkl_ftruncate(s, fd, length);
+
+    ret = kbox_lkl_ftruncate(s, fd, length);
+    if (ret >= 0 || ret != -EFBIG || (long long) st.st_size >= length ||
+        length <= 0)
+        return ret;
+
+    ret = kbox_lkl_pwrite64(s, fd, &zero, 1, length - 1);
+    return ret < 0 ? ret : 0;
+}
+
 long kbox_lkl_fallocate(const struct kbox_sysnrs *s,
                         long fd,
                         long mode,
@@ -426,7 +604,9 @@ long kbox_lkl_fsync(const struct kbox_sysnrs *s, long fd)
     return lkl_syscall6(s->fsync, fd, 0, 0, 0, 0, 0);
 }
 
-long kbox_lkl_msync(const struct kbox_sysnrs *s, long addr, long length,
+long kbox_lkl_msync(const struct kbox_sysnrs *s,
+                    long addr,
+                    long length,
                     long flags)
 {
     return lkl_syscall6(s->msync, addr, length, flags, 0, 0, 0);

@@ -250,10 +250,19 @@ static void test_normalize_edge_cases(void)
     ASSERT_EQ(rc, 0);
     ASSERT_STREQ(out, "/");
 
-    /* Trailing slash stripped. */
+    /* Trailing slash preserved: it asserts the path names a directory, so
+     * open("missing/", O_CREAT) must not create a file named "missing" and
+     * stat("file/") must fail with ENOTDIR, as they do on Linux
+     * (test_shutil.test_copyfile_nonexistent_dir). */
     rc = kbox_normalize_join("/", "/proc/self/", out, sizeof(out));
     ASSERT_EQ(rc, 0);
-    ASSERT_STREQ(out, "/proc/self");
+    ASSERT_STREQ(out, "/proc/self/");
+
+    /* A path of nothing but separators stays the root, without a doubled
+     * slash. */
+    rc = kbox_normalize_join("/", "///", out, sizeof(out));
+    ASSERT_EQ(rc, 0);
+    ASSERT_STREQ(out, "/");
 }
 
 /* /proc magic symlink escape detection. */

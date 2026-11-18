@@ -43,8 +43,18 @@ long lkl_syscall6(long nr,
                   long a4,
                   long a5,
                   long a6);
+
+/* Name every LKL call that has been running for at least `min_ms`.
+ *
+ * LKL runs all Linux code under one CPU lock: a single call that never returns
+ * stops every LKL syscall of every container, and the only other symptom is a
+ * guest waiting for an answer. Each entry point records its number and start
+ * time here, so a stuck engine can name the call that holds it.
+ */
+void kbox_lkl_report_stalls(int min_ms);
 const char *kbox_err_text(long code);
 int kbox_boot_kernel(const char *cmdline);
+void kbox_sync_guest_realtime(void);
 void kbox_halt_kernel(void);
 
 long kbox_lkl_mount(const struct kbox_sysnrs *s,
@@ -77,6 +87,7 @@ long kbox_lkl_lseek(const struct kbox_sysnrs *s,
                     long offset,
                     long whence);
 long kbox_lkl_fcntl(const struct kbox_sysnrs *s, long fd, long cmd, long arg);
+long kbox_lkl_ioctl(const struct kbox_sysnrs *s, long fd, long cmd, long arg);
 long kbox_lkl_dup(const struct kbox_sysnrs *s, long fd);
 long kbox_lkl_fstat(const struct kbox_sysnrs *s, long fd, void *buf);
 long kbox_lkl_newfstatat(const struct kbox_sysnrs *s,
@@ -107,6 +118,11 @@ long kbox_lkl_mkdirat(const struct kbox_sysnrs *s,
                       long dirfd,
                       const char *path,
                       long mode);
+long kbox_lkl_mknodat(const struct kbox_sysnrs *s,
+                      long dirfd,
+                      const char *path,
+                      long mode,
+                      long dev);
 long kbox_lkl_mkdir(const struct kbox_sysnrs *s, const char *path, int mode);
 long kbox_lkl_unlinkat(const struct kbox_sysnrs *s,
                        long dirfd,
@@ -222,6 +238,9 @@ long kbox_lkl_readlinkat(const struct kbox_sysnrs *s,
                          long bufsiz);
 long kbox_lkl_umask(const struct kbox_sysnrs *s, long mask);
 long kbox_lkl_ftruncate(const struct kbox_sysnrs *s, long fd, long length);
+/* ftruncate, with extension done by a one-byte write when the guest kernel
+ * refuses to grow the file (see lkl-wrap.c). */
+long kbox_lkl_ftruncate_safe(const struct kbox_sysnrs *s, long fd, long length);
 long kbox_lkl_fallocate(const struct kbox_sysnrs *s,
                         long fd,
                         long mode,
@@ -231,7 +250,9 @@ long kbox_lkl_flock(const struct kbox_sysnrs *s, long fd, long operation);
 long kbox_lkl_fsync(const struct kbox_sysnrs *s, long fd);
 long kbox_lkl_fdatasync(const struct kbox_sysnrs *s, long fd);
 long kbox_lkl_sync(const struct kbox_sysnrs *s);
-long kbox_lkl_msync(const struct kbox_sysnrs *s, long addr, long length,
+long kbox_lkl_msync(const struct kbox_sysnrs *s,
+                    long addr,
+                    long length,
                     long flags);
 long kbox_lkl_symlinkat(const struct kbox_sysnrs *s,
                         const char *target,

@@ -204,6 +204,61 @@ int kbox_vcred_may_setgid(pid_t pid)
     return c.euid == 0 || c.had_root;
 }
 
+int kbox_vcred_setgroups(pid_t pid, size_t n, const uint32_t *list)
+{
+    int idx;
+
+    if (n > KBOX_VCRED_MAX_GROUPS)
+        return -EINVAL;
+
+    pthread_mutex_lock(&g_lock);
+    idx = ensure_locked(pid);
+    if (!(g_vc[idx].c.euid == 0 || g_vc[idx].c.had_root)) {
+        pthread_mutex_unlock(&g_lock);
+        return -EPERM;
+    }
+    if (n > 0)
+        memcpy(g_vc[idx].c.groups, list, n * sizeof(uint32_t));
+    g_vc[idx].c.ngroups = (uint32_t) n;
+    g_vc[idx].c.groups_set = 1;
+    pthread_mutex_unlock(&g_lock);
+    return 0;
+}
+
+/* The list getgroups reports: what setgroups stored, or the effective gid for a
+ * process that never called it. */
+static uint32_t groups_of(const struct kbox_vcred *c, uint32_t *out)
+{
+    if (!c->groups_set) {
+        out[0] = c->egid;
+        return 1;
+    }
+    if (c->ngroups > 0)
+        memcpy(out, c->groups, c->ngroups * sizeof(uint32_t));
+    return c->ngroups;
+}
+
+int kbox_vcred_group_count(pid_t pid)
+{
+    struct kbox_vcred c;
+    uint32_t tmp[KBOX_VCRED_MAX_GROUPS];
+
+    kbox_vcred_get(pid, &c);
+    return (int) groups_of(&c, tmp);
+}
+
+int kbox_vcred_getgroups(pid_t pid, size_t size, uint32_t *out)
+{
+    struct kbox_vcred c;
+    uint32_t count;
+
+    kbox_vcred_get(pid, &c);
+    count = groups_of(&c, out);
+    if (size < count)
+        return -EINVAL;
+    return (int) count;
+}
+
 void kbox_vcred_forget(pid_t pid)
 {
     pthread_mutex_lock(&g_lock);

@@ -3946,6 +3946,29 @@ static int writeback_copy(const struct kbox_sysnrs *sysnrs,
     long trunc_ret;
     int result = 0;
 
+    /* Copy what the shadow holds now, not what it held when this job was
+     * queued.
+     *
+     * The memfd is the authority and this call may run on a thread that was
+     * started earlier: a thread exit and a close of the same file each queue a
+     * copy, the later one sees the larger shadow, and the earlier one finishing
+     * last used to truncate the guest file back to its own stale size. The
+     * memfd only shrinks when the guest truncates it, so its current size is
+     * the size the guest expects to find.
+     */
+    {
+        struct stat now;
+
+        if (fstat(memfd, &now) == 0 && now.st_size != size) {
+            if (verbose || getenv("KBOX_FD_TRACE"))
+                fprintf(stderr,
+                        "kbox: writeback size lkl_fd=%ld "
+                        "queued=%lld now=%lld\n",
+                        lkl_fd, (long long) size, (long long) now.st_size);
+            size = now.st_size;
+        }
+    }
+
     /* LKL returns -errno. A signal during a multi-gigabyte copy-back is normal,
      * and giving up on -EINTR left the guest file truncated at whatever had
      * been copied so far. */

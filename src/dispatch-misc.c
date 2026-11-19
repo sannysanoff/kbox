@@ -1122,6 +1122,8 @@ struct kbox_dispatch forward_fchown(const struct kbox_syscall_request *req,
     if (stat(link, &st) < 0)
         return kbox_dispatch_errno(errno);
     kbox_owner_set(st.st_dev, st.st_ino, owner, group);
+    /* Persist on the file: a bind-mounted datadir outlives this supervisor. */
+    (void) kbox_owner_xattr_set(AT_FDCWD, link, 0, owner, group);
     return kbox_dispatch_value(0);
 }
 

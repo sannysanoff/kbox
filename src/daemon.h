@@ -40,13 +40,18 @@ struct kbox_daemon_config {
     char gateway_ip[32];
     struct kbox_nfs_mount nfs[KBOX_NFS_MAX_MOUNTS];
     size_t nfs_count;
-    /* Storage. Defaults keep the legacy behaviour: images are copied into the
-     * guest tmpfs and container scratch space lives in guest RAM.
+    /* Storage. Defaults are host-backed: image layers and each container's
+     * overlay upper/work live in host directories, mounted into the guest by
+     * the LKL hostfs driver, so a container's data lands on the pod filesystem
+     * instead of in guest RAM and is not duplicated per container.
      *
      * images_hostfs mounts each image rootfs directly from the host instead of
-     * copying it, so the image is not duplicated in guest memory.
+     * copying it.
      * ephemeral_hostfs backs each container's upper/work dirs with a host
-     * directory, so writes land on the pod filesystem. */
+     * directory.
+     *
+     * Both need CONFIG_HOSTFS in the guest kernel and user.* xattrs on the host
+     * filesystem (overlay whiteouts are stored as user.overlay.*). */
     int images_hostfs;
     int ephemeral_hostfs;
     char ephemeral_root[256];

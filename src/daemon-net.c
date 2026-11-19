@@ -212,8 +212,8 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
     cfg->gateway_ip[0] = '\0';
     memset(cfg->nfs, 0, sizeof(cfg->nfs));
     cfg->nfs_count = 0;
-    cfg->images_hostfs = 0;
-    cfg->ephemeral_hostfs = 0;
+    cfg->images_hostfs = 1;
+    cfg->ephemeral_hostfs = 1;
     snprintf(cfg->ephemeral_root, sizeof(cfg->ephemeral_root), "%s",
              KBOX_DAEMON_DEFAULT_EPHEMERAL_ROOT);
 

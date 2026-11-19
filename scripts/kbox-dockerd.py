@@ -81,7 +81,7 @@ def load_kbox_config(config_path=None):
         "images_dir": "",
         "layers_dir": "",
         "manifests_dir": "",
-        "images_driver": "copy",
+        "images_driver": "hostfs",
     }
     eff = config_path or os.environ.get("KBOX_CONFIG") or os.path.expanduser(DEFAULT_CONFIG_PATH)
     cfg["config_path"] = eff
@@ -270,7 +270,7 @@ class ImageStore:
         self.layers_dir = cfg.get("layers_dir") or os.path.join(state_dir, "layers")
         self.images_dir = cfg.get("images_dir") or os.path.join(state_dir, "images")
         self.manifests_dir = cfg.get("manifests_dir") or os.path.join(state_dir, "manifests")
-        self.images_driver = cfg.get("images_driver", "copy")
+        self.images_driver = cfg.get("images_driver", "hostfs")
         self.tags_file = os.path.join(state_dir, "tags.json")
         for d in (self.blobs_dir, self.layers_dir, self.images_dir,
                   self.manifests_dir):

@@ -2647,8 +2647,24 @@ static struct kbox_dispatch finish_open_dispatch(
  * the calling process". Only for root_identity containers. */
 static void apply_virtual_owner(struct kbox_supervisor_ctx *ctx,
                                 pid_t pid,
-                                struct stat *host_stat)
+                                struct stat *host_stat,
+                                int dirfd,
+                                const char *host_path,
+                                int nofollow)
 {
+    int64_t uid, gid;
+
+    /* A host file behind a bind mount keeps the guest's identity in
+     * user.kbox.owner -- the same xattr the LKL hostfs driver reads -- so the
+     * owner survives a container restart and is shared by every container that
+     * sees the file. It wins over the in-memory overlay, which only lives as
+     * long as this supervisor process. */
+    if (host_path &&
+        kbox_owner_xattr_get(dirfd, host_path, nofollow, &uid, &gid) == 1) {
+        host_stat->st_uid = (uid_t) uid;
+        host_stat->st_gid = (gid_t) gid;
+        return;
+    }
     if (ctx->root_identity)
         kbox_owner_apply(pid, host_stat);
 }
@@ -6257,8 +6273,36 @@ static struct kbox_dispatch forward_fstat(
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
-    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd)))
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
+        /* A descriptor kbox handed to the tracee points at a host file, so the
+         * kernel would report the supervisor's uid. Answer from the file
+         * itself and let the stored guest owner win, exactly as the path stat
+         * handlers do. */
+        char link[64];
+        struct stat host_stat;
+        int64_t uid, gid;
+        pid_t pid = kbox_syscall_request_pid(req);
+        uint64_t remote = kbox_syscall_request_arg(req, 1);
+
+        if (remote == 0)
+            return kbox_dispatch_errno(EFAULT);
+        snprintf(link, sizeof(link), "/proc/%d/fd/%ld", (int) pid, fd);
+        if (stat(link, &host_stat) < 0)
+            return kbox_dispatch_continue();
+        if (kbox_owner_xattr_get(AT_FDCWD, link, 0, &uid, &gid) == 1) {
+            host_stat.st_uid = (uid_t) uid;
+            host_stat.st_gid = (gid_t) gid;
+        } else if (ctx->root_identity) {
+            kbox_owner_apply(pid, &host_stat);
+        }
+        int wrc = guest_mem_write_small_metadata(ctx, pid, remote, &host_stat,
+                                                 sizeof(host_stat));
+        if (wrc < 0)
+            return kbox_dispatch_errno(-wrc);
+        return kbox_dispatch_value(0);
+    }
+
+    if (lkl_fd < 0 && !io_should_deny_fd(ctx, req, fd, lkl_fd))
         return kbox_dispatch_continue();
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
@@ -6468,11 +6512,13 @@ static struct kbox_dispatch forward_newfstatat(
         struct stat host_stat;
         int host_rc = fstatat(sv_dirfd, sv_path, &host_stat, (int) flags);
         int saved = errno;
+        if (host_rc == 0)
+            apply_virtual_owner(ctx, pid, &host_stat, sv_dirfd, sv_path,
+                                (int) (flags & AT_SYMLINK_NOFOLLOW));
         if (close_sv)
             close(sv_dirfd);
         if (host_rc < 0)
             return kbox_dispatch_errno(saved);
-        apply_virtual_owner(ctx, pid, &host_stat);
         normalize_host_stat_if_needed(ctx, translated, &host_stat);
         int wrc = guest_mem_write_small_metadata(ctx, pid, remote_stat,
                                                  &host_stat, sizeof(host_stat));
@@ -7405,6 +7451,10 @@ static long host_chown_virtual(struct kbox_supervisor_ctx *ctx,
         if (fstatat(dirfd, path, &st, flags & AT_SYMLINK_NOFOLLOW) == 0) {
             kbox_owner_set(st.st_dev, st.st_ino, (int32_t) owner,
                            (int32_t) group);
+            /* Persist it on the file itself: the in-memory overlay dies with
+             * this supervisor, and a bind-mounted datadir outlives it. */
+            (void) kbox_owner_xattr_set(
+                dirfd, path, (flags & AT_SYMLINK_NOFOLLOW) != 0, owner, group);
             return 0;
         }
         err = errno;
@@ -7561,7 +7611,8 @@ static struct kbox_dispatch forward_stat_legacy(
         struct stat host_stat;
         if (fstatat(AT_FDCWD, sv_path, &host_stat, stat_flags) < 0)
             return kbox_dispatch_errno(errno);
-        apply_virtual_owner(ctx, pid, &host_stat);
+        apply_virtual_owner(ctx, pid, &host_stat, AT_FDCWD, sv_path,
+                            (stat_flags & AT_SYMLINK_NOFOLLOW));
         normalize_host_stat_if_needed(ctx, translated, &host_stat);
         int wrc = guest_mem_write_small_metadata(ctx, pid, remote_stat,
                                                  &host_stat, sizeof(host_stat));

@@ -5,7 +5,9 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #define VC_MAX 4096
@@ -268,6 +270,107 @@ void kbox_vcred_forget(pid_t pid)
         g_vc_n--;
     }
     pthread_mutex_unlock(&g_lock);
+}
+
+/* ---- guest ownership stored on host files ----------------------------- */
+
+#define KBOX_OWNER_XATTR "user.kbox.owner"
+
+int kbox_owner_xattr_format(char *buf, size_t len, int64_t uid, int64_t gid)
+{
+    int n;
+
+    if (!buf || len == 0)
+        return -EINVAL;
+    n = snprintf(buf, len, "%lld:%lld", (long long) uid, (long long) gid);
+    if (n < 0 || (size_t) n >= len)
+        return -ENAMETOOLONG;
+    return 0;
+}
+
+int kbox_owner_xattr_parse(const char *buf, int64_t *uid, int64_t *gid)
+{
+    char *end = NULL;
+    long long u, g;
+
+    if (!buf || !uid || !gid)
+        return -EINVAL;
+    errno = 0;
+    u = strtoll(buf, &end, 10);
+    if (errno != 0 || end == buf || *end != ':')
+        return -EINVAL;
+    const char *rest = end + 1;
+    errno = 0;
+    g = strtoll(rest, &end, 10);
+    if (errno != 0 || end == rest || *end != '\0')
+        return -EINVAL;
+    if (u < 0 || g < 0)
+        return -EINVAL;
+    *uid = (int64_t) u;
+    *gid = (int64_t) g;
+    return 0;
+}
+
+/* Build the path the xattr calls work on: absolute paths are used as given, a
+ * relative path is resolved through the supervisor's own descriptor, and an
+ * empty path means the descriptor itself (fstatat's AT_EMPTY_PATH shape). */
+static int owner_xattr_path(int dirfd, const char *path, char *out, size_t len)
+{
+    int n;
+
+    if (!out || len == 0)
+        return -EINVAL;
+    if (!path || path[0] == '\0') {
+        n = snprintf(out, len, "/proc/self/fd/%d", dirfd);
+    } else if (path[0] == '/') {
+        n = snprintf(out, len, "%s", path);
+    } else {
+        n = snprintf(out, len, "/proc/self/fd/%d/%s", dirfd, path);
+    }
+    if (n < 0 || (size_t) n >= len)
+        return -ENAMETOOLONG;
+    return 0;
+}
+
+int kbox_owner_xattr_get(int dirfd,
+                         const char *path,
+                         int nofollow,
+                         int64_t *uid,
+                         int64_t *gid)
+{
+    char full[1024];
+    char value[64];
+    ssize_t n;
+
+    if (owner_xattr_path(dirfd, path, full, sizeof(full)) < 0)
+        return 0;
+    n = nofollow ? lgetxattr(full, KBOX_OWNER_XATTR, value, sizeof(value) - 1)
+                 : getxattr(full, KBOX_OWNER_XATTR, value, sizeof(value) - 1);
+    if (n < 0)
+        return 0;
+    value[n] = '\0';
+    return kbox_owner_xattr_parse(value, uid, gid) == 0 ? 1 : 0;
+}
+
+int kbox_owner_xattr_set(int dirfd,
+                         const char *path,
+                         int nofollow,
+                         int64_t uid,
+                         int64_t gid)
+{
+    char full[1024];
+    char value[64];
+    int rc = owner_xattr_path(dirfd, path, full, sizeof(full));
+
+    if (rc < 0)
+        return rc;
+    rc = kbox_owner_xattr_format(value, sizeof(value), uid, gid);
+    if (rc < 0)
+        return rc;
+    if ((nofollow ? lsetxattr : setxattr)(full, KBOX_OWNER_XATTR, value,
+                                          strlen(value), 0) < 0)
+        return -errno;
+    return 0;
 }
 
 void kbox_owner_set(dev_t dev, ino_t ino, int64_t uid, int64_t gid)

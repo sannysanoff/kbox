@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -202,6 +206,75 @@ static void test_setgroups_rejects_oversized_list(void)
               -EINVAL);
 }
 
+static void test_owner_xattr_format_round_trip(void)
+{
+    char buf[64];
+    int64_t uid = -1, gid = -1;
+
+    ASSERT_EQ(kbox_owner_xattr_format(buf, sizeof(buf), 101, 102), 0);
+    ASSERT_EQ(strcmp(buf, "101:102"), 0);
+    ASSERT_EQ(kbox_owner_xattr_parse(buf, &uid, &gid), 0);
+    ASSERT_EQ(uid, 101);
+    ASSERT_EQ(gid, 102);
+}
+
+static void test_owner_xattr_parse_rejects_junk(void)
+{
+    int64_t uid = -1, gid = -1;
+
+    ASSERT_EQ(kbox_owner_xattr_parse("", &uid, &gid), -EINVAL);
+    ASSERT_EQ(kbox_owner_xattr_parse("101", &uid, &gid), -EINVAL);
+    ASSERT_EQ(kbox_owner_xattr_parse("101:", &uid, &gid), -EINVAL);
+    ASSERT_EQ(kbox_owner_xattr_parse(":102", &uid, &gid), -EINVAL);
+    ASSERT_EQ(kbox_owner_xattr_parse("10x:102", &uid, &gid), -EINVAL);
+    ASSERT_EQ(kbox_owner_xattr_parse("101:102:3", &uid, &gid), -EINVAL);
+    ASSERT_EQ(kbox_owner_xattr_parse("-5:102", &uid, &gid), -EINVAL);
+}
+
+static void test_owner_xattr_stores_and_reads_back(void)
+{
+    char path[] = "/tmp/kbox-owner-XXXXXX";
+    int fd = mkstemp(path);
+    int64_t uid = -1, gid = -1;
+    int stored;
+
+    if (fd < 0) {
+        perror("mkstemp");
+        ASSERT_EQ(fd >= 0, 1);
+        return;
+    }
+    close(fd);
+    stored = kbox_owner_xattr_set(AT_FDCWD, path, 0, 101, 102) == 0;
+    if (!stored) {
+        /* A filesystem without user xattrs: nothing to check here. */
+        unlink(path);
+        return;
+    }
+    ASSERT_EQ(kbox_owner_xattr_get(AT_FDCWD, path, 0, &uid, &gid), 1);
+    ASSERT_EQ(uid, 101);
+    ASSERT_EQ(gid, 102);
+    unlink(path);
+}
+
+static void test_owner_xattr_absent_is_zero(void)
+{
+    char path[] = "/tmp/kbox-owner-XXXXXX";
+    int fd = mkstemp(path);
+    int64_t uid = -1, gid = -1;
+
+    if (fd < 0) {
+        perror("mkstemp");
+        ASSERT_EQ(fd >= 0, 1);
+        return;
+    }
+    close(fd);
+    ASSERT_EQ(kbox_owner_xattr_get(AT_FDCWD, path, 0, &uid, &gid), 0);
+    ASSERT_EQ(kbox_owner_xattr_get(AT_FDCWD, "/nonexistent/kbox-owner", 0, &uid,
+                                   &gid),
+              0);
+    unlink(path);
+}
+
 void test_vcred_init(void)
 {
     TEST_REGISTER(test_new_pid_is_root);
@@ -218,6 +291,10 @@ void test_vcred_init(void)
     TEST_REGISTER(test_setgroups_replaces_the_list);
     TEST_REGISTER(test_setgroups_empty_list_is_legal);
     TEST_REGISTER(test_setgroups_allowed_after_dropping_root);
+    TEST_REGISTER(test_owner_xattr_format_round_trip);
+    TEST_REGISTER(test_owner_xattr_parse_rejects_junk);
+    TEST_REGISTER(test_owner_xattr_stores_and_reads_back);
+    TEST_REGISTER(test_owner_xattr_absent_is_zero);
     TEST_REGISTER(test_getgroups_rejects_small_buffer);
     TEST_REGISTER(test_setgroups_rejects_oversized_list);
 }

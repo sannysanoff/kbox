@@ -10,7 +10,7 @@ deployed, how to drive it, and what the numbers mean.
 |---|---|
 | Namespace | `kbox-sqlite` |
 | Deployment / file | `kbox` in [`deploy/sqlite/kbox.yaml`](deploy/sqlite/kbox.yaml) |
-| Pod image | `kbox-sqlite/kbox:v4` (built locally, `imagePullPolicy: IfNotPresent`) |
+| Pod image | `kbox-sqlite/kbox:v6` (built locally, `imagePullPolicy: IfNotPresent`) |
 | Containers | `kboxd` (LKL daemon) and `shim` (Docker Engine API on 2376) |
 | LKL | `sannysanoff/linux` master `e7a0d32c9d`, rebuilt by `scripts/build-lkl.sh` |
 | kbox | `make BUILD=release`, linux/arm64 |
@@ -62,11 +62,26 @@ Driver options that matter:
 The corpus location is fixed: `/data/slt/test`. Do not edit it. The runner only
 reads it and writes `test.db` under `--db-dir`.
 
+### Volume semantics
+
+| Form | Behaviour |
+|---|---|
+| `-v /pod/path:/dst` | bind of a pod path, read/write |
+| `-v /pod/path:/dst:ro` | bind, writes answer `Read-only file system` |
+| `-v name:/dst` (no leading slash) | named volume under `--state-dir`, survives container removal |
+| `-v /missing:/dst` | the source directory is created, as the Docker daemon does |
+| `--mount type=bind` with a missing source | create answers 400, `bind source path does not exist` |
+| `nfs://…` | passed to the daemon's NFS binder, see `nfs-volumes.md` |
+
+The last two rules were added while testing this workload. The shim had started
+containers with a mount that pointed at nothing, which only showed up as `ENOENT`
+inside the guest.
+
 ## Measured behaviour
 
 | Run | Files | PASS | Tests | Errors | Skipped | Wall clock |
 |---|---|---|---|---|---|---|
-| primary (db in container `/tmp`) | 622 | 622 | 5,939,879 | 0 | 1,480,844 | 19 min 43 s at `--workers 3` |
+| primary (db in container `/tmp`) | 622 | 622 | 5,939,879 | 0 | 1,480,844 | 19 min 12 s at `--workers 3` |
 | bind mount (db on the PVC) | 622 | 622 | 5,939,879 | 0 | 1,480,844 | 7 min 17 s at `--workers 3` |
 
 Per-file samples: `evidence/in1.test` 214 tests in 2 s; a 4.8 MB

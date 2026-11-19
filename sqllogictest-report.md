@@ -2,7 +2,7 @@
 
 Environment: local OrbStack Kubernetes, namespace `kbox-sqlite`, unprivileged
 pod (uid 65534, every capability set empty, `allowPrivilegeEscalation: false`,
-no service-account token). Pod image `kbox-sqlite/kbox:v4`. Guest kernel
+no service-account token). Pod image `kbox-sqlite/kbox:v6`. Guest kernel
 `Linux 6.8.0-kbox aarch64`, LKL from `sannysanoff/linux` commit `e7a0d32c9d`.
 
 Workload: the SQLite sqllogictest corpus, 622 script files, 1,116,799,996
@@ -55,12 +55,14 @@ bind mount, in both runs.
 | primary, guest filesystem | 622 | 622 | 0 | 5,939,879 | 0 | 1,480,844 |
 | bind mount, pod volume | 622 | 622 | 0 | 5,939,879 | 0 | 1,480,844 |
 
+Timings on image `v6`: 19 min 12 s for the primary path, 7 min 17 s for the
+bind mount, both at three files in flight.
+
 Every file ran once in each run. Each run has its own summary
 (`summary.tsv`) with one line per file and its log.
 
-Both rows are from image `v4`. The primary row was also reproduced end to end
-in a separate single run on that image: 622 lines, one per file, from
-22:40:15 to 22:59:58 UTC, with the same totals.
+Both rows are from image `v6`. The primary row is one single run: 622 lines,
+one per file, from 08:51:02 to 09:10:14 UTC, with the same totals.
 
 The two paths differ in speed by about 3x, and only in speed: the primary path
 sustained ~30 files per minute, the bind-mount path ~90. The database is the
@@ -111,12 +113,33 @@ status and not the shim's opinion of it.
 | Defect | Fix |
 |---|---|
 | `scripts/build-lkl.sh` aborted with `sha256sum: ./include: Is a directory` when `lkl-aarch64/` held a header tree from an older layout, after the library had already been installed | the checksum step hashes regular files at the top level only |
+| A short `-v` bind with a missing source started a container whose mount pointed at nothing; every access was `ENOENT` | the shim creates the source directory, as the Docker daemon does, and answers 400 when it cannot |
+| A long `--mount` bind with a missing source started silently | the shim rejects it at create with Docker's `bind source path does not exist` wording |
 
 No kbox daemon or LKL defect surfaced under this workload. The kernel paths the
 corpus drives (hostfs reads of 1.1 GB of scripts, overlay and shadow writes of
 SQLite pages, `pread`/`pwrite`, `ftruncate` on journal rollback, `unlink` of
 temporary sort files, `fstat` of the database) all behaved as the native
 control did.
+
+## Volume path handling
+
+The corpus binds the pod's `/data/slt` at `/data`, which is the existing-source
+branch. The rest of the `-v` and `--mount` paths were probed directly, because
+Compose files and scripts depend on them:
+
+| Probe | Result |
+|---|---|
+| existing directory, read-only (`:ro`) | read succeeds, write answers `Read-only file system` |
+| file as source (`sqllogictest:/bin/slt:ro`) | the static binary runs from the mount |
+| named volume (`probevol:/x`) | data written in one container is readable in the next |
+| relative source (`reldir:/x`) | treated as a named volume, as Docker does |
+| missing source through `-v` | the directory is created on the pod and the container writes into it |
+| missing source through `--mount` | create answers 400, `bind source path does not exist`, and no directory appears |
+
+The last two rows failed before this work: `-v` produced a container whose mount
+pointed at nothing, and `--mount` started silently. Both are now handled in the
+shim, with unit tests, and the pod runs image `v6` with the fix.
 
 ## What the corpus does not cover
 

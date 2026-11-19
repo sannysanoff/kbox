@@ -2,7 +2,7 @@
 
 Environment: local OrbStack Kubernetes, namespace `kbox-sqlite`, unprivileged
 pod (uid 65534, every capability set empty, `allowPrivilegeEscalation: false`,
-no service-account token). Pod image `kbox-sqlite/kbox:v6`. Guest kernel
+no service-account token). Pod image `kbox-sqlite/kbox:v7`, built from the pushed tree at `9371812`. Guest kernel
 `Linux 6.8.0-kbox aarch64`, LKL from `sannysanoff/linux` commit `e7a0d32c9d`.
 
 Workload: the SQLite sqllogictest corpus, 622 script files, 1,116,799,996
@@ -55,14 +55,15 @@ bind mount, in both runs.
 | primary, guest filesystem | 622 | 622 | 0 | 5,939,879 | 0 | 1,480,844 |
 | bind mount, pod volume | 622 | 622 | 0 | 5,939,879 | 0 | 1,480,844 |
 
-Timings on image `v6`: 19 min 12 s for the primary path, 7 min 17 s for the
-bind mount, both at three files in flight.
+Timings on image `v7`: 21 min 7 s for the primary path, 8 min 16 s for the bind
+mount, both at three files in flight.
 
 Every file ran once in each run. Each run has its own summary
 (`summary.tsv`) with one line per file and its log.
 
-Both rows are from image `v6`. The primary row is one single run: 622 lines,
-one per file, from 08:51:02 to 09:10:14 UTC, with the same totals.
+Both rows are from image `v7`, which contains the upstream hostfs and guest
+ownership work merged with this harness. Each row is one single run with one
+line per file.
 
 The two paths differ in speed by about 3x, and only in speed: the primary path
 sustained ~30 files per minute, the bind-mount path ~90. The database is the
@@ -139,7 +140,7 @@ Compose files and scripts depend on them:
 
 The last two rows failed before this work: `-v` produced a container whose mount
 pointed at nothing, and `--mount` started silently. Both are now handled in the
-shim, with unit tests, and the pod runs image `v6` with the fix.
+shim, with unit tests, and the pod runs image `v7` with the fix.
 
 ## What the corpus does not cover
 

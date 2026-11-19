@@ -10,7 +10,7 @@ deployed, how to drive it, and what the numbers mean.
 |---|---|
 | Namespace | `kbox-sqlite` |
 | Deployment / file | `kbox` in [`deploy/sqlite/kbox.yaml`](deploy/sqlite/kbox.yaml) |
-| Pod image | `kbox-sqlite/kbox:v6` (built locally, `imagePullPolicy: IfNotPresent`) |
+| Pod image | `kbox-sqlite/kbox:v7` (built locally, `imagePullPolicy: IfNotPresent`) |
 | Containers | `kboxd` (LKL daemon) and `shim` (Docker Engine API on 2376) |
 | LKL | `sannysanoff/linux` master `e7a0d32c9d`, rebuilt by `scripts/build-lkl.sh` |
 | kbox | `make BUILD=release`, linux/arm64 |
@@ -81,8 +81,8 @@ inside the guest.
 
 | Run | Files | PASS | Tests | Errors | Skipped | Wall clock |
 |---|---|---|---|---|---|---|
-| primary (db in container `/tmp`) | 622 | 622 | 5,939,879 | 0 | 1,480,844 | 19 min 12 s at `--workers 3` |
-| bind mount (db on the PVC) | 622 | 622 | 5,939,879 | 0 | 1,480,844 | 7 min 17 s at `--workers 3` |
+| primary (db in container `/tmp`) | 622 | 622 | 5,939,879 | 0 | 1,480,844 | 21 min 7 s at `--workers 3` |
+| bind mount (db on the PVC) | 622 | 622 | 5,939,879 | 0 | 1,480,844 | 8 min 16 s at `--workers 3` |
 
 Per-file samples: `evidence/in1.test` 214 tests in 2 s; a 4.8 MB
 `index/between/100` file 10,121 tests in 4 s; `index/delete/10` files 16–20 s

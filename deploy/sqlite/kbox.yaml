@@ -50,7 +50,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kboxd
-          image: kbox-sqlite/kbox:v4
+          image: kbox-sqlite/kbox:v6
           imagePullPolicy: IfNotPresent
           args:
             - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=6144M loglevel=4"
@@ -87,7 +87,7 @@ spec:
             limits:
               memory: 12Gi
         - name: shim
-          image: kbox-sqlite/kbox:v4
+          image: kbox-sqlite/kbox:v6
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

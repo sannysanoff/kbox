@@ -140,6 +140,10 @@ def load_kbox_config(config_path=None):
 NFS_SCHEME = "nfs://"
 
 
+class ContainerConfigError(Exception):
+    """A request the Docker API answers with 400, not 500."""
+
+
 def is_nfs_source(src):
     """True for a volume source that names a kbox-declared NFS export."""
     return isinstance(src, str) and src.startswith(NFS_SCHEME)
@@ -1021,6 +1025,23 @@ class DockerEngineState:
                 return dst_prefix.rstrip("/") + p[len(src_prefix.rstrip("/")):]
         return p
 
+    def prepare_bind_source(self, src):
+        """Create a missing `-v` source directory, as the Docker daemon does.
+
+        Compose files such as `./data:/data` depend on it for the first start.
+        The long `--mount` form stays strict, because Docker rejects a missing
+        source there and callers rely on that error.
+        """
+        if os.path.exists(src):
+            return src
+        try:
+            os.makedirs(src, exist_ok=True)
+        except OSError as err:
+            raise ContainerConfigError(
+                f"error while creating mount source path '{src}': {err.strerror}"
+            ) from None
+        return src
+
     def _alloc_ephemeral_port(self):
         p = self._next_ephemeral_port
         self._next_ephemeral_port += 1
@@ -1177,7 +1198,7 @@ class DockerEngineState:
                     "RW": not ro_flag,
                 })
             else:
-                src = self.map_host_path(raw_src)
+                src = self.prepare_bind_source(self.map_host_path(raw_src))
                 mounts_json.append({
                     "Type": "bind",
                     "Source": src,
@@ -1220,6 +1241,14 @@ class DockerEngineState:
                 })
             else:
                 src = self.map_host_path(src)
+                # Docker rejects a missing --mount source at create time. The
+                # daemon would otherwise start a container whose mount points
+                # at nothing, and every access would answer ENOENT.
+                if not os.path.exists(src):
+                    raise ContainerConfigError(
+                        'invalid mount config for type "bind": '
+                        f"bind source path does not exist: {src}"
+                    )
                 mounts_json.append({
                     "Type": "bind",
                     "Source": src,
@@ -2102,6 +2131,8 @@ class DockerHandler(BaseHTTPRequestHandler):
             try:
                 rec = eng.create_container(cname, body)
                 self.send_json(201, {"Id": rec["id"], "Warnings": []})
+            except ContainerConfigError as e:
+                self.send_json(400, {"message": str(e)})
             except KeyError as e:
                 self.send_json(404, {"message": str(e)})
             except Exception as e:

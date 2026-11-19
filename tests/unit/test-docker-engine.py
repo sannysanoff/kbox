@@ -80,10 +80,13 @@ class TestDockerEngine(unittest.TestCase):
 
         self.rpc = FakeRpc(self.log_dir)
         self.vol_root = os.path.join(self.tmpdir.name, "volumes")
+        # The mapped tree is writable: a missing -v source is created on the
+        # host, so a map that pointed at the real root would create /mapped.
+        self.mapped_src = os.path.join(self.tmpdir.name, "mapped", "src")
         self.engine = kbox_dockerd.DockerEngineState(
             self.rpc,
             self.state_dir,
-            path_maps=[("/host/src", "/mapped/src")],
+            path_maps=[("/host/src", self.mapped_src)],
             config={
                 "start_ip": "172.18.0.2",
                 "gateway": "172.18.0.1",
@@ -129,10 +132,49 @@ class TestDockerEngine(unittest.TestCase):
         self.assertEqual(rec["name"], "web-1")
         self.assertEqual(rec["ip"], "172.18.0.2")
         create_rpc = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]
-        self.assertIn("/mapped/src/www:/srv:ro", create_rpc["binds"])
+        self.assertIn(f"{self.mapped_src}/www:/srv:ro", create_rpc["binds"])
+        self.assertTrue(os.path.isdir(f"{self.mapped_src}/www"))
         self.assertIn("web", create_rpc["aliases"])
         self.assertIn("web-alias", create_rpc["aliases"])
         self.assertIn("0.0.0.0:18080:8080", create_rpc["ports"])
+
+    def test_create_container_creates_missing_bind_source(self):
+        # Docker's -v creates the host directory when it does not exist, and
+        # Compose relies on it for the first start of `./data:/data`.
+        src = os.path.join(self.tmpdir.name, "fresh", "data")
+        self.engine.create_container(
+            "b-1",
+            {
+                "Image": "alpine:latest",
+                "Cmd": ["true"],
+                "HostConfig": {"Binds": [f"{src}:/data"]},
+            },
+        )
+        self.assertTrue(os.path.isdir(src))
+        create_rpc = [c for c in self.rpc.calls if c["op"] == "container_create"][-1]
+        self.assertIn(f"{src}:/data", create_rpc["binds"])
+
+    def test_long_mount_rejects_missing_source(self):
+        # The --mount form stays strict: Docker rejects a missing source at
+        # create time, and the path must not be created as a side effect.
+        src = os.path.join(self.tmpdir.name, "absent")
+        with self.assertRaises(kbox_dockerd.ContainerConfigError):
+            self.engine.create_container(
+                "m-1",
+                {
+                    "Image": "alpine:latest",
+                    "Cmd": ["true"],
+                    "HostConfig": {
+                        "Mounts": [
+                            {"Type": "bind", "Source": src, "Target": "/data"}
+                        ]
+                    },
+                },
+            )
+        self.assertFalse(os.path.exists(src))
+        self.assertFalse(
+            any(c["op"] == "container_create" for c in self.rpc.calls)
+        )
 
     def test_create_container_sets_home_and_hostname(self):
         # Docker gives the container process HOME and HOSTNAME when the image and the
